@@ -1002,6 +1002,36 @@ fn build_command(manifest: &smolvm_pack::PackManifest, cli_command: &[String]) -
     }
 }
 
+/// What a packed machine launches with, after the command line has had its
+/// say over the manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackedLaunch {
+    pub command: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub workdir: Option<String>,
+    pub user: Option<String>,
+}
+
+/// The one place a packed manifest and the command line are combined into a
+/// launch. Every packed entry point (`pack run`, the standalone binary's run
+/// and exec) goes through here, so a setting the manifest carries cannot be
+/// honoured by one of them and ignored by another. The command line wins for
+/// each setting it gives; the manifest fills the rest.
+pub(crate) fn resolve_packed_launch(
+    manifest: &smolvm_pack::PackManifest,
+    cli_command: &[String],
+    cli_env: &[String],
+    cli_workdir: Option<String>,
+    cli_user: Option<String>,
+) -> smolvm::Result<PackedLaunch> {
+    Ok(PackedLaunch {
+        command: build_command(manifest, cli_command),
+        env: build_env(manifest, cli_env)?,
+        workdir: cli_workdir.or_else(|| manifest.workdir.clone()),
+        user: cli_user.or_else(|| manifest.user.clone()),
+    })
+}
+
 /// Build environment variables from manifest defaults and CLI overrides.
 fn build_env(
     manifest: &smolvm_pack::PackManifest,
@@ -1059,19 +1089,29 @@ fn execute_command(
     args: &PackRunCmd,
     mounts: &[smolvm::data::storage::HostMount],
 ) -> smolvm::Result<i32> {
-    let command = build_command(manifest, &args.command);
-    let mut env = build_env(manifest, &args.env)?;
+    let PackedLaunch {
+        command,
+        mut env,
+        workdir,
+        user,
+    } = resolve_packed_launch(
+        manifest,
+        &args.command,
+        &args.env,
+        args.workdir.clone(),
+        args.user.clone(),
+    )?;
     if args.auto_graph {
         smolvm::util::enable_cuda_auto_graph_env(&mut env);
     }
-    let workdir = args.workdir.clone().or_else(|| manifest.workdir.clone());
-    let user = args.user.clone().or_else(|| manifest.user.clone());
 
     let params = ExecParams {
-        command,
-        env,
-        workdir,
-        user,
+        launch: PackedLaunch {
+            command,
+            env,
+            workdir,
+            user,
+        },
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -1081,10 +1121,7 @@ fn execute_command(
 
 /// Resolved execution parameters for a packed command.
 struct ExecParams {
-    command: Vec<String>,
-    env: Vec<(String, String)>,
-    workdir: Option<String>,
-    user: Option<String>,
+    launch: PackedLaunch,
     interactive: bool,
     tty: bool,
     timeout: Option<Duration>,
@@ -1100,10 +1137,13 @@ fn execute_packed_command(
     persistent_overlay_id: Option<String>,
 ) -> smolvm::Result<i32> {
     let ExecParams {
-        command,
-        env,
-        workdir,
-        user,
+        launch:
+            PackedLaunch {
+                command,
+                env,
+                workdir,
+                user,
+            },
         interactive,
         tty,
         timeout,
@@ -1782,10 +1822,7 @@ fn run_from_cache(
     let mut client = wait_for_agent(&vsock_path, debug)?;
 
     let params = ExecParams {
-        command: build_command(manifest, &args.command),
-        env: build_env(manifest, &args.env)?,
-        workdir: args.workdir.or_else(|| manifest.workdir.clone()),
-        user: args.user.or_else(|| manifest.user.clone()),
+        launch: resolve_packed_launch(manifest, &args.command, &args.env, args.workdir, args.user)?,
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -2201,10 +2238,7 @@ fn daemon_exec(
     // Virtiofs devices are fixed at boot — exec cannot add new host mounts.
     let mounts: Vec<smolvm::data::storage::HostMount> = Vec::new();
     let params = ExecParams {
-        command: build_command(manifest, &args.command),
-        env: build_env(manifest, &args.env)?,
-        workdir: args.workdir.or_else(|| manifest.workdir.clone()),
-        user: args.user.or_else(|| manifest.user.clone()),
+        launch: resolve_packed_launch(manifest, &args.command, &args.env, args.workdir, args.user)?,
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,

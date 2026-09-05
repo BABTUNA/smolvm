@@ -616,6 +616,33 @@ init = ["echo init"]
         assert!(manifest.env.contains(&"GREETING=hello".to_string()));
         assert_eq!(manifest.workdir, params.workdir);
         assert_eq!(manifest.user, params.user);
+
+        // Hop 4: pack manifest -> what a packed machine launches with, the
+        // `pack run` and standalone-binary paths. The manifest fills every
+        // setting the command line leaves out, and the command line wins for
+        // each one it gives.
+        use crate::cli::pack_run::resolve_packed_launch;
+        let launch = resolve_packed_launch(&manifest, &[], &[], None, None).unwrap();
+        assert_eq!(launch.command, vec!["/bin/sh", "-c", "sleep infinity"]);
+        assert!(launch
+            .env
+            .contains(&("GREETING".to_string(), "hello".to_string())));
+        assert_eq!(launch.workdir, params.workdir);
+        assert_eq!(launch.user, params.user);
+        let overridden = resolve_packed_launch(
+            &manifest,
+            &["id".to_string()],
+            &["GREETING=bye".to_string()],
+            Some("/tmp".to_string()),
+            Some("0".to_string()),
+        )
+        .unwrap();
+        assert_eq!(overridden.command, vec!["id"]);
+        assert!(overridden
+            .env
+            .contains(&("GREETING".to_string(), "bye".to_string())));
+        assert_eq!(overridden.workdir.as_deref(), Some("/tmp"));
+        assert_eq!(overridden.user.as_deref(), Some("0"));
     }
 
     #[test]
