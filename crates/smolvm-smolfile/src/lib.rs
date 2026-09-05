@@ -19,6 +19,7 @@
 //! | `cmd` | string[] | No | Default args appended to entrypoint. Overrides image CMD. |
 //! | `env` | string[] | No | Environment variables as `KEY=VALUE`. |
 //! | `workdir` | string | No | Working directory inside the VM. |
+//! | `user` | string | No | User the workload runs as, like `docker run --user`: a name or `uid[:gid]`. Overrides the image `USER`. |
 //! | `cpus` | int | No | Number of vCPUs (default: 4). |
 //! | `memory` | int | No | Memory in MiB (default: 8192). |
 //! | `net` | bool | No | Enable outbound networking via NAT. |
@@ -42,6 +43,7 @@
 //! | `env` | string[] | Dev-only environment variables |
 //! | `init` | string[] | Bootstrap commands run on start |
 //! | `workdir` | string | Dev working directory override |
+//! | `user` | string | Dev user override (name or `uid[:gid]`) |
 //! | `ports` | string[] | Port mappings or equal-length one-to-one ranges for development |
 //!
 //! ### `[artifact]` — Pack/distribution overrides
@@ -245,6 +247,11 @@ pub struct Smolfile {
     pub secrets: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
     /// Working directory inside the VM.
     pub workdir: Option<String>,
+    /// User the workload runs as, like `docker run --user`: a name from the
+    /// image's passwd database or a numeric `uid[:gid]`. Overrides the image
+    /// `USER`, which is what lets a workload match the owner of a mounted
+    /// host directory when the image was built for a different account.
+    pub user: Option<String>,
 
     // Resources
     /// Number of vCPUs.
@@ -382,6 +389,8 @@ pub struct DevConfig {
     pub init: Vec<String>,
     /// Development working directory override.
     pub workdir: Option<String>,
+    /// Dev user override (name or `uid[:gid]`).
+    pub user: Option<String>,
     /// Port mappings for development (e.g., `["8080:8080"]`).
     #[serde(default)]
     pub ports: Vec<String>,
@@ -477,6 +486,22 @@ mod tests {
         let sf: Smolfile = parse("").unwrap();
         assert_eq!(sf.image, None);
         assert_eq!(sf.cpus, None);
+    }
+
+    /// `user` is accepted at the top level and as a `[dev]` override, in the
+    /// same forms `docker run --user` takes.
+    #[test]
+    fn parse_user_directive() {
+        let sf = parse("image = \"alpine\"\nuser = \"1000:1000\"\n").unwrap();
+        assert_eq!(sf.user.as_deref(), Some("1000:1000"));
+        assert!(sf.dev.is_none());
+
+        let sf = parse("image = \"alpine\"\nuser = \"app\"\n\n[dev]\nuser = \"501:20\"\n").unwrap();
+        assert_eq!(sf.user.as_deref(), Some("app"));
+        assert_eq!(sf.dev.unwrap().user.as_deref(), Some("501:20"));
+
+        let sf = parse("image = \"alpine\"\n").unwrap();
+        assert!(sf.user.is_none());
     }
 
     #[test]

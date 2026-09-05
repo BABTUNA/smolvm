@@ -513,6 +513,11 @@ pub struct RunCmd {
     #[arg(short = 'w', long, value_name = "DIR", help_heading = "Container")]
     pub workdir: Option<String>,
 
+    /// Run as this user, like `docker run --user`: a name from the image or a
+    /// numeric `uid[:gid]`. Overrides the image's USER.
+    #[arg(short = 'u', long, value_name = "USER", help_heading = "Container")]
+    pub user: Option<String>,
+
     /// Set environment variable (can be used multiple times)
     #[arg(
         short = 'e',
@@ -1179,6 +1184,7 @@ impl RunCmd {
             vec![],
             self.env,
             self.workdir,
+            self.user,
             self.smolfile.clone(),
             self.storage,
             self.overlay,
@@ -1727,6 +1733,7 @@ impl RunCmd {
                     image_info: image_info.as_ref(),
                     env: &init_env,
                     workdir: params.workdir.as_deref(),
+                    user: params.user.as_deref(),
                     record_mounts: &record_mounts,
                     overlay_id: &vm_name,
                 },
@@ -1777,6 +1784,7 @@ impl RunCmd {
                 image_info.as_ref(),
                 &env,
                 params.workdir.as_deref(),
+                params.user.as_deref(),
             );
             // Credentials and endpoint come from the workload's own env, the
             // same place every AWS SDK reads them, so a remote volume needs no
@@ -2003,7 +2011,7 @@ impl RunCmd {
                             init: params.init.clone(),
                             env: parse_env_list(&params.env),
                             workdir: params.workdir.clone(),
-                            user: None,
+                            user: params.user.clone(),
                             image: None,
                             entrypoint: params.entrypoint.clone(),
                             cmd: params.cmd.clone(),
@@ -2760,6 +2768,11 @@ pub struct ExecCmd {
     #[arg(short = 'w', long, value_name = "DIR")]
     pub workdir: Option<String>,
 
+    /// Run as this user (name or `uid[:gid]`). Defaults to the machine's
+    /// configured user, then the image's USER.
+    #[arg(short = 'u', long, value_name = "USER")]
+    pub user: Option<String>,
+
     /// Set environment variable (can be used multiple times)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -2820,6 +2833,12 @@ impl ExecCmd {
             .workdir
             .clone()
             .or_else(|| record.as_ref().and_then(|r| r.workdir.clone()));
+        // Same precedence for the user: an explicit flag, then whatever the
+        // machine was created with (or resolved from the image at first start).
+        let user = self
+            .user
+            .clone()
+            .or_else(|| record.as_ref().and_then(|r| r.user.clone()));
         let record_image = record.as_ref().and_then(|r| r.image.clone());
 
         // Check if this machine has an image — if so, exec inside the image's
@@ -2866,6 +2885,7 @@ impl ExecCmd {
                 image_info.as_ref(),
                 &configured_env,
                 workdir.as_deref(),
+                user.as_deref(),
             );
             // Image-based machine: exec inside the image's rootfs via crun.
             // Fork clones address the golden's inherited overlay; ordinary
@@ -3032,6 +3052,7 @@ impl ShellCmd {
             command: vec!["/bin/sh".to_string()],
             name: self.name,
             workdir: None,
+            user: None,
             env: vec![],
             secret_env: vec![],
             secret_file: vec![],
@@ -3199,6 +3220,12 @@ pub struct CreateCmd {
     #[arg(short = 'w', long = "workdir", value_name = "DIR")]
     pub workdir: Option<String>,
 
+    /// Run the workload as this user, like `docker run --user`: a name from the
+    /// image or a numeric `uid[:gid]`. Overrides the image's USER, so a workload
+    /// can match the owner of a mounted host directory.
+    #[arg(short = 'u', long = "user", value_name = "USER")]
+    pub user: Option<String>,
+
     /// Forward host SSH agent into the VM (enables git/ssh without exposing keys)
     #[arg(long)]
     pub ssh_agent: bool,
@@ -3336,6 +3363,7 @@ impl CreateCmd {
             self.init,
             self.env,
             self.workdir,
+            self.user,
             self.smolfile.clone(),
             self.storage,
             self.overlay,
@@ -3640,6 +3668,7 @@ impl CreateCmd {
                 env
             },
             workdir: manifest.workdir,
+            user: None,
             storage_gb: checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.storage_gib)
