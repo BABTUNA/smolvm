@@ -1797,6 +1797,43 @@ fn start_vm_named_with_db(
 ///
 /// Creates the record if it doesn't exist, then updates state to Running
 /// with the current PID and optional config overrides (cpus, mem, etc.).
+/// The one place a machine record takes its settings from a set of overrides.
+///
+/// Every field a record carries for a workload is written here and nowhere
+/// else, so a setting added to [`DefaultVmOverrides`] cannot be persisted on
+/// one path and dropped on another. Covered by the launch-settings round-trip
+/// test in this module.
+pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
+    r.cpus = o.cpus;
+    r.mem = o.mem;
+    r.mounts = o.mounts.clone();
+    r.staged_mounts = o.staged_mounts.clone();
+    r.ports = o.ports.clone();
+    r.network = o.network;
+    r.network_backend = o.network_backend;
+    r.dns = o.dns;
+    r.network_name = o.network_name.clone();
+    r.storage_gb = o.storage_gb;
+    r.overlay_gb = o.overlay_gb;
+    r.allowed_cidrs = o.allowed_cidrs.clone();
+    r.init = o.init.clone();
+    r.init_completed = false;
+    r.env = o.env.clone();
+    r.secret_refs = o.secret_refs.clone();
+    r.workdir = o.workdir.clone();
+    r.user = o.user.clone();
+    r.image = o.image.clone();
+    r.entrypoint = o.entrypoint.clone();
+    r.cmd = o.cmd.clone();
+    r.ssh_agent = o.ssh_agent;
+    r.cuda = o.cuda;
+    r.docker_socket = o.docker_socket;
+    r.dns_filter_hosts = o.dns_filter_hosts.clone();
+    r.gpu = if o.gpu { Some(true) } else { None };
+    r.gpu_vram_mib = o.gpu_vram_mib;
+    r.rosetta = if o.rosetta { Some(true) } else { None };
+}
+
 pub fn persist_named_running(
     config: &mut SmolvmConfig,
     name: &str,
@@ -1821,34 +1858,7 @@ pub fn persist_named_running(
             r.pid = pid;
             r.pid_start_time = pid_start_time;
             if let Some(ref o) = overrides {
-                r.cpus = o.cpus;
-                r.mem = o.mem;
-                r.mounts = o.mounts.clone();
-                r.staged_mounts = o.staged_mounts.clone();
-                r.ports = o.ports.clone();
-                r.network = o.network;
-                r.network_backend = o.network_backend;
-                r.dns = o.dns;
-                r.network_name = o.network_name.clone();
-                r.storage_gb = o.storage_gb;
-                r.overlay_gb = o.overlay_gb;
-                r.allowed_cidrs = o.allowed_cidrs.clone();
-                r.init = o.init.clone();
-                r.init_completed = false;
-                r.env = o.env.clone();
-                r.secret_refs = o.secret_refs.clone();
-                r.workdir = o.workdir.clone();
-                r.user = o.user.clone();
-                r.image = o.image.clone();
-                r.entrypoint = o.entrypoint.clone();
-                r.cmd = o.cmd.clone();
-                r.ssh_agent = o.ssh_agent;
-                r.cuda = o.cuda;
-                r.docker_socket = o.docker_socket;
-                r.dns_filter_hosts = o.dns_filter_hosts.clone();
-                r.gpu = if o.gpu { Some(true) } else { None };
-                r.gpu_vram_mib = o.gpu_vram_mib;
-                r.rosetta = if o.rosetta { Some(true) } else { None };
+                apply_overrides(r, o);
             }
         })
         .ok_or_else(|| smolvm::Error::config(
@@ -1890,6 +1900,52 @@ pub struct DefaultVmOverrides {
     pub gpu: bool,
     pub gpu_vram_mib: Option<u32>,
     pub rosetta: bool,
+}
+
+impl DefaultVmOverrides {
+    /// The one projection of create parameters onto the settings a machine
+    /// record keeps. Both the image-machine and the one-shot `run` path build
+    /// their record through here and then adjust only what is genuinely
+    /// path-specific (the image-resolved env, workdir and user; the image and
+    /// command). Before this each path spelled the projection out by hand, and
+    /// the two copies drifted: one persisted `user` while the other silently
+    /// wrote `None`.
+    pub(crate) fn from_create_params(
+        params: &CreateVmParams,
+        mounts: Vec<(String, String, bool)>,
+        staged_mounts: Vec<(usize, String, String)>,
+        ports: Vec<(u16, u16)>,
+    ) -> Self {
+        Self {
+            secret_refs: params.secret_refs.clone(),
+            cpus: params.cpus,
+            mem: params.mem,
+            mounts,
+            staged_mounts,
+            ports,
+            network: params.net,
+            network_backend: params.network_backend,
+            dns: params.dns,
+            network_name: params.network_name.clone(),
+            storage_gb: params.storage_gb,
+            overlay_gb: params.overlay_gb,
+            allowed_cidrs: params.allowed_cidrs.clone(),
+            init: params.init.clone(),
+            env: smolvm::util::parse_env_list(&params.env),
+            workdir: params.workdir.clone(),
+            user: params.user.clone(),
+            image: params.image.clone(),
+            entrypoint: params.entrypoint.clone(),
+            cmd: params.cmd.clone(),
+            ssh_agent: params.ssh_agent,
+            cuda: params.cuda,
+            docker_socket: params.docker_socket,
+            dns_filter_hosts: params.dns_filter_hosts.clone(),
+            gpu: params.gpu,
+            gpu_vram_mib: params.gpu_vram_mib,
+            rosetta: false,
+        }
+    }
 }
 
 /// Check if any running VM already binds to the same host ports.
