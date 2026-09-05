@@ -1822,46 +1822,34 @@ impl RunCmd {
                             &mut config,
                             &vm_name,
                             manager.child_pid(),
-                            Some(DefaultVmOverrides {
-                                // Persist the REFS (re-resolved at each start via
-                                // record_env_with_secrets), never the resolved
-                                // plaintext — see `env` below.
-                                secret_refs: params.secret_refs.clone(),
-                                cpus: params.cpus,
-                                mem: params.mem,
-                                mounts: mount_tuples,
-                                staged_mounts,
-                                ports: port_tuples,
-                                network: params.net,
-                                network_backend: params.network_backend,
-                                dns: params.dns,
-                                network_name: params.network_name.clone(),
-                                storage_gb: params.storage_gb,
-                                overlay_gb: params.overlay_gb,
-                                allowed_cidrs: params.allowed_cidrs.clone(),
-                                init: params.init.clone(),
-                                // Strip resolved secret values so plaintext never
-                                // reaches the DB/pack record. defaults.env still
-                                // carries them for RUNNING the container above; the
-                                // record keeps only refs + non-secret env.
-                                env: defaults
+                            Some({
+                                let mut o = DefaultVmOverrides::from_create_params(
+                                    &params,
+                                    mount_tuples,
+                                    staged_mounts,
+                                    port_tuples,
+                                );
+                                // An image machine records what the image
+                                // resolved to: its env (minus secret values, which
+                                // stay as refs), workdir and user, the image itself
+                                // and the workload command.
+                                o.env = defaults
                                     .env
                                     .iter()
                                     .filter(|(k, _)| !params.secret_refs.contains_key(k))
                                     .cloned()
-                                    .collect(),
-                                workdir: defaults.workdir.clone(),
-                                user: defaults.user.clone(),
-                                image: Some(img.clone()),
-                                entrypoint: Vec::new(),
-                                cmd: command.clone(),
-                                ssh_agent: self.ssh_agent || params.ssh_agent,
-                                cuda: self.cuda || params.cuda,
-                                docker_socket: self.docker_socket || params.docker_socket,
-                                dns_filter_hosts: params.dns_filter_hosts.clone(),
-                                gpu: self.gpu || params.gpu,
-                                gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
-                                rosetta: self.rosetta || params.rosetta,
+                                    .collect();
+                                o.workdir = defaults.workdir.clone();
+                                o.user = defaults.user.clone();
+                                o.image = Some(img.clone());
+                                o.entrypoint = Vec::new();
+                                o.cmd = command.clone();
+                                o.ssh_agent = self.ssh_agent || o.ssh_agent;
+                                o.cuda = self.cuda || o.cuda;
+                                o.docker_socket = self.docker_socket || o.docker_socket;
+                                o.gpu = self.gpu || o.gpu;
+                                o.gpu_vram_mib = self.gpu_vram_mib.or(o.gpu_vram_mib);
+                                o
                             }),
                         )
                     });
@@ -1995,36 +1983,23 @@ impl RunCmd {
                         &mut config,
                         &vm_name,
                         manager.child_pid(),
-                        Some(DefaultVmOverrides {
-                            // Persist the refs so secrets re-resolve on restart
-                            // (env below is already secret-free: parse_env_list).
-                            secret_refs: params.secret_refs.clone(),
-                            cpus: params.cpus,
-                            mem: params.mem,
-                            mounts: mount_tuples,
-                            staged_mounts,
-                            ports: port_tuples,
-                            network: params.net,
-                            network_backend: params.network_backend,
-                            dns: params.dns,
-                            network_name: params.network_name.clone(),
-                            storage_gb: params.storage_gb,
-                            overlay_gb: params.overlay_gb,
-                            allowed_cidrs: params.allowed_cidrs.clone(),
-                            init: params.init.clone(),
-                            env: parse_env_list(&params.env),
-                            workdir: params.workdir.clone(),
-                            user: params.user.clone(),
-                            image: None,
-                            entrypoint: params.entrypoint.clone(),
-                            cmd: params.cmd.clone(),
-                            ssh_agent: self.ssh_agent || params.ssh_agent,
-                            cuda: self.cuda || params.cuda,
-                            docker_socket: self.docker_socket || params.docker_socket,
-                            dns_filter_hosts: params.dns_filter_hosts.clone(),
-                            gpu: self.gpu || params.gpu,
-                            gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
-                            rosetta: false,
+                        Some({
+                            let mut o = DefaultVmOverrides::from_create_params(
+                                &params,
+                                mount_tuples,
+                                staged_mounts,
+                                port_tuples,
+                            );
+                            // A one-shot run keeps no image on its record; the
+                            // command line flags may enable features on top of
+                            // what the Smolfile asked for.
+                            o.image = None;
+                            o.ssh_agent = self.ssh_agent || o.ssh_agent;
+                            o.cuda = self.cuda || o.cuda;
+                            o.docker_socket = self.docker_socket || o.docker_socket;
+                            o.gpu = self.gpu || o.gpu;
+                            o.gpu_vram_mib = self.gpu_vram_mib.or(o.gpu_vram_mib);
+                            o
                         }),
                     )?;
                 }

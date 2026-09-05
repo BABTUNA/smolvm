@@ -528,6 +528,96 @@ mod tests {
         )
     }
 
+    /// Every launch setting a Smolfile can express must reach every carrier
+    /// it is later read from. Each hop below is the one function that path
+    /// uses, so a setting added to the Smolfile but not carried by one of them
+    /// fails here instead of surfacing as a machine that silently ignores it
+    /// (which is how `user` was lost once on the record and once on the pack
+    /// manifest). Add a line per hop when adding a launch setting.
+    #[test]
+    fn every_launch_setting_survives_every_hop() {
+        use crate::cli::vm_common::{apply_overrides, build_vm_record, DefaultVmOverrides};
+        use smolvm::config::VmRecord;
+        use smolvm::pack_export::{seed_manifest_from_vm, FromVmAssets};
+        use smolvm_pack::format::{PackManifest, PackMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            r#"
+image = "library/alpine:latest"
+net = true
+entrypoint = ["/bin/sh", "-c"]
+cmd = ["sleep infinity"]
+env = ["GREETING=hello", "EMPTY="]
+workdir = "/srv/app"
+user = "501:20"
+init = ["echo init"]
+"#,
+        )
+        .unwrap();
+        let params = build_from_smolfile(path).unwrap();
+
+        // Hop 1: Smolfile -> create params.
+        assert_eq!(params.image.as_deref(), Some("library/alpine:latest"));
+        assert_eq!(params.entrypoint, vec!["/bin/sh", "-c"]);
+        assert_eq!(params.cmd, vec!["sleep infinity"]);
+        assert_eq!(params.env, vec!["GREETING=hello", "EMPTY="]);
+        assert_eq!(params.workdir.as_deref(), Some("/srv/app"));
+        assert_eq!(params.user.as_deref(), Some("501:20"));
+        assert_eq!(params.init, vec!["echo init"]);
+
+        // Hop 2a: create params -> record, the `machine create` path.
+        let created = build_vm_record(&params).unwrap();
+        assert_eq!(created.image, params.image);
+        assert_eq!(created.entrypoint, params.entrypoint);
+        assert_eq!(created.cmd, params.cmd);
+        assert_eq!(
+            created.env,
+            vec![
+                ("GREETING".to_string(), "hello".to_string()),
+                ("EMPTY".to_string(), String::new())
+            ]
+        );
+        assert_eq!(created.workdir, params.workdir);
+        assert_eq!(created.user, params.user);
+        assert_eq!(created.init, params.init);
+
+        // Hop 2b: create params -> overrides -> record, the `run` and
+        // first-launch paths.
+        let overrides = DefaultVmOverrides::from_create_params(&params, vec![], vec![], vec![]);
+        let mut persisted = VmRecord::new("parity".to_string(), 1, 512, vec![], vec![], true);
+        apply_overrides(&mut persisted, &overrides);
+        assert_eq!(persisted.image, params.image);
+        assert_eq!(persisted.entrypoint, params.entrypoint);
+        assert_eq!(persisted.cmd, params.cmd);
+        assert_eq!(persisted.env, created.env);
+        assert_eq!(persisted.workdir, params.workdir);
+        assert_eq!(persisted.user, params.user);
+        assert_eq!(persisted.init, params.init);
+
+        // Hop 3: record -> pack manifest, the `pack create --from-vm` path.
+        let mut manifest = PackManifest::new(
+            "library/alpine:latest".to_string(),
+            "sha256:0".to_string(),
+            "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
+        );
+        let assets = FromVmAssets {
+            mode: PackMode::Container,
+            image: params.image.clone(),
+            image_env: vec![],
+            layer_bytes: 0,
+        };
+        seed_manifest_from_vm(&mut manifest, &persisted, &assets);
+        assert_eq!(manifest.entrypoint, params.entrypoint);
+        assert_eq!(manifest.cmd, params.cmd);
+        assert!(manifest.env.contains(&"GREETING=hello".to_string()));
+        assert_eq!(manifest.workdir, params.workdir);
+        assert_eq!(manifest.user, params.user);
+    }
+
     #[test]
     fn smolfile_port_ranges_expand_before_create() {
         let dir = tempfile::tempdir().unwrap();
