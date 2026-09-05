@@ -19,6 +19,21 @@ pub const CUDA_PRELOAD_MODULES_HINT: &str = "cuda-preload-modules";
 /// Agent capability required by readiness-gated fork-pool leases.
 pub const WORKER_READY_CAPABILITY: &str = "fork-worker-ready-v1";
 
+/// Agent capability for parking an idle branchpoint until the host arms it.
+pub const ARMING_CAPABILITY: &str = "branchpoint-arming-v1";
+
+/// Host marker that asks the branchpoint helper to enter its capture-safe loop.
+pub const ARM_PATH: &str = "/run/smolvm/forkpoint/arm";
+
+/// Helper acknowledgement that it is safe for the host to capture the vCPU.
+pub const ARMED_PATH: &str = "/run/smolvm/forkpoint/armed";
+
+/// Generation-addressed arm marker prefix.
+pub const ARM_PREFIX: &str = "smolvm-forkpoint-arm-v1:";
+
+/// Generation-addressed arm acknowledgement prefix.
+pub const ARMED_PREFIX: &str = "smolvm-forkpoint-armed-v1:";
+
 /// Marker written after a restored clone can safely enter ordinary timed waits.
 pub const RESTORED_PATH: &str = "/run/smolvm/forkpoint/restored";
 

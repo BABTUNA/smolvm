@@ -261,6 +261,114 @@ pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
     }
 }
 
+fn build_arm_forkpoint_script() -> String {
+    format!(
+        "if [ ! -f '{ready}' ]; then exit 3; fi; \
+         generation=$(sed -n 's/^{generation_prefix}//p' '{ready}' | head -n 1); \
+         case \"$generation\" in ''|*[!0-9a-fA-F]*) exit 4 ;; esac; \
+         [ \"${{#generation}}\" -eq 32 ] || exit 4; \
+         rm -f '{arm}'; \
+         i=0; while [ -e '{armed}' ]; do \
+           i=$((i + 1)); [ \"$i\" -lt 400 ] || exit 47; sleep 0.005; \
+         done; \
+         printf '%s%s\\n' '{arm_prefix}' \"$generation\" > '{arm}.tmp'; \
+         mv '{arm}.tmp' '{arm}'; \
+         i=0; until grep -q -x '{armed_prefix}'\"$generation\" '{armed}' 2>/dev/null; do \
+           i=$((i + 1)); [ \"$i\" -lt 400 ] || exit 47; sleep 0.005; \
+         done",
+        arm = smolvm_protocol::forkpoint::ARM_PATH,
+        armed = smolvm_protocol::forkpoint::ARMED_PATH,
+        arm_prefix = smolvm_protocol::forkpoint::ARM_PREFIX,
+        armed_prefix = smolvm_protocol::forkpoint::ARMED_PREFIX,
+        generation_prefix = smolvm_protocol::forkpoint::GENERATION_PREFIX,
+        ready = smolvm_protocol::forkpoint::READY_PATH,
+    )
+}
+
+/// Put a negotiated workload helper into its restore-safe userspace loop just
+/// before capture. A branchable machine without a helper remains a valid
+/// immediate snapshot source, and an older guest keeps its legacy loop.
+fn arm_forkpoint_for_capture(golden: &str) -> Result<bool> {
+    let socket = vm_data_dir(golden).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&socket)
+        .map_err(|e| Error::agent("arm branchpoint", format!("agent connect: {e}")))?;
+    if !client
+        .supports_capability(smolvm_protocol::forkpoint::ARMING_CAPABILITY)
+        .map_err(|e| Error::agent("arm branchpoint", e.to_string()))?
+    {
+        return Ok(false);
+    }
+    match client.vm_exec(
+        vec!["/bin/sh".into(), "-c".into(), build_arm_forkpoint_script()],
+        vec![],
+        None,
+        Some(Duration::from_secs(3)),
+        None,
+    ) {
+        Ok((0, _, _)) => Ok(true),
+        Ok((3, _, _)) => Ok(false),
+        Ok((47, _, _)) => Err(Error::agent(
+            "arm branchpoint",
+            format!("source '{golden}' did not acknowledge the capture arm marker"),
+        )),
+        Ok((code, _, stderr)) => Err(Error::agent(
+            "arm branchpoint",
+            format!(
+                "source '{golden}' arm exited {code}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        )),
+        Err(error) => Err(Error::agent(
+            "arm branchpoint",
+            format!("source '{golden}': {error}"),
+        )),
+    }
+}
+
+fn build_park_forkpoint_script() -> String {
+    format!(
+        "rm -f '{arm}'; \
+         i=0; while [ -e '{armed}' ]; do \
+           i=$((i + 1)); [ \"$i\" -lt 400 ] || exit 47; sleep 0.005; \
+         done",
+        arm = smolvm_protocol::forkpoint::ARM_PATH,
+        armed = smolvm_protocol::forkpoint::ARMED_PATH,
+    )
+}
+
+/// Park the continued source after capture. Failure is reported to the caller,
+/// which can retain the valid snapshot while making the performance fault
+/// visible instead of corrupting a completed branch generation.
+fn park_forkpoint_after_capture(golden: &str) -> Result<()> {
+    let socket = vm_data_dir(golden).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&socket)
+        .map_err(|e| Error::agent("park branchpoint", format!("agent connect: {e}")))?;
+    match client.vm_exec(
+        vec!["/bin/sh".into(), "-c".into(), build_park_forkpoint_script()],
+        vec![],
+        None,
+        Some(Duration::from_secs(3)),
+        None,
+    ) {
+        Ok((0, _, _)) => Ok(()),
+        Ok((47, _, _)) => Err(Error::agent(
+            "park branchpoint",
+            format!("source '{golden}' did not leave its capture loop"),
+        )),
+        Ok((code, _, stderr)) => Err(Error::agent(
+            "park branchpoint",
+            format!(
+                "source '{golden}' park exited {code}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        )),
+        Err(error) => Err(Error::agent(
+            "park branchpoint",
+            format!("source '{golden}': {error}"),
+        )),
+    }
+}
+
 fn fork_base_already_paused(status: &str) -> bool {
     status.trim() == "OK paused"
 }
@@ -1653,10 +1761,25 @@ pub(crate) fn prepare_forks_reusing(
             return Err(error);
         }
 
+        let forkpoint_armed = match arm_forkpoint_for_capture(golden) {
+            Ok(armed) => armed,
+            Err(error) => {
+                // An acknowledgement timeout may still have left the helper in
+                // its capture loop. Best-effort parking keeps a failed capture
+                // from turning into a permanent host-CPU leak.
+                let _ = park_forkpoint_after_capture(golden);
+                let _ = std::fs::remove_dir_all(&snapshot_dir);
+                return Err(error);
+            }
+        };
+
         let fork_continue = fork_continue_enabled();
         if fork_continue {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Err(error) = prepare_running_disk_generation(&gdir, &snapshot_dir, vm_ids) {
+                if forkpoint_armed {
+                    let _ = park_forkpoint_after_capture(golden);
+                }
                 let _ = std::fs::remove_dir_all(&snapshot_dir);
                 return Err(error);
             }
@@ -1677,6 +1800,11 @@ pub(crate) fn prepare_forks_reusing(
             "FORK"
         };
         let reply = control_socket_cmd(&ctl, &format!("{fork_verb} {}", snapshot_dir.display()));
+        if fork_continue && forkpoint_armed {
+            if let Err(error) = park_forkpoint_after_capture(golden) {
+                tracing::warn!(%golden, %error, "continued source did not park after capture");
+            }
+        }
         let reply = match reply {
             Ok(reply) if reply.starts_with("OK") => reply,
             Ok(reply) => {
@@ -3186,6 +3314,41 @@ mod tests {
             .expect("ready marker must be observed");
         assert!(publish < acknowledge);
         assert!(script.contains("exit 46"));
+    }
+
+    #[test]
+    fn forkpoint_arm_is_generation_scoped_and_waits_for_acknowledgement() {
+        let script = build_arm_forkpoint_script();
+        let ready = script
+            .find(smolvm_protocol::forkpoint::READY_PATH)
+            .expect("ready marker must be read");
+        let publish = script
+            .find(smolvm_protocol::forkpoint::ARM_PATH)
+            .expect("arm marker must be published");
+        let acknowledge = script
+            .rfind(smolvm_protocol::forkpoint::ARMED_PATH)
+            .expect("armed marker must be observed");
+
+        assert!(ready < publish);
+        assert!(publish < acknowledge);
+        assert!(script.contains(smolvm_protocol::forkpoint::GENERATION_PREFIX));
+        assert!(script.contains(smolvm_protocol::forkpoint::ARM_PREFIX));
+        assert!(script.contains(smolvm_protocol::forkpoint::ARMED_PREFIX));
+        assert!(script.contains("exit 47"));
+    }
+
+    #[test]
+    fn forkpoint_park_disarms_before_waiting_for_idle_acknowledgement() {
+        let script = build_park_forkpoint_script();
+        let disarm = script
+            .find(smolvm_protocol::forkpoint::ARM_PATH)
+            .expect("arm marker must be removed");
+        let idle_ack = script
+            .rfind(smolvm_protocol::forkpoint::ARMED_PATH)
+            .expect("armed marker removal must be observed");
+
+        assert!(disarm < idle_ack);
+        assert!(script.contains("exit 47"));
     }
 
     #[test]

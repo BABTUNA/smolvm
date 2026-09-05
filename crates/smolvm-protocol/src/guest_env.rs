@@ -35,6 +35,14 @@ pub const CUDA_ZEROCOPY: &str = "SMOLVM_CUDA_ZEROCOPY";
 /// Fork clones inherit the already-running helper from the golden snapshot.
 pub const FORKABLE: &str = "SMOLVM_FORKABLE";
 
+/// The host can arm a branchpoint immediately before capture.
+///
+/// New agents use this handshake to sleep while a branchable source is idle,
+/// then enter the restore-safe userspace loop only for the brief capture
+/// window. An older host does not set the sentinel, so a newer agent preserves
+/// the legacy always-spinning behavior and remains compatible.
+pub const BRANCHPOINT_ARMING: &str = "SMOLVM_BRANCHPOINT_ARMING";
+
 /// Planned CUDA fork-pool size passed to the guest agent.
 ///
 /// The agent uses this to select fork-friendly workload defaults only when a

@@ -1983,6 +1983,10 @@ impl AgentManager {
             let mut v = Vec::new();
             if features.forkable {
                 v.push((smolvm_protocol::guest_env::FORKABLE, "1".to_string()));
+                v.push((
+                    smolvm_protocol::guest_env::BRANCHPOINT_ARMING,
+                    smolvm_protocol::guest_env::VALUE_ON.to_string(),
+                ));
             }
             // Embedder override for the control socket path; without it the
             // launcher defaults to control.sock in the per-VM dir.

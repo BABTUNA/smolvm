@@ -10,16 +10,30 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt as _;
+
 const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
 use smolvm_protocol::forkpoint::{
-    BRANCH_ENV_PATH, BRANCH_HELPER_PATH, CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH,
-    GENERATION_PREFIX, HELPER_PATH, LEGACY_RELEASE_TOKEN, READY_PATH, READY_VERSION, RELEASE_PATH,
-    RELEASE_PREFIX, RESTORED_CONTAINER_PATH, RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH,
-    WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
+    ARMED_PATH, ARMED_PREFIX, ARM_PATH, ARM_PREFIX, BRANCH_ENV_PATH, BRANCH_HELPER_PATH,
+    CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH, GENERATION_PREFIX, HELPER_PATH, LEGACY_RELEASE_TOKEN,
+    READY_PATH, READY_VERSION, RELEASE_PATH, RELEASE_PREFIX, RESTORED_CONTAINER_PATH,
+    RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH, WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
 };
 
 fn enabled() -> bool {
     std::env::var(smolvm_protocol::guest_env::FORKABLE).as_deref()
+        == Ok(smolvm_protocol::guest_env::VALUE_ON)
+}
+
+/// Whether the paired host supports parking and arming an idle branchpoint.
+///
+/// This is negotiated by the host at boot. A new guest launched by an older
+/// host leaves it unset and retains the legacy always-spinning behavior.
+pub fn arming_enabled() -> bool {
+    std::env::var(smolvm_protocol::guest_env::BRANCHPOINT_ARMING).as_deref()
         == Ok(smolvm_protocol::guest_env::VALUE_ON)
 }
 
@@ -67,6 +81,8 @@ pub fn setup() {
     let _ = std::fs::remove_file(RESTORED_PATH);
     let _ = std::fs::remove_file(RELEASE_PATH);
     let _ = std::fs::remove_file(WORKER_READY_PATH);
+    let _ = std::fs::remove_file(ARM_PATH);
+    let _ = std::fs::remove_file(ARMED_PATH);
 
     for helper in [BRANCH_HELPER_PATH, HELPER_PATH, WORKER_READY_HELPER_PATH] {
         if !Path::new(helper).exists() {
@@ -80,12 +96,13 @@ pub fn setup() {
 /// Expose the forkpoint helper and its VM-private state directory inside a
 /// workload container. No-op for ordinary machines.
 pub fn inject_into_container(spec: &mut crate::oci::OciSpec) {
-    inject_into_container_if(spec, enabled(), AGENT_BINARY, STATE_DIR);
+    inject_into_container_if(spec, enabled(), arming_enabled(), AGENT_BINARY, STATE_DIR);
 }
 
 fn inject_into_container_if(
     spec: &mut crate::oci::OciSpec,
     enabled: bool,
+    armable: bool,
     agent_binary: &str,
     state_dir: &str,
 ) {
@@ -96,6 +113,12 @@ fn inject_into_container_if(
     spec.add_bind_mount(agent_binary, BRANCH_HELPER_PATH, true);
     spec.add_bind_mount(agent_binary, WORKER_READY_HELPER_PATH, true);
     spec.add_bind_mount(state_dir, STATE_DIR, false);
+    if armable {
+        spec.add_env(
+            smolvm_protocol::guest_env::BRANCHPOINT_ARMING,
+            smolvm_protocol::guest_env::VALUE_ON,
+        );
+    }
 }
 
 /// Mark the workload ready and block until this VM is a released clone.
@@ -110,23 +133,108 @@ pub fn run_helper() -> i32 {
 
 fn run_helper_inner(preload_modules: bool) -> Result<(), String> {
     run_helper_at(
-        Path::new(STATE_DIR),
-        Path::new(READY_PATH),
-        Path::new(RESTORED_PATH),
-        Path::new(RELEASE_PATH),
+        ForkpointPaths {
+            state_dir: Path::new(STATE_DIR),
+            ready_path: Path::new(READY_PATH),
+            restored_path: Path::new(RESTORED_PATH),
+            release_path: Path::new(RELEASE_PATH),
+            arm_path: Path::new(ARM_PATH),
+            armed_path: Path::new(ARMED_PATH),
+        },
         Duration::from_millis(20),
         preload_modules,
+        arming_enabled(),
     )
 }
 
+/// Block in the guest kernel until the host changes branchpoint state. The
+/// helper always checks the marker files before waiting, so the inotify queue
+/// closes the check/sleep race without periodic vCPU wakeups. If inotify is
+/// unavailable, the caller retains the bounded polling fallback.
+#[cfg(target_os = "linux")]
+struct StateChangeWaiter {
+    fd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl StateChangeWaiter {
+    fn new(state_dir: &Path) -> std::io::Result<Self> {
+        let path = std::ffi::CString::new(state_dir.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "branchpoint state path contains NUL",
+            )
+        })?;
+        let raw_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if raw_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let mask = libc::IN_CREATE
+            | libc::IN_DELETE
+            | libc::IN_MOVED_FROM
+            | libc::IN_MOVED_TO
+            | libc::IN_CLOSE_WRITE;
+        if unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), mask) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    fn wait(&self) -> bool {
+        let mut descriptor = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let ready = unsafe { libc::poll(&mut descriptor, 1, -1) };
+            if ready > 0 {
+                let mut events = [0_u8; 1024];
+                let _ = unsafe {
+                    libc::read(
+                        self.fd.as_raw_fd(),
+                        events.as_mut_ptr().cast(),
+                        events.len(),
+                    )
+                };
+                return true;
+            }
+            if ready == 0 {
+                continue;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+    }
+}
+
+struct ForkpointPaths<'a> {
+    state_dir: &'a Path,
+    ready_path: &'a Path,
+    restored_path: &'a Path,
+    release_path: &'a Path,
+    arm_path: &'a Path,
+    armed_path: &'a Path,
+}
+
 fn run_helper_at(
-    state_dir: &Path,
-    ready_path: &Path,
-    restored_path: &Path,
-    release_path: &Path,
+    paths: ForkpointPaths<'_>,
     poll_interval: Duration,
     preload_modules: bool,
+    use_arming: bool,
 ) -> Result<(), String> {
+    let ForkpointPaths {
+        state_dir,
+        ready_path,
+        restored_path,
+        release_path,
+        arm_path,
+        armed_path,
+    } = paths;
     std::fs::create_dir_all(state_dir)
         .map_err(|error| format!("create {}: {error}", state_dir.display()))?;
     let _ = std::fs::remove_file(release_path);
@@ -153,17 +261,54 @@ fn run_helper_at(
     println!("smolvm branch point ready; waiting for child release");
     let _ = std::io::stdout().flush();
 
-    // Keep the snapshot boundary out of a timed kernel wait. Some VMM restore
-    // paths cannot reliably re-arm an inherited sleeping thread, which can
-    // leave every clone from that checkpoint parked after a successful host
-    // release. A restored clone writes RESTORED_PATH during identity setup;
-    // waits started after that point are native to the clone and safe to use.
-    while !restored_path.is_file() {
-        if release_matches(release_path, &generation) {
-            acknowledge_generation(ready_path, &generation);
-            return Ok(());
+    #[cfg(target_os = "linux")]
+    let mut change_waiter = use_arming
+        .then(|| StateChangeWaiter::new(state_dir).ok())
+        .flatten();
+
+    // A timed kernel wait captured in the snapshot is not reliably re-armed by
+    // every VMM restore path. Older hosts therefore require the legacy
+    // userspace loop below. A paired host advertises the arming protocol: the
+    // source sleeps while idle, the host writes ARM_PATH immediately before
+    // capture and waits for ARMED_PATH, and only that short capture window uses
+    // the restore-safe userspace loop. Once the source continues, removing the
+    // arm marker parks it again instead of consuming one host core forever.
+    if use_arming {
+        while !restored_path.is_file() {
+            if release_matches(release_path, &generation) {
+                acknowledge_generation(ready_path, &generation);
+                return Ok(());
+            }
+            if arm_matches(arm_path, &generation) {
+                publish_generation_marker(armed_path, ARMED_PREFIX, &generation)?;
+                while !restored_path.is_file() && arm_matches(arm_path, &generation) {
+                    if release_matches(release_path, &generation) {
+                        let _ = std::fs::remove_file(armed_path);
+                        acknowledge_generation(ready_path, &generation);
+                        return Ok(());
+                    }
+                    std::thread::yield_now();
+                }
+                let _ = std::fs::remove_file(armed_path);
+            } else {
+                #[cfg(target_os = "linux")]
+                if let Some(waiter) = &change_waiter {
+                    if waiter.wait() {
+                        continue;
+                    }
+                    change_waiter = None;
+                }
+                std::thread::sleep(poll_interval);
+            }
         }
-        std::thread::yield_now();
+    } else {
+        while !restored_path.is_file() {
+            if release_matches(release_path, &generation) {
+                acknowledge_generation(ready_path, &generation);
+                return Ok(());
+            }
+            std::thread::yield_now();
+        }
     }
 
     loop {
@@ -265,6 +410,35 @@ fn release_matches(release_path: &Path, generation: &str) -> bool {
     })
 }
 
+fn arm_matches(arm_path: &Path, generation: &str) -> bool {
+    marker_matches(arm_path, ARM_PREFIX, generation)
+}
+
+fn marker_matches(path: &Path, prefix: &str, generation: &str) -> bool {
+    std::fs::read_to_string(path)
+        .is_ok_and(|marker| marker.trim() == format!("{prefix}{generation}"))
+}
+
+fn publish_generation_marker(path: &Path, prefix: &str, generation: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    let temporary = parent.join(format!(".armed.{}.tmp", std::process::id()));
+    let mut marker = std::fs::File::create(&temporary)
+        .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+    if let Err(error) = marker
+        .write_all(format!("{prefix}{generation}\n").as_bytes())
+        .and_then(|()| marker.sync_all())
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("write {}: {error}", temporary.display()));
+    }
+    std::fs::rename(&temporary, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("publish {}: {error}", path.display())
+    })
+}
+
 fn acknowledge_generation(ready_path: &Path, generation: &str) {
     let is_current = std::fs::read_to_string(ready_path).is_ok_and(|ready| {
         ready
@@ -316,7 +490,7 @@ mod tests {
     #[test]
     fn ordinary_container_does_not_receive_helper() {
         let mut spec = spec();
-        inject_into_container_if(&mut spec, false, "/missing-agent", "/missing-state");
+        inject_into_container_if(&mut spec, false, false, "/missing-agent", "/missing-state");
         assert!(spec
             .mounts
             .iter()
@@ -336,6 +510,7 @@ mod tests {
         let mut spec = spec();
         inject_into_container_if(
             &mut spec,
+            true,
             true,
             agent.to_str().unwrap(),
             state.to_str().unwrap(),
@@ -364,6 +539,11 @@ mod tests {
             .options
             .iter()
             .any(|option| option == "ro"));
+        assert!(spec.process.env.contains(&format!(
+            "{}={}",
+            smolvm_protocol::guest_env::BRANCHPOINT_ARMING,
+            smolvm_protocol::guest_env::VALUE_ON
+        )));
         let state_mount = spec
             .mounts
             .iter()
@@ -374,12 +554,40 @@ mod tests {
     }
 
     #[test]
+    fn older_host_does_not_enable_arming_in_a_new_container() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent = temp.path().join("smolvm-agent");
+        let state = temp.path().join("forkpoint");
+        std::fs::write(&agent, b"agent").unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let mut spec = spec();
+
+        inject_into_container_if(
+            &mut spec,
+            true,
+            false,
+            agent.to_str().unwrap(),
+            state.to_str().unwrap(),
+        );
+
+        let prefix = format!("{}=", smolvm_protocol::guest_env::BRANCHPOINT_ARMING);
+        assert!(spec
+            .process
+            .env
+            .iter()
+            .all(|entry| !entry.starts_with(&prefix)));
+    }
+
+    #[test]
     fn helper_blocks_until_release_marker() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("forkpoint");
         let ready = state.join("ready");
         let restored = state.join("restored");
         let release = state.join("release");
+        let arm = state.join("arm");
+        let armed = state.join("armed");
         std::fs::create_dir(&state).unwrap();
 
         let state_thread = state.clone();
@@ -387,11 +595,16 @@ mod tests {
         let release_thread = release.clone();
         let helper = std::thread::spawn(move || {
             run_helper_at(
-                &state_thread,
-                &ready_thread,
-                &state_thread.join("restored"),
-                &release_thread,
+                ForkpointPaths {
+                    state_dir: &state_thread,
+                    ready_path: &ready_thread,
+                    restored_path: &state_thread.join("restored"),
+                    release_path: &release_thread,
+                    arm_path: &state_thread.join("arm"),
+                    armed_path: &state_thread.join("armed"),
+                },
                 Duration::from_millis(1),
+                false,
                 false,
             )
         });
@@ -406,6 +619,8 @@ mod tests {
         std::fs::write(&release, format!("{RELEASE_PREFIX}{generation}\n")).unwrap();
         helper.join().unwrap().unwrap();
         assert!(!ready.exists());
+        assert!(!arm.exists());
+        assert!(!armed.exists());
     }
 
     #[test]
@@ -423,11 +638,16 @@ mod tests {
         let release_thread = release.clone();
         let helper = std::thread::spawn(move || {
             run_helper_at(
-                &state_thread,
-                &ready_thread,
-                &restored_thread,
-                &release_thread,
+                ForkpointPaths {
+                    state_dir: &state_thread,
+                    ready_path: &ready_thread,
+                    restored_path: &restored_thread,
+                    release_path: &release_thread,
+                    arm_path: &state_thread.join("arm"),
+                    armed_path: &state_thread.join("armed"),
+                },
                 Duration::from_secs(60),
+                false,
                 false,
             )
         });
@@ -437,6 +657,62 @@ mod tests {
         std::fs::write(&release, format!("{RELEASE_PREFIX}{generation}\n")).unwrap();
         helper.join().unwrap().unwrap();
         assert!(!ready.exists());
+    }
+
+    #[test]
+    fn armable_helper_sleeps_until_capture_and_parks_again_after_disarm() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("forkpoint");
+        let ready = state.join("ready");
+        let restored = state.join("restored");
+        let release = state.join("release");
+        let arm = state.join("arm");
+        let armed = state.join("armed");
+        std::fs::create_dir(&state).unwrap();
+
+        let state_thread = state.clone();
+        let ready_thread = ready.clone();
+        let restored_thread = restored.clone();
+        let release_thread = release.clone();
+        let arm_thread = arm.clone();
+        let armed_thread = armed.clone();
+        let helper = std::thread::spawn(move || {
+            run_helper_at(
+                ForkpointPaths {
+                    state_dir: &state_thread,
+                    ready_path: &ready_thread,
+                    restored_path: &restored_thread,
+                    release_path: &release_thread,
+                    arm_path: &arm_thread,
+                    armed_path: &armed_thread,
+                },
+                Duration::from_millis(1),
+                false,
+                true,
+            )
+        });
+        wait_for_marker(&ready);
+        let generation = marker_generation(&ready);
+        assert!(!armed.exists());
+
+        std::fs::write(&arm, format!("{ARM_PREFIX}{generation}\n")).unwrap();
+        wait_for_marker(&armed);
+        assert!(marker_matches(&armed, ARMED_PREFIX, &generation));
+        std::fs::remove_file(&arm).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while armed.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!armed.exists());
+        assert!(!helper.is_finished());
+
+        std::fs::write(&arm, format!("{ARM_PREFIX}{generation}\n")).unwrap();
+        wait_for_marker(&armed);
+        std::fs::write(&restored, b"restored\n").unwrap();
+        std::fs::write(&release, format!("{RELEASE_PREFIX}{generation}\n")).unwrap();
+        helper.join().unwrap().unwrap();
+        assert!(!ready.exists());
+        assert!(!armed.exists());
     }
 
     #[test]

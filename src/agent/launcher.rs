@@ -1989,6 +1989,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             )));
         }
 
+        if std::env::var(guest_env::BRANCHPOINT_ARMING).as_deref() == Ok(guest_env::VALUE_ON) {
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::BRANCHPOINT_ARMING,
+                guest_env::VALUE_ON
+            )));
+        }
+
         if let Ok(pool_size) = std::env::var(guest_env::CUDA_FORK_POOL_SIZE) {
             env_strings.push(cstr(&format!(
                 "{}={pool_size}",
