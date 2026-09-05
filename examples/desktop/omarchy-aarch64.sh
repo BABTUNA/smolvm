@@ -67,10 +67,29 @@ if [ ! -d /usr/share/omarchy ]; then
   done
   [ "$ok" = 1 ] || { tail -5 /tmp/pac0.log; exit 1; }
 
+  # A failed attempt leaves the clone behind and git refuses to clone into it,
+  # so every rerun would die here instead of retrying the install.
+  rm -rf /tmp/om
   git clone -q --depth 1 https://github.com/basecamp/omarchy /tmp/om || exit 1
   mapfile -t PKGS < <(grep -vE "^\s*#|^\s*$" /tmp/om/install/omarchy-base.packages)
   OK=()
   for p in "${PKGS[@]}"; do pacman -Si "$p" >/dev/null 2>&1 && OK+=("$p"); done
+  # A fresh install is only as reproducible as the Arch Linux ARM repositories
+  # are consistent that day: a package can be rebuilt against a library the
+  # repository has already moved past (seen: hyprland and hyprtoolkit requiring
+  # libaquamarine.so=13 after aquamarine had moved on to so=14), and then the
+  # compositor cannot be installed at all. When the recipe's /in directory
+  # carries a pkgs/ directory of known-good packages, install those first and
+  # pin them so the repository cannot replace them with a set that does not
+  # resolve. Without pkgs/ this does nothing.
+  pkgfiles=$(ls /in/pkgs/*.pkg.tar.xz /in/pkgs/*.pkg.tar.zst 2>/dev/null)
+  if [ -n "$pkgfiles" ]; then
+    pacman -U --noconfirm --needed $pkgfiles >/tmp/pacU.log 2>&1 \
+      || { tail -5 /tmp/pacU.log; exit 1; }
+    pinned=$(for f in $pkgfiles; do basename "$f" | sed -E 's/-[^-]+-[0-9]+-(aarch64|any|x86_64)\.pkg\.tar\.(xz|zst)$//'; done | sort -u | tr '\n' ' ')
+    sed -i "s/^#\{0,1\}IgnorePkg.*/IgnorePkg = $pinned/" /etc/pacman.conf
+    log "pinned known-good packages: $pinned"
+  fi
   log "installing ${#OK[@]}/${#PKGS[@]} base packages available on aarch64"
   ok=0
   for _ in 1 2 3; do
