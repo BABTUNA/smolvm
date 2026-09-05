@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Metadata applied to an uploaded file after it lands: permissions and
 /// ownership. Ownership matters for non-root workload images — a root-owned
@@ -99,6 +99,147 @@ const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 /// Default socket write timeout (10 seconds).
 /// Writes should complete quickly - if they don't, the connection is likely broken.
 const DEFAULT_WRITE_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum time a framed request may make no write progress after the socket's
+/// own timeout expires. Concurrent large transfers can legitimately fill the
+/// guest RX queue; retrying from the exact byte offset provides backpressure
+/// without corrupting the length-prefixed protocol stream.
+const REQUEST_WRITE_IDLE_TIMEOUT_SECS: u64 = 30;
+
+/// Large file chunks get a wider backpressure window. A verifier artifact can
+/// be hundreds of MiB and several branches may upload at once, while each
+/// individual frame is still bounded by the protocol limit.
+const FILE_WRITE_IDLE_TIMEOUT_SECS: u64 = 120;
+
+fn write_all_with_idle_timeout<W: Write>(
+    writer: &mut W,
+    data: &[u8],
+    idle_timeout: Duration,
+) -> std::io::Result<()> {
+    let mut written = 0;
+    let mut last_progress = Instant::now();
+    while written < data.len() {
+        match writer.write(&data[written..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "agent socket accepted no bytes",
+                ));
+            }
+            Ok(count) => {
+                written += count;
+                last_progress = Instant::now();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if last_progress.elapsed() >= idle_timeout {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "agent socket made no write progress for {:.1}s",
+                            idle_timeout.as_secs_f64()
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    writer.flush()
+}
+
+#[cfg(test)]
+mod write_backpressure_tests {
+    use super::*;
+
+    struct PartialThenBlocked {
+        calls: usize,
+        output: Vec<u8>,
+    }
+
+    impl Write for PartialThenBlocked {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 2 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            let count = if self.calls == 1 {
+                data.len().min(3)
+            } else {
+                data.len()
+            };
+            self.output.extend_from_slice(&data[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn framed_write_resumes_after_partial_progress_and_backpressure() {
+        let mut writer = PartialThenBlocked {
+            calls: 0,
+            output: Vec::new(),
+        };
+        write_all_with_idle_timeout(&mut writer, b"complete frame", Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(writer.output, b"complete frame");
+    }
+
+    #[test]
+    fn framed_write_retries_platform_socket_timeout() {
+        struct TimedOutOnce {
+            blocked: bool,
+            output: Vec<u8>,
+        }
+        impl Write for TimedOutOnce {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                if !self.blocked {
+                    self.blocked = true;
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                self.output.extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = TimedOutOnce {
+            blocked: false,
+            output: Vec::new(),
+        };
+        write_all_with_idle_timeout(&mut writer, b"complete frame", Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(writer.output, b"complete frame");
+    }
+
+    #[test]
+    fn framed_write_bounds_a_peer_that_never_drains() {
+        struct Blocked;
+        impl Write for Blocked {
+            fn write(&mut self, _data: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = write_all_with_idle_timeout(&mut Blocked, b"frame", Duration::ZERO)
+            .expect_err("a permanently blocked peer must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+}
 
 /// Read timeout for image pull operations (10 minutes).
 /// Image pulls can take a long time for large images over slow connections.
@@ -969,10 +1110,20 @@ impl AgentClient {
 
     /// Send a request and receive a response.
     fn request(&mut self, req: &AgentRequest) -> Result<AgentResponse> {
+        self.request_with_write_idle_timeout(
+            req,
+            Duration::from_secs(REQUEST_WRITE_IDLE_TIMEOUT_SECS),
+        )
+    }
+
+    fn request_with_write_idle_timeout(
+        &mut self,
+        req: &AgentRequest,
+        idle_timeout: Duration,
+    ) -> Result<AgentResponse> {
         // Encode and send request
         let data = self.encode_traced(req)?;
-        self.stream
-            .write_all(&data)
+        write_all_with_idle_timeout(&mut self.stream, &data, idle_timeout)
             .map_err(|e| Error::agent("send message", e.to_string()))?;
 
         // Read response
@@ -2091,13 +2242,16 @@ impl AgentClient {
         mut on_progress: F,
     ) -> Result<()> {
         if data.len() <= FILE_WRITE_SINGLE_SHOT_MAX {
-            let resp = self.request(&AgentRequest::FileWrite {
-                path: path.to_string(),
-                data: data.to_vec(),
-                mode: meta.mode,
-                uid: meta.uid,
-                gid: meta.gid,
-            })?;
+            let resp = self.request_with_write_idle_timeout(
+                &AgentRequest::FileWrite {
+                    path: path.to_string(),
+                    data: data.to_vec(),
+                    mode: meta.mode,
+                    uid: meta.uid,
+                    gid: meta.gid,
+                },
+                Duration::from_secs(FILE_WRITE_IDLE_TIMEOUT_SECS),
+            )?;
             expect_ok(resp, "write file")?;
             on_progress(data.len() as u64);
             Ok(())
@@ -2181,13 +2335,17 @@ impl AgentClient {
         meta: FileWriteMeta,
         on_progress: &mut F,
     ) -> Result<()> {
-        let resp = self.request(&AgentRequest::FileWriteBegin {
-            path: path.to_string(),
-            mode: meta.mode,
-            uid: meta.uid,
-            gid: meta.gid,
-            total_size,
-        })?;
+        let transfer_write_timeout = Duration::from_secs(FILE_WRITE_IDLE_TIMEOUT_SECS);
+        let resp = self.request_with_write_idle_timeout(
+            &AgentRequest::FileWriteBegin {
+                path: path.to_string(),
+                mode: meta.mode,
+                uid: meta.uid,
+                gid: meta.gid,
+                total_size,
+            },
+            transfer_write_timeout,
+        )?;
         expect_ok(resp, "begin streaming write")?;
 
         let mut buf = vec![0u8; FILE_WRITE_CHUNK_SIZE];
@@ -2207,10 +2365,13 @@ impl AgentClient {
 
             if filled == 0 {
                 // EOF — send final empty chunk to finalize.
-                let resp = self.request(&AgentRequest::FileWriteChunk {
-                    data: Vec::new(),
-                    done: true,
-                })?;
+                let resp = self.request_with_write_idle_timeout(
+                    &AgentRequest::FileWriteChunk {
+                        data: Vec::new(),
+                        done: true,
+                    },
+                    transfer_write_timeout,
+                )?;
                 expect_ok(resp, "finalize streaming write")?;
                 break;
             }
@@ -2218,10 +2379,13 @@ impl AgentClient {
             bytes_sent += filled as u64;
             let done = bytes_sent >= total_size;
 
-            let resp = self.request(&AgentRequest::FileWriteChunk {
-                data: buf[..filled].to_vec(),
-                done,
-            })?;
+            let resp = self.request_with_write_idle_timeout(
+                &AgentRequest::FileWriteChunk {
+                    data: buf[..filled].to_vec(),
+                    done,
+                },
+                transfer_write_timeout,
+            )?;
             expect_ok(resp, "stream write chunk")?;
             on_progress(bytes_sent);
 
