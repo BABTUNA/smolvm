@@ -597,7 +597,13 @@ impl OciSpec {
                     vec![]
                 },
             },
-            mounts: default_mounts(unprivileged),
+            mounts: {
+                let mut mounts = default_mounts(unprivileged);
+                if !unprivileged {
+                    mounts.extend(tun_device_mount(Path::new("/dev/net/tun")));
+                }
+                mounts
+            },
             hostname: Some(container_hostname()),
         }
     }
@@ -1029,6 +1035,27 @@ fn default_devices() -> Vec<OciDevice> {
             gid: Some(0),
         },
     ]
+}
+
+/// The guest's `/dev/net/tun`, bind-mounted into the container.
+///
+/// The guest kernel carries the TUN driver and its devtmpfs creates the node,
+/// but the container's `/dev` is a fresh tmpfs built from the spec, so nothing
+/// inside the image can open a tunnel (Tailscale, WireGuard, OpenVPN, any
+/// userspace network stack) until someone runs `mknod` by hand on every boot.
+/// This follows the `/dev/dri` shape rather than adding a `linux.devices`
+/// entry: crun's mknod fails silently when the node's parent directory does
+/// not exist in that tmpfs, and `/dev/net` never does, whereas crun creates
+/// the destination of a bind mount as needed. Nothing is added when the guest
+/// has no such node, so a kernel without TUN simply leaves it out; the caller
+/// keeps it out of unprivileged workloads, whose reduced device view stays.
+fn tun_device_mount(guest_node: &Path) -> Option<OciMount> {
+    guest_node.exists().then(|| OciMount {
+        destination: "/dev/net/tun".to_string(),
+        mount_type: Some("bind".to_string()),
+        source: guest_node.display().to_string(),
+        options: vec!["bind".to_string(), "rprivate".to_string()],
+    })
 }
 
 /// Default mounts for container execution.
@@ -1641,6 +1668,45 @@ mod tests {
                 .contains(&"/proc/kcore".to_string()),
             "unprivileged spec must keep /proc/kcore masked"
         );
+    }
+
+    /// The guest's TUN node is handed to the container as a bind mount, which
+    /// is the only form that survives crun's fresh /dev tmpfs (a device entry
+    /// whose parent directory is missing is dropped silently).
+    #[test]
+    fn tun_node_is_bind_mounted_when_the_guest_has_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("tun");
+        std::fs::write(&node, b"").unwrap();
+
+        let mount = tun_device_mount(&node).expect("an existing node is mounted");
+        assert_eq!(mount.destination, "/dev/net/tun");
+        assert_eq!(mount.source, node.display().to_string());
+        assert_eq!(mount.mount_type.as_deref(), Some("bind"));
+        assert!(mount.options.contains(&"bind".to_string()));
+
+        // A guest kernel without the TUN driver has no node, and nothing is
+        // added rather than a bind mount that would fail at container start.
+        assert!(tun_device_mount(&dir.path().join("absent")).is_none());
+    }
+
+    /// Unprivileged workloads keep the reduced device view: no tunnel node,
+    /// whatever the guest has.
+    #[test]
+    fn unprivileged_workloads_never_get_the_tun_node() {
+        let identity = ProcessIdentity::root();
+        let spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, true);
+        assert!(!spec.mounts.iter().any(|m| m.destination == "/dev/net/tun"));
+    }
+
+    /// The default (VM-grade) spec carries the node whenever this host has it,
+    /// so every path that builds a spec gets it without separate wiring.
+    #[test]
+    fn vm_grade_spec_carries_the_tun_node_when_the_host_has_it() {
+        let identity = ProcessIdentity::root();
+        let spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
+        let has = spec.mounts.iter().any(|m| m.destination == "/dev/net/tun");
+        assert_eq!(has, std::path::Path::new("/dev/net/tun").exists());
     }
 
     #[test]
