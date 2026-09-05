@@ -183,6 +183,29 @@ pub fn resolve_process_identity(
 /// `--user` CLI flag only accepts numeric ids and rejects a name with
 /// `invalid USERSPEC specified` (issue #632).
 ///
+/// The HOME a process gets for `identity`: its passwd home when it has one,
+/// otherwise `/`, which is what Docker gives a numeric uid that has no passwd
+/// entry. Leaving it unset breaks git, pip, npm and most tools that write
+/// under `$HOME`.
+pub fn home_for(identity: &ProcessIdentity) -> &str {
+    identity.home.as_deref().unwrap_or("/")
+}
+
+/// Give an exec its HOME unless the caller supplied one.
+///
+/// The keep-alive `crun exec` path builds a fresh process environment instead
+/// of inheriting the container's, so without this an exec has no HOME at all,
+/// whatever user it runs as. Resolution mirrors the container spec: the exec
+/// user's passwd entry, the container default (root) when no user is given.
+pub fn ensure_exec_home(rootfs: &Path, user_spec: Option<&str>, env: &mut Vec<(String, String)>) {
+    if env.iter().any(|(key, _)| key == "HOME") {
+        return;
+    }
+    if let Ok(identity) = resolve_process_identity(rootfs, user_spec) {
+        env.push(("HOME".to_string(), home_for(&identity).to_string()));
+    }
+}
+
 /// Returns `Ok(None)` for an empty/absent spec so the exec keeps the container
 /// default. Names are resolved against the rootfs `/etc/passwd` via
 /// [`resolve_process_identity`], so this stays consistent with the `crun run`
@@ -497,9 +520,11 @@ impl OciSpec {
             "TERM=xterm-256color".to_string(),
         ];
         if !env.iter().any(|(key, _)| key == "HOME") {
-            if let Some(home) = &identity.home {
-                env_strings.push(format!("HOME={home}"));
-            }
+            // A numeric uid with no passwd entry has no home directory; leave
+            // HOME unset and git, pip, npm and most tools that write under
+            // $HOME fail in confusing ways. Docker falls back to "/" for the
+            // same case, so do the same.
+            env_strings.push(format!("HOME={}", home_for(identity)));
         }
         env_strings.extend(env.iter().map(|(k, v)| format!("{}={}", k, v)));
 
@@ -1707,6 +1732,68 @@ mod tests {
         let spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
         let has = spec.mounts.iter().any(|m| m.destination == "/dev/net/tun");
         assert_eq!(has, std::path::Path::new("/dev/net/tun").exists());
+    }
+
+    /// An exec gets HOME from the exec user's passwd entry, `/` for a numeric
+    /// uid without one, and never overrides a HOME the caller supplied.
+    #[test]
+    fn exec_env_gets_a_home_for_its_user() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("etc")).unwrap();
+        std::fs::write(
+            rootfs.path().join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nsteam:x:1000:1000::/home/steam:/bin/sh\n",
+        )
+        .unwrap();
+        std::fs::write(
+            rootfs.path().join("etc/group"),
+            "root:x:0:\nsteam:x:1000:\n",
+        )
+        .unwrap();
+
+        let mut env = vec![];
+        ensure_exec_home(rootfs.path(), Some("steam"), &mut env);
+        assert_eq!(env, vec![("HOME".to_string(), "/home/steam".to_string())]);
+
+        let mut env = vec![];
+        ensure_exec_home(rootfs.path(), Some("4242"), &mut env);
+        assert_eq!(env, vec![("HOME".to_string(), "/".to_string())]);
+
+        let mut env = vec![];
+        ensure_exec_home(rootfs.path(), None, &mut env);
+        assert_eq!(env, vec![("HOME".to_string(), "/root".to_string())]);
+
+        let mut env = vec![("HOME".to_string(), "/srv".to_string())];
+        ensure_exec_home(rootfs.path(), Some("steam"), &mut env);
+        assert_eq!(env, vec![("HOME".to_string(), "/srv".to_string())]);
+    }
+
+    /// A numeric uid that has no passwd entry still gets a HOME, as Docker
+    /// gives it, so tools that write under $HOME do not fail on an empty path.
+    #[test]
+    fn a_user_without_a_passwd_entry_gets_home_root() {
+        let identity = ProcessIdentity {
+            user: OciUser {
+                uid: 4242,
+                gid: 0,
+                additional_gids: vec![],
+            },
+            home: None,
+        };
+        let spec = OciSpec::new(&["sh".to_string()], &[], "/", false, &identity, false);
+        assert!(spec.process.env.contains(&"HOME=/".to_string()));
+
+        // An explicit HOME from the caller is never overridden.
+        let spec = OciSpec::new(
+            &["sh".to_string()],
+            &[("HOME".to_string(), "/srv".to_string())],
+            "/",
+            false,
+            &identity,
+            false,
+        );
+        assert!(spec.process.env.contains(&"HOME=/srv".to_string()));
+        assert!(!spec.process.env.contains(&"HOME=/".to_string()));
     }
 
     #[test]
