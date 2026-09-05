@@ -551,6 +551,10 @@ pub struct PackManifest {
     /// Working directory (from image config or override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    /// User the workload runs as (name or `uid[:gid]`), when the machine was
+    /// given one; absent means the image's USER applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 
     /// Default number of vCPUs.
     pub cpus: u8,
@@ -686,6 +690,7 @@ impl PackManifest {
             env: Vec::new(),
             secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
+            user: None,
             cpus: 1,
             mem: 256,
             image_size: 0,

@@ -201,6 +201,11 @@ pub struct PackRunCmd {
     #[arg(short = 'w', long, value_name = "DIR", help_heading = "Container")]
     pub workdir: Option<String>,
 
+    /// Run as this user (name or `uid[:gid]`); defaults to the user the
+    /// machine was packed with, then the image's USER.
+    #[arg(short = 'u', long, value_name = "USER", help_heading = "Container")]
+    pub user: Option<String>,
+
     /// Set environment variable (can be used multiple times)
     #[arg(
         short = 'e',
@@ -1060,11 +1065,13 @@ fn execute_command(
         smolvm::util::enable_cuda_auto_graph_env(&mut env);
     }
     let workdir = args.workdir.clone().or_else(|| manifest.workdir.clone());
+    let user = args.user.clone().or_else(|| manifest.user.clone());
 
     let params = ExecParams {
         command,
         env,
         workdir,
+        user,
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -1077,6 +1084,7 @@ struct ExecParams {
     command: Vec<String>,
     env: Vec<(String, String)>,
     workdir: Option<String>,
+    user: Option<String>,
     interactive: bool,
     tty: bool,
     timeout: Option<Duration>,
@@ -1095,6 +1103,7 @@ fn execute_packed_command(
         command,
         env,
         workdir,
+        user,
         interactive,
         tty,
         timeout,
@@ -1126,6 +1135,7 @@ fn execute_packed_command(
                 let config = RunConfig::new(&manifest.image, command)
                     .with_env(env)
                     .with_workdir(workdir)
+                    .with_user(user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(timeout)
                     .with_tty(tty)
@@ -1135,6 +1145,7 @@ fn execute_packed_command(
                 let config = RunConfig::new(&manifest.image, command)
                     .with_env(env)
                     .with_workdir(workdir)
+                    .with_user(user)
                     .with_mounts(mount_bindings)
                     .with_timeout(timeout)
                     .with_persistent_overlay(persistent_overlay_id);
@@ -1221,6 +1232,11 @@ struct PackedRunArgs {
     /// Working directory inside the container
     #[arg(short = 'w', long = "workdir", value_name = "PATH")]
     workdir: Option<String>,
+
+    /// Run as this user (name or `uid[:gid]`); defaults to the user the
+    /// machine was packed with, then the image's USER.
+    #[arg(short = 'u', long = "user", value_name = "USER")]
+    user: Option<String>,
 
     /// Set environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
@@ -1330,6 +1346,11 @@ struct PackedExecArgs {
     /// Working directory inside the container
     #[arg(short = 'w', long = "workdir", value_name = "PATH")]
     workdir: Option<String>,
+
+    /// Run as this user (name or `uid[:gid]`); defaults to the user the
+    /// machine was packed with, then the image's USER.
+    #[arg(short = 'u', long = "user", value_name = "USER")]
+    user: Option<String>,
 
     /// Set environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
@@ -1443,6 +1464,7 @@ fn run_ephemeral(
                 tty: args.tty,
                 timeout: args.timeout,
                 workdir: args.workdir,
+                user: args.user,
                 env: args.env,
                 volume: args.volume,
                 allow_system_mounts: args.allow_system_mounts,
@@ -1763,6 +1785,7 @@ fn run_from_cache(
         command: build_command(manifest, &args.command),
         env: build_env(manifest, &args.env)?,
         workdir: args.workdir.or_else(|| manifest.workdir.clone()),
+        user: args.user.or_else(|| manifest.user.clone()),
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -2181,6 +2204,7 @@ fn daemon_exec(
         command: build_command(manifest, &args.command),
         env: build_env(manifest, &args.env)?,
         workdir: args.workdir.or_else(|| manifest.workdir.clone()),
+        user: args.user.or_else(|| manifest.user.clone()),
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,

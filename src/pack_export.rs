@@ -213,6 +213,7 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     manifest.cmd = vm.cmd.clone();
     manifest.env = merge_env(&assets.image_env, &vm.env);
     manifest.workdir = vm.workdir.clone();
+    manifest.user = vm.user.clone();
     manifest.secret_refs = vm.secret_refs.clone();
 }
 
