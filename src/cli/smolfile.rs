@@ -47,6 +47,7 @@ pub fn build_create_params(
     cli_init: Vec<String>,
     cli_env: Vec<String>,
     cli_workdir: Option<String>,
+    cli_user: Option<String>,
     smolfile_path: Option<PathBuf>,
     cli_storage_gb: Option<u64>,
     cli_overlay_gb: Option<u64>,
@@ -86,6 +87,7 @@ pub fn build_create_params(
                 init: cli_init,
                 env: cli_env,
                 workdir: cli_workdir,
+                user: cli_user,
                 storage_gb: cli_storage_gb,
                 overlay_gb: cli_overlay_gb,
                 allowed_cidrs: cidrs_to_option(cli_allow_cidr),
@@ -200,6 +202,7 @@ pub fn build_create_params(
 
     // Workdir: CLI > [dev].workdir > top-level workdir
     let dev_workdir = dev.workdir;
+    let dev_user = dev.user;
 
     // Scalars: CLI non-default overrides Smolfile
     let default_cpus = DEFAULT_MICROVM_CPU_COUNT;
@@ -227,6 +230,7 @@ pub fn build_create_params(
     let rosetta = sf.rosetta.unwrap_or(false);
 
     let workdir = cli_workdir.or(dev_workdir).or(sf.workdir);
+    let user = cli_user.or(dev_user).or(sf.user);
 
     // Scalars: CLI overrides Smolfile
     let storage_gb = cli_storage_gb.or(sf.storage);
@@ -321,6 +325,7 @@ pub fn build_create_params(
         init,
         env,
         workdir,
+        user,
         storage_gb,
         overlay_gb,
         allowed_cidrs,
@@ -514,6 +519,7 @@ mod tests {
             vec![],
             vec![],
             None,
+            None,
             Some(path),
             None,
             None,
@@ -565,6 +571,7 @@ mod tests {
             None,
             vec![],
             vec![],
+            None,
             None,
             Some(path),
             None,
