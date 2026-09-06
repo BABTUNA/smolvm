@@ -1127,3 +1127,69 @@ mod smolfile_local_image_tests {
         assert_eq!(flagged.image, Some(image));
     }
 }
+
+#[cfg(test)]
+mod cli_entrypoint_tests {
+    use super::resolve_pack_config;
+
+    /// `--entrypoint ""` used to become an entrypoint of one empty string,
+    /// which the runtime then tried to execute. It must resolve to no
+    /// override at all.
+    #[test]
+    fn an_empty_cli_entrypoint_is_not_an_entrypoint() {
+        let cfg = resolve_pack_config(
+            Some("alpine".to_string()),
+            Some(String::new()),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("resolves");
+
+        assert!(cfg.entrypoint.is_empty(), "got {:?}", cfg.entrypoint);
+    }
+
+    /// Same through the Smolfile route, where the CLI value competes with an
+    /// [artifact] entrypoint: an empty flag must not shadow it.
+    #[test]
+    fn an_empty_cli_entrypoint_does_not_shadow_a_smolfile_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\nentrypoint = [\"/from/smolfile\"]\n",
+        )
+        .expect("write");
+
+        let cfg = resolve_pack_config(
+            None,
+            Some(String::new()),
+            None,
+            None,
+            None,
+            false,
+            Some(path),
+        )
+        .expect("resolves");
+
+        assert_eq!(cfg.entrypoint, vec!["/from/smolfile"]);
+    }
+
+    #[test]
+    fn a_real_cli_entrypoint_is_kept() {
+        let cfg = resolve_pack_config(
+            Some("alpine".to_string()),
+            Some("/app/run".to_string()),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("resolves");
+
+        assert_eq!(cfg.entrypoint, vec!["/app/run"]);
+    }
+}
