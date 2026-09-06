@@ -19,7 +19,6 @@ use clap::{Args, Subcommand};
 use sha2::{Digest, Sha256};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
 use smolvm::data::network::{PortMapping, PortMappingSpec, MAX_PORT_MAPPINGS};
-use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
@@ -615,13 +614,15 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Resources")]
     pub rosetta: bool,
 
-    /// Number of virtual CPUs
-    #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N", help_heading = "Resources")]
-    pub cpus: u8,
+    /// Maximum vCPUs the machine may use [default: 4]. Idle vCPUs cost nothing;
+    /// this caps what the workload can consume, it does not reserve it.
+    #[arg(long, value_name = "N", help_heading = "Resources")]
+    pub cpus: Option<u8>,
 
-    /// Memory allocation in MiB
-    #[arg(long, default_value_t = DEFAULT_MICROVM_MEMORY_MIB, value_name = "MiB", help_heading = "Resources")]
-    pub mem: u32,
+    /// Maximum memory in MiB the machine may use [default: 8192]. Memory is
+    /// elastic: the host commits only what the guest touches, up to this cap.
+    #[arg(long, value_name = "MiB", help_heading = "Resources")]
+    pub mem: Option<u32>,
 
     /// Writable data disk size in GiB (default 20). Bounds how much a workload
     /// can write: a disk-heavy or untrusted command fills this disk (ENOSPC),
@@ -1154,8 +1155,8 @@ impl RunCmd {
                 port: port.into_iter().map(PortMappingSpec::from).collect(),
                 net: self.net,
                 net_backend: self.net_backend,
-                cpus: (self.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(self.cpus),
-                mem: (self.mem != DEFAULT_MICROVM_MEMORY_MIB).then_some(self.mem),
+                cpus: self.cpus,
+                mem: self.mem,
                 storage: self.storage,
                 overlay: self.overlay,
                 force_extract: false,
@@ -1299,8 +1300,8 @@ impl RunCmd {
                         .collect(),
                     net: params.net,
                     net_backend: params.network_backend,
-                    cpus: (params.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(params.cpus),
-                    mem: (params.mem != DEFAULT_MICROVM_MEMORY_MIB).then_some(params.mem),
+                    cpus: Some(params.cpus),
+                    mem: Some(params.mem),
                     storage: params.storage_gb,
                     overlay: params.overlay_gb,
                     force_extract: false,
@@ -1417,8 +1418,8 @@ impl RunCmd {
                     .collect(),
                 net: params.net,
                 net_backend: params.network_backend,
-                cpus: (params.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(params.cpus),
-                mem: (params.mem != DEFAULT_MICROVM_MEMORY_MIB).then_some(params.mem),
+                cpus: Some(params.cpus),
+                mem: Some(params.mem),
                 storage: params.storage_gb,
                 overlay: params.overlay_gb,
                 force_extract: false,
@@ -2631,8 +2632,8 @@ mod tests {
         let MachineCmd::Create(cmd) = cli.command else {
             panic!("expected machine create command");
         };
-        // They configured nothing: the machine still has the defaults.
-        assert_eq!(cmd.mem, DEFAULT_MICROVM_MEMORY_MIB);
+        // They configured nothing: no cap was given, so the default applies later.
+        assert_eq!(cmd.mem, None);
         assert_eq!(cmd.storage, None);
         assert!(!cmd.net);
         assert_eq!(
@@ -3130,13 +3131,15 @@ pub struct CreateCmd {
           value_parser = crate::cli::parsers::parse_size_bytes)]
     pub max_image_size: Option<u64>,
 
-    /// Number of virtual CPUs
-    #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
-    pub cpus: u8,
+    /// Maximum vCPUs the machine may use [default: 4, or the Smolfile/pack
+    /// value]. Idle vCPUs cost nothing; this caps consumption, not a reservation.
+    #[arg(long, value_name = "N")]
+    pub cpus: Option<u8>,
 
-    /// Memory allocation in MiB
-    #[arg(long, default_value_t = DEFAULT_MICROVM_MEMORY_MIB, value_name = "MiB")]
-    pub mem: u32,
+    /// Maximum memory in MiB the machine may use [default: 8192, or the
+    /// Smolfile/pack value]. Elastic: only touched memory is committed.
+    #[arg(long, value_name = "MiB")]
+    pub mem: Option<u32>,
 
     /// Storage disk size in GiB (for OCI layers and container data)
     #[arg(long, value_name = "GiB")]
@@ -3462,8 +3465,6 @@ impl CreateCmd {
 
     /// Create a machine from a .smolmachine artifact.
     fn run_from_smolmachine(&self, sidecar_path: &std::path::Path) -> smolvm::Result<()> {
-        use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
-
         if !sidecar_path.exists() {
             return Err(smolvm::Error::config(
                 "create from .smolmachine",
@@ -3562,17 +3563,10 @@ impl CreateCmd {
         // extraction that targets this machine's own data dir.
         let name_for_layers = name.clone();
 
-        // CLI flags override manifest defaults.
-        let cpus = if self.cpus != DEFAULT_MICROVM_CPU_COUNT {
-            self.cpus
-        } else {
-            manifest.cpus
-        };
-        let mem = if self.mem != DEFAULT_MICROVM_MEMORY_MIB {
-            self.mem
-        } else {
-            manifest.mem
-        };
+        // Resource caps: an explicit flag overrides the pack's baked values,
+        // including when it equals the default.
+        let cpus = self.cpus.unwrap_or(manifest.cpus);
+        let mem = self.mem.unwrap_or(manifest.mem);
         if let Some(ref checkpoint) = checkpoint {
             if cpus != checkpoint.cpus || mem != checkpoint.memory_mib {
                 return Err(smolvm::Error::config(
