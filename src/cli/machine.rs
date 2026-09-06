@@ -1081,6 +1081,18 @@ fn run_smolvm(exe: &Path, args: &[&str]) -> smolvm::Result<()> {
     Ok(())
 }
 
+/// When an agent request fails because the VM process is gone, replace the
+/// bare transport error ("connection closed") with how the process ended.
+fn explain_vm_death(manager: &smolvm::agent::AgentManager, error: smolvm::Error) -> smolvm::Error {
+    match manager.death_reason() {
+        Some(reason) => smolvm::Error::agent(
+            "run command",
+            format!("the machine's VM process died while the command ran: {reason}"),
+        ),
+        None => error,
+    }
+}
+
 impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
@@ -1806,7 +1818,9 @@ impl RunCmd {
                         .with_persistent_overlay(Some(vm_name.clone()))
                         .with_unprivileged(self.unprivileged)
                         .with_s3_volumes(s3_volumes.clone());
-                    client.run_container_detached(run_config)?;
+                    client
+                        .run_container_detached(run_config)
+                        .map_err(|e| explain_vm_death(&manager, e))?;
                 }
 
                 // Container started — persist the DB record. If this fails,
@@ -1902,7 +1916,9 @@ impl RunCmd {
                         .with_persistent_overlay(Some(vm_name.clone()))
                         .with_unprivileged(self.unprivileged)
                         .with_s3_volumes(s3_volumes.clone());
-                    client.run_interactive(config)?
+                    client
+                        .run_interactive(config)
+                        .map_err(|e| explain_vm_death(&manager, e))?
                 } else {
                     let config = RunConfig::new(img, command)
                         .with_env(defaults.env)
@@ -1913,7 +1929,9 @@ impl RunCmd {
                         .with_persistent_overlay(Some(vm_name.clone()))
                         .with_unprivileged(self.unprivileged)
                         .with_s3_volumes(s3_volumes.clone());
-                    let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
+                    let (exit_code, stdout, stderr) = client
+                        .run_non_interactive(config)
+                        .map_err(|e| explain_vm_death(&manager, e))?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);
                     }

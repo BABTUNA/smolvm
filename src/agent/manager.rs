@@ -1314,6 +1314,31 @@ impl AgentManager {
     }
 
     /// Get the child PID if known.
+    /// How the VM process ended, if it has: the signal that killed it or its
+    /// exit code, with the last line of its startup log when there is one.
+    /// `None` while it is still running or when it was never spawned.
+    pub fn death_reason(&self) -> Option<String> {
+        let pid = self.child_pid()?;
+        // A request fails the instant the guest drops the connection, which
+        // can be a moment before the VM process itself is gone (the guest
+        // reboots on a panic, and the VMM exits with it). Give it that moment
+        // rather than reporting a live process and losing the reason.
+        let mut exit_code = None;
+        for _ in 0..30 {
+            exit_code = process::try_wait(pid);
+            if exit_code.is_some() || !process::is_alive(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if exit_code.is_none() && process::is_alive(pid) {
+            return None;
+        }
+        let log = std::fs::read_to_string(&self.startup_error_log).ok();
+        let log = log.as_deref().map(str::trim).filter(|l| !l.is_empty());
+        Some(boot_failure_reason(exit_code, log))
+    }
+
     pub fn child_pid(&self) -> Option<i32> {
         self.inner.lock().child.as_ref().map(|c| c.pid())
     }
@@ -3136,6 +3161,22 @@ impl Drop for AgentManager {
 /// mismatched/corrupt `krun.dll`/`libkrunfw.dll` or unavailable WHP, which is
 /// far more useful than whatever benign WARN happened to be logged last (on
 /// Windows the guest console isn't captured, so the log is often just that).
+/// The name of the fatal signal a `128 + signal` exit code stands for.
+fn fatal_signal_name(code: i32) -> Option<&'static str> {
+    Some(match code - 128 {
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        31 => "SIGSYS",
+        _ => return None,
+    })
+}
+
 fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> String {
     let real_error = startup_log
         .and_then(|log| {
@@ -3187,6 +3228,12 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
                      Hypervisor Platform (WHP) is unavailable; verify the DLLs match smolvm \
                      (checksums.txt) and that WHP is enabled"
                 )
+            } else if let Some(signal) = fatal_signal_name(code) {
+                // try_wait reports a signalled exit as 128 + signal. A VM
+                // killed by a signal never writes a message, and its process
+                // is not dumpable, so the signal name is the only trace the
+                // user gets of a crash in the VMM or a renderer library.
+                format!("boot process was killed by {signal} (a crash in the VMM or a library it loaded)")
             } else {
                 format!("boot process exited (code {code}) before the agent was ready")
             }
@@ -3453,6 +3500,22 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("916b7f42b3b3"), "{reason}");
+    }
+
+    /// A signalled exit (128 + signal, as try_wait reports it) is named, since
+    /// a VM killed by a signal leaves no message and no core to look at.
+    #[test]
+    fn boot_failure_names_the_fatal_signal() {
+        let r = boot_failure_reason(Some(128 + 11), None);
+        assert!(r.contains("SIGSEGV"), "got: {r}");
+        let r = boot_failure_reason(Some(128 + 6), Some("virgl: something broke\n"));
+        assert!(
+            r.contains("SIGABRT") && r.contains("virgl: something broke"),
+            "got: {r}"
+        );
+        // Plain exit codes keep their existing wording.
+        let r = boot_failure_reason(Some(3), None);
+        assert!(r.contains("exited (code 3)"), "got: {r}");
     }
 
     #[test]
