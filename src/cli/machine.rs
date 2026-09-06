@@ -684,6 +684,11 @@ pub struct RunCmd {
     )]
     pub secret_file: Vec<String>,
 
+    /// Run command before the workload (can be used multiple times); the same
+    /// as `init` in a Smolfile, and the CLI form wins when both are given
+    #[arg(long = "init", value_name = "COMMAND")]
+    pub init: Vec<String>,
+
     /// Skip the init-layer cache: re-run `init` on every ephemeral run instead of
     /// baking `image + init` once into a cached, reusable artifact. Use this when
     /// `init` depends on live volume contents (and so cannot be safely cached).
@@ -916,15 +921,6 @@ fn ensure_init_layer(
         return Ok(cached);
     }
 
-    // The Smolfile is the source of init commands, so it's required only when there
-    // ARE init steps. A bare `--oci-cache` image (no init) bakes from `--image`
-    // alone and needs no Smolfile.
-    if !params.init.is_empty() && smolfile.is_none() {
-        return Err(smolvm::Error::config(
-            "init-layer cache",
-            "init caching requires a --smolfile (the init source); pass --no-init-cache otherwise",
-        ));
-    }
     if params.init.is_empty() {
         println!("Caching image {key} (one-time; reused on later runs)");
     } else {
@@ -981,6 +977,23 @@ fn ensure_init_layer(
             create.push("-e".into());
             create.push(e.clone());
         }
+        // Forward the RESOLVED init steps too: they may have come from `--init`
+        // rather than the Smolfile, and the cache key is derived from them, so
+        // the baked rootfs must run exactly these.
+        for step in &params.init {
+            create.push("--init".into());
+            create.push(step.clone());
+        }
+        // Init runs in the resolved workdir as the resolved user; without these
+        // a step like `echo x > $WORKDIR/f` has no directory to write into.
+        if let Some(workdir) = &params.workdir {
+            create.push("--workdir".into());
+            create.push(workdir.clone());
+        }
+        if let Some(user) = &params.user {
+            create.push("--user".into());
+            create.push(user.clone());
+        }
         if params.allow_system_mounts {
             create.push("--allow-system-mounts".into());
         }
@@ -1014,6 +1027,17 @@ fn ensure_init_layer(
         // even when the outer run was given --proxy.
         let start = bake_start_args(&tmp, proxy, no_proxy);
         run_smolvm(&exe, &start)?;
+        // The snapshot below captures the rootfs overlay only. /workspace is the
+        // machine's storage disk, so anything init wrote there is NOT in the
+        // cached artifact and every cached run starts without it. Say so
+        // rather than let a `cat $WORKDIR/file` fail with no explanation.
+        if !params.init.is_empty() && bake_workspace_has_files(&exe, &tmp) {
+            eprintln!(
+                "warning: init wrote files under /workspace, which the init-layer cache does not \
+                 capture (it snapshots the root filesystem only); cached runs will start \
+                 without them. Pass --no-init-cache to run init live instead."
+            );
+        }
         run_smolvm(&exe, &["machine", "stop", "--name", &tmp])?;
         println!("  · snapshotting...");
         run_smolvm(
@@ -1052,6 +1076,26 @@ fn ensure_init_layer(
 /// CAPTURED (not inherited) so the bake's internal create/pull/pack chatter — and
 /// the harmless "vm not found" from the best-effort pre-clean — never reach the
 /// user's terminal; on failure the captured stderr tail is surfaced in the error.
+/// Whether init left anything on the bake machine's /workspace (its storage
+/// disk). Best effort: a failed probe reads as "nothing there" so it can never
+/// turn a good bake into an error.
+fn bake_workspace_has_files(exe: &Path, name: &str) -> bool {
+    std::process::Command::new(exe)
+        .args([
+            "machine",
+            "exec",
+            "--name",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "find /workspace -mindepth 1 -print -quit 2>/dev/null | grep -q .",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn run_smolvm(exe: &Path, args: &[&str]) -> smolvm::Result<()> {
     let out = std::process::Command::new(exe)
         .args(args)
@@ -1194,7 +1238,7 @@ impl RunCmd {
             self.net_backend,
             self.dns,
             self.network_name.clone(),
-            vec![],
+            self.init.clone(),
             self.env,
             self.workdir,
             self.user,
