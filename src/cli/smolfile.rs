@@ -36,6 +36,33 @@ fn parse_net_backend(raw: &str) -> smolvm::Result<NetworkBackend> {
     })
 }
 
+/// A CLI list that is empty, or holds only empty strings, contributes
+/// nothing. Trailing args and `--entrypoint` both go through here so an
+/// accidental `""` never becomes a one-element command the runtime tries to
+/// execute.
+fn cli_list_override(values: Vec<String>) -> Option<Vec<String>> {
+    if values.iter().all(|v| v.is_empty()) {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+/// The entrypoint a `--entrypoint` flag contributes, if any.
+fn cli_entrypoint_override(cli_entrypoint: Option<String>) -> Option<Vec<String>> {
+    cli_list_override(cli_entrypoint.into_iter().collect())
+}
+
+/// A `[dev]` list overrides the top-level one when set; an empty `[dev]` list
+/// means "not set", not "none".
+fn dev_or_top<T>(dev: Vec<T>, top: Vec<T>) -> Vec<T> {
+    if dev.is_empty() {
+        top
+    } else {
+        dev
+    }
+}
+
 /// Build `CreateVmParams` by merging CLI flags with an optional Smolfile.
 ///
 /// CLI flags override Smolfile values. For Vec fields, CLI values are appended
@@ -53,8 +80,8 @@ pub fn build_create_params(
     cli_image: Option<String>,
     cli_entrypoint: Option<String>,
     cli_cmd: Vec<String>,
-    cli_cpus: u8,
-    cli_mem: u32,
+    cli_cpus: Option<u8>,
+    cli_mem: Option<u32>,
     cli_volume: Vec<String>,
     cli_port: Vec<PortMappingSpec>,
     cli_net: bool,
@@ -90,10 +117,10 @@ pub fn build_create_params(
                 name,
                 labels: cli_labels,
                 image: cli_image,
-                entrypoint: cli_entrypoint.map(|e| vec![e]).unwrap_or_default(),
+                entrypoint: cli_entrypoint_override(cli_entrypoint).unwrap_or_default(),
                 cmd: cli_cmd,
-                cpus: cli_cpus,
-                mem: cli_mem,
+                cpus: cli_cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
+                mem: cli_mem.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
                 volume: cli_volume,
                 allow_system_mounts: false,
                 port: ports,
@@ -164,24 +191,16 @@ pub fn build_create_params(
     let image = cli_image.or(sf.image);
 
     // Entrypoint: CLI > Smolfile
-    let entrypoint = if let Some(ep) = cli_entrypoint {
-        vec![ep]
-    } else {
-        sf.entrypoint
-    };
+    let entrypoint = cli_entrypoint_override(cli_entrypoint).unwrap_or(sf.entrypoint);
 
     // Cmd: CLI > Smolfile (full replacement, not append)
-    let cmd = if cli_cmd.is_empty() { sf.cmd } else { cli_cmd };
+    let cmd = cli_list_override(cli_cmd).unwrap_or(sf.cmd);
 
     // Resolve [dev] fields, falling back to top-level
     let dev = sf.dev.unwrap_or_default();
 
     // Ports: [dev].ports > top-level ports, then CLI extends
-    let sf_ports = if !dev.ports.is_empty() {
-        dev.ports
-    } else {
-        sf.ports
-    };
+    let sf_ports = dev_or_top(dev.ports, sf.ports);
     let mut port_specs: Vec<PortMappingSpec> = sf_ports
         .iter()
         .map(|s| PortMappingSpec::parse(s))
@@ -192,11 +211,7 @@ pub fn build_create_params(
         .map_err(|e| smolvm::Error::config("smolfile ports", e))?;
 
     // Volumes: [dev].volumes > top-level volumes, then CLI extends
-    let sf_volumes = if !dev.volumes.is_empty() {
-        dev.volumes
-    } else {
-        sf.volumes
-    };
+    let sf_volumes = dev_or_top(dev.volumes, sf.volumes);
     let mut volumes = sf_volumes;
     volumes.extend(cli_volume);
 
@@ -209,11 +224,7 @@ pub fn build_create_params(
     }
 
     // Init: [dev].init > top-level init, then CLI extends
-    let sf_init = if !dev.init.is_empty() {
-        dev.init
-    } else {
-        sf.init
-    };
+    let sf_init = dev_or_top(dev.init, sf.init);
     let mut init = sf_init;
     init.extend(cli_init);
 
@@ -221,21 +232,12 @@ pub fn build_create_params(
     let dev_workdir = dev.workdir;
     let dev_user = dev.user;
 
-    // Scalars: CLI non-default overrides Smolfile
-    let default_cpus = DEFAULT_MICROVM_CPU_COUNT;
-    let default_mem = DEFAULT_MICROVM_MEMORY_MIB;
-
-    let cpus = if cli_cpus != default_cpus {
-        cli_cpus
-    } else {
-        sf.cpus.unwrap_or(cli_cpus)
-    };
-
-    let mem = if cli_mem != default_mem {
-        cli_mem
-    } else {
-        sf.memory.unwrap_or(cli_mem)
-    };
+    // Resource caps: CLI > Smolfile > default. The flags are Option so an
+    // explicit value that happens to equal the default still wins; the old
+    // "CLI differs from default" sentinel silently dropped `--cpus 4` against
+    // a Smolfile that said otherwise.
+    let cpus = cli_cpus.or(sf.cpus).unwrap_or(DEFAULT_MICROVM_CPU_COUNT);
+    let mem = cli_mem.or(sf.memory).unwrap_or(DEFAULT_MICROVM_MEMORY_MIB);
 
     let net = if cli_net {
         true
@@ -430,8 +432,8 @@ pub struct PackConfig {
 pub fn resolve_pack_config(
     cli_image: Option<String>,
     cli_entrypoint: Option<String>,
-    cli_cpus: u8,
-    cli_mem: u32,
+    cli_cpus: Option<u8>,
+    cli_mem: Option<u32>,
     cli_oci_platform: Option<String>,
     cli_gpu: bool,
     smolfile_path: Option<PathBuf>,
@@ -443,10 +445,10 @@ pub fn resolve_pack_config(
         None => {
             return Ok(PackConfig {
                 image: cli_image,
-                entrypoint: cli_entrypoint.map(|e| vec![e]).unwrap_or_default(),
+                entrypoint: cli_entrypoint_override(cli_entrypoint).unwrap_or_default(),
                 cmd: vec![],
-                cpus: cli_cpus,
-                mem: cli_mem,
+                cpus: cli_cpus.unwrap_or(default_cpus),
+                mem: cli_mem.unwrap_or(default_mem),
                 oci_platform: cli_oci_platform,
                 env: vec![],
                 workdir: None,
@@ -464,8 +466,8 @@ pub fn resolve_pack_config(
     let image = cli_image.or(sf.image);
 
     // Entrypoint: CLI > [artifact] > top-level
-    let entrypoint = if let Some(ep) = cli_entrypoint {
-        vec![ep]
+    let entrypoint = if let Some(ep) = cli_entrypoint_override(cli_entrypoint) {
+        ep
     } else if !artifact.entrypoint.is_empty() {
         artifact.entrypoint
     } else {
@@ -480,17 +482,15 @@ pub fn resolve_pack_config(
     };
 
     // Scalars: CLI non-default > [artifact] > top-level > default
-    let cpus = if cli_cpus != default_cpus {
-        cli_cpus
-    } else {
-        artifact.cpus.or(sf.cpus).unwrap_or(cli_cpus)
-    };
-
-    let mem = if cli_mem != default_mem {
-        cli_mem
-    } else {
-        artifact.memory.or(sf.memory).unwrap_or(cli_mem)
-    };
+    // Resource caps: CLI > [artifact] > Smolfile > default.
+    let cpus = cli_cpus
+        .or(artifact.cpus)
+        .or(sf.cpus)
+        .unwrap_or(default_cpus);
+    let mem = cli_mem
+        .or(artifact.memory)
+        .or(sf.memory)
+        .unwrap_or(default_mem);
 
     // oci_platform: CLI > [artifact]
     let oci_platform = cli_oci_platform.or(artifact.oci_platform);
@@ -535,8 +535,8 @@ mod tests {
             None,
             None,
             vec![],
-            DEFAULT_MICROVM_CPU_COUNT,
-            DEFAULT_MICROVM_MEMORY_MIB,
+            None,
+            None,
             vec![],
             vec![],
             false,
@@ -730,8 +730,8 @@ init = ["echo init"]
             None,
             None,
             vec![],
-            DEFAULT_MICROVM_CPU_COUNT,
-            DEFAULT_MICROVM_MEMORY_MIB,
+            None,
+            None,
             vec![],
             vec![],
             false,
@@ -797,8 +797,8 @@ init = ["echo init"]
             None,
             None,
             vec![],
-            DEFAULT_MICROVM_CPU_COUNT,
-            DEFAULT_MICROVM_MEMORY_MIB,
+            None,
+            None,
             vec![],
             vec![],
             false,
@@ -867,5 +867,146 @@ init = ["echo init"]
 
         let error = build_from_smolfile(path).err().unwrap().to_string();
         assert!(error.contains("requires pool_size"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod resource_cap_precedence_tests {
+    use super::*;
+    use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+
+    fn smolfile(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, contents).expect("write");
+        (dir, path)
+    }
+
+    /// `build_create_params` with only the resource caps and trailing args
+    /// varied; everything else is off.
+    fn create(
+        cli_cpus: Option<u8>,
+        cli_mem: Option<u32>,
+        cli_cmd: Vec<String>,
+        smolfile_path: Option<PathBuf>,
+    ) -> CreateVmParams {
+        build_create_params(
+            "m".to_string(),
+            None,
+            None,
+            cli_cmd,
+            cli_cpus,
+            cli_mem,
+            vec![],
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+            smolfile_path,
+            None,
+            None,
+            vec![],
+            Default::default(),
+        )
+        .expect("params")
+    }
+
+    /// The bug: `--cpus 4` against a Smolfile saying 8 yielded 8, because 4 is
+    /// the default and the resolver could not tell "typed the default" from
+    /// "typed nothing". An explicit flag must win regardless of its value.
+    #[test]
+    fn an_explicit_default_valued_flag_still_overrides_the_smolfile() {
+        let (_d, path) = smolfile("image = \"alpine\"\ncpus = 8\nmemory = 16384\n");
+
+        let p = create(
+            Some(DEFAULT_MICROVM_CPU_COUNT),
+            Some(DEFAULT_MICROVM_MEMORY_MIB),
+            vec![],
+            Some(path),
+        );
+
+        assert_eq!(
+            p.cpus, DEFAULT_MICROVM_CPU_COUNT,
+            "--cpus was silently dropped"
+        );
+        assert_eq!(
+            p.mem, DEFAULT_MICROVM_MEMORY_MIB,
+            "--mem was silently dropped"
+        );
+    }
+
+    /// With no flag, the Smolfile's cap applies.
+    #[test]
+    fn the_smolfile_cap_applies_when_no_flag_is_given() {
+        let (_d, path) = smolfile("image = \"alpine\"\ncpus = 8\nmemory = 16384\n");
+
+        let p = create(None, None, vec![], Some(path));
+
+        assert_eq!((p.cpus, p.mem), (8, 16384));
+    }
+
+    /// With neither, the default applies exactly once.
+    #[test]
+    fn the_default_applies_only_when_nothing_else_spoke() {
+        let (_d, path) = smolfile("image = \"alpine\"\n");
+
+        let with_smolfile = create(None, None, vec![], Some(path));
+        let without = create(None, None, vec![], None);
+
+        for p in [with_smolfile, without] {
+            assert_eq!(
+                (p.cpus, p.mem),
+                (DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB)
+            );
+        }
+    }
+
+    /// The pack route has one more layer, `[artifact]`, and the same bug.
+    #[test]
+    fn an_explicit_default_valued_flag_overrides_the_artifact_and_smolfile() {
+        let (_d, path) = smolfile(
+            "image = \"alpine\"\ncpus = 8\nmemory = 16384\n[artifact]\ncpus = 16\nmemory = 32768\n",
+        );
+
+        let cfg = resolve_pack_config(
+            None,
+            None,
+            Some(DEFAULT_MICROVM_CPU_COUNT),
+            Some(crate::cli::pack::PACK_DEFAULT_MEMORY_MIB),
+            None,
+            false,
+            Some(path.clone()),
+        )
+        .expect("resolves");
+        assert_eq!(cfg.cpus, DEFAULT_MICROVM_CPU_COUNT);
+        assert_eq!(cfg.mem, crate::cli::pack::PACK_DEFAULT_MEMORY_MIB);
+
+        // And without a flag, [artifact] outranks the top level.
+        let cfg =
+            resolve_pack_config(None, None, None, None, None, false, Some(path)).expect("resolves");
+        assert_eq!((cfg.cpus, cfg.mem), (16, 32768));
+    }
+
+    /// A trailing `""` is not a command, any more than `--entrypoint ""` is an
+    /// entrypoint; the Smolfile's cmd must survive it.
+    #[test]
+    fn an_empty_trailing_arg_does_not_replace_the_smolfile_cmd() {
+        let (_d, path) = smolfile("image = \"alpine\"\ncmd = [\"sleep\", \"infinity\"]\n");
+
+        let p = create(None, None, vec![String::new()], Some(path));
+
+        assert_eq!(p.cmd, vec!["sleep", "infinity"]);
+    }
+
+    /// `[dev]` lists override the top level only when set.
+    #[test]
+    fn an_empty_dev_list_falls_back_to_the_top_level() {
+        assert_eq!(dev_or_top(Vec::<u8>::new(), vec![1, 2]), vec![1, 2]);
+        assert_eq!(dev_or_top(vec![3], vec![1, 2]), vec![3]);
     }
 }

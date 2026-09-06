@@ -9,7 +9,6 @@
 
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager, VmResources};
-use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 
 /// Default memory for packed VMs. Same as machine create — memory is elastic
 /// via virtio balloon, so the host only commits what the guest actually uses.
@@ -159,13 +158,15 @@ pub struct PackCreateCmd {
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
 
-    /// Default number of vCPUs for the packed VM
-    #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
-    pub cpus: u8,
+    /// Maximum vCPUs machines from this pack may use [default: 4, or the
+    /// Smolfile value]. A cap on consumption, not a reservation.
+    #[arg(long, value_name = "N")]
+    pub cpus: Option<u8>,
 
-    /// Default memory in MiB for the packed VM
-    #[arg(long, default_value_t = PACK_DEFAULT_MEMORY_MIB, value_name = "MiB")]
-    pub mem: u32,
+    /// Maximum memory in MiB machines from this pack may use [default: 8192,
+    /// or the Smolfile value]. Elastic: only touched memory is committed.
+    #[arg(long, value_name = "MiB")]
+    pub mem: Option<u32>,
 
     /// Target OCI platform for multi-arch images (e.g., linux/arm64, linux/amd64)
     ///
@@ -1850,8 +1851,8 @@ mod tests {
             rebase_from_image: false,
             include_workspace: false,
             output: PathBuf::from("test-output"),
-            cpus: 2,
-            mem: 1024,
+            cpus: Some(2),
+            mem: Some(1024),
             oci_platform: None,
             entrypoint: None,
             no_sign: false,
