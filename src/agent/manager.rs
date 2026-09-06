@@ -1339,6 +1339,7 @@ impl AgentManager {
         Some(boot_failure_reason(exit_code, log))
     }
 
+    /// The PID of the VM process this manager spawned, once it has.
     pub fn child_pid(&self) -> Option<i32> {
         self.inner.lock().child.as_ref().map(|c| c.pid())
     }
