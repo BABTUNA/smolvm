@@ -931,8 +931,24 @@ pub fn vm_uid_drop_active() -> bool {
 /// privileged with the uid drop active and no XDG override (serve only — a
 /// one-off root CLI invocation shouldn't silently switch roots). Must be called
 /// single-threaded, before the tokio runtime, so `set_var` is safe.
+/// The platform data directory as it was before [`apply_system_data_root`]
+/// moved `HOME`. `None` until that runs.
+static ORIGINAL_DATA_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> =
+    std::sync::OnceLock::new();
+
+/// The data directory of the user who invoked this process, unaffected by
+/// [`apply_system_data_root`] relocating the process's own state.
+///
+/// Installed artifacts such as the agent rootfs belong to that user's
+/// install, not to wherever a system service keeps its machine records, so
+/// their fallback lookups use this rather than the live `HOME`.
+pub fn original_data_dir() -> Option<std::path::PathBuf> {
+    ORIGINAL_DATA_DIR.get().cloned().flatten()
+}
+
 #[cfg(target_os = "linux")]
 pub fn apply_system_data_root(allow_auto: bool) {
+    let _ = ORIGINAL_DATA_DIR.get_or_init(|| dirs::data_local_dir().or_else(dirs::data_dir));
     let root = if let Some(explicit) = std::env::var_os("SMOLVM_DATA_DIR") {
         std::path::PathBuf::from(explicit)
     } else if allow_auto
@@ -975,7 +991,9 @@ pub fn apply_system_data_root(allow_auto: bool) {
 
 /// No-op where the data root isn't applicable (macOS dev).
 #[cfg(not(target_os = "linux"))]
-pub fn apply_system_data_root(_allow_auto: bool) {}
+pub fn apply_system_data_root(_allow_auto: bool) {
+    let _ = ORIGINAL_DATA_DIR.get_or_init(|| dirs::data_local_dir().or_else(dirs::data_dir));
+}
 
 /// Per-VM uid isolation needs every ancestor of the data root to be traversable
 /// (others-execute) by the drop uid, or the dropped VMM can't reach its own

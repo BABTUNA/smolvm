@@ -766,6 +766,23 @@ pub struct AgentManager {
     inner: Arc<Mutex<AgentInner>>,
 }
 
+/// Where the agent rootfs may live when neither an override nor a copy beside
+/// the executable applies: the invoking user's data dir first (captured before
+/// any relocation), then the live one. Deduplicated, order preserved.
+///
+/// Kept free of environment reads so the ordering can be tested with plain
+/// inputs rather than by rewriting `HOME` under a parallel test suite.
+fn rootfs_fallback_candidates(original: Option<PathBuf>, live: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for base in [original, live].into_iter().flatten() {
+        let dir = base.join("smolvm").join("agent-rootfs");
+        if !candidates.contains(&dir) {
+            candidates.push(dir);
+        }
+    }
+    candidates
+}
+
 impl AgentManager {
     /// Create a new agent manager with explicit paths (low-level).
     ///
@@ -988,11 +1005,21 @@ impl AgentManager {
             }
         }
 
-        let data_dir = dirs::data_local_dir()
-            .or_else(dirs::data_dir)
-            .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
-
-        Ok(data_dir.join("smolvm").join("agent-rootfs"))
+        // Installed-artifact fallback. `serve` relocates its state to a system
+        // data root by rewriting HOME, which would move this lookup too and make
+        // a root `serve` and a root CLI on the same host disagree about the
+        // rootfs. The rootfs belongs to the invoking user's install, so prefer
+        // the data dir as it was before any relocation; the live one is still
+        // tried so a rootfs deliberately placed in the system root is found.
+        let live = dirs::data_local_dir().or_else(dirs::data_dir);
+        let candidates = rootfs_fallback_candidates(crate::process::original_data_dir(), live);
+        if let Some(existing) = candidates.iter().find(|d| d.is_dir()) {
+            return Ok(existing.clone());
+        }
+        candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))
     }
 
     /// Resolve the agent rootfs an operation should use, and insist it is real.
@@ -3277,6 +3304,30 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
 
 #[cfg(test)]
 mod tests {
+    /// `serve` relocates its state by rewriting HOME. The agent rootfs is an
+    /// installed artifact of the invoking user, so the fallback must look in
+    /// that user's data dir FIRST, and only then wherever the process now
+    /// lives — otherwise a root `serve` and a root CLI on one host would boot
+    /// different agents. Pure inputs: no environment is touched.
+    #[test]
+    fn rootfs_fallback_prefers_the_invoking_users_install() {
+        let user = PathBuf::from("/home/op/.local/share");
+        let relocated = PathBuf::from("/var/lib/smolvm/.local/share");
+        let got = super::rootfs_fallback_candidates(Some(user.clone()), Some(relocated.clone()));
+        assert_eq!(
+            got,
+            vec![
+                user.join("smolvm/agent-rootfs"),
+                relocated.join("smolvm/agent-rootfs"),
+            ]
+        );
+        // No relocation ever happened: only the live dir, once.
+        let same = super::rootfs_fallback_candidates(Some(user.clone()), Some(user.clone()));
+        assert_eq!(same, vec![user.join("smolvm/agent-rootfs")]);
+        let only_live = super::rootfs_fallback_candidates(None, Some(user.clone()));
+        assert_eq!(only_live, vec![user.join("smolvm/agent-rootfs")]);
+    }
+
     /// An explicit override must win even over a real default, and a rootfs
     /// is only accepted when `sbin/init` is present — checked without following
     /// the symlink, because in a real rootfs it points at a guest-only path.
