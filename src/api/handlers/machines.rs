@@ -2635,7 +2635,7 @@ pub async fn sync_machine(
 /// longer a side-effect of process shutdown — it's a deliberate decommission step.
 /// The control plane (autoscaler scale-in) calls this BEFORE terminating the host
 /// so VMs flush cleanly. Control-only by construction: the serve listener is mTLS-
-/// gated, and the loopback door is localhost. See docs/lossless-serve-restart.md.
+/// gated, and the loopback door is localhost.
 pub async fn drain_node(State(state): State<Arc<ApiState>>) -> axum::http::StatusCode {
     tracing::info!("drain requested via API (node decommission)");
     drain_machines(&state).await;

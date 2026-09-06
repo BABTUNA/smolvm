@@ -230,7 +230,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
 
     // Explicit, control-initiated node drain (decommission). Stops all VMs
     // cleanly. Control-only by construction (the listener is mTLS-gated; the
-    // loopback door is localhost). See docs/lossless-serve-restart.md.
+    // loopback door is localhost).
     let drain_route = Router::new().route("/drain", post(handlers::machines::drain_node));
 
     // Brokered P2P blob serving: hand a cached layer blob to a sibling node so a

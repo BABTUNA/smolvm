@@ -6,7 +6,7 @@
 //! to recreate the unit (`status=219/CGROUP`) → serve crash-loops. Adopting the
 //! VM into its own `smolvm-vm-<id>.scope` (a sibling unit owned by PID1) moves it
 //! out of the service cgroup, so serve can restart and reconnect to the still-
-//! running VM. See `docs/lossless-serve-restart.md`.
+//! running VM.
 //!
 //! Implemented by shelling out to `busctl` (ships with systemd — no D-Bus crate
 //! dependency, and absent exactly where scopes wouldn't work anyway). The caller
