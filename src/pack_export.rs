@@ -213,6 +213,10 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     if let Some(ref image) = assets.image {
         manifest.image = image.clone();
     }
+    // The source machine's caps are the baseline a from-machine pack starts
+    // from; CLI, [artifact] and Smolfile values layer on top in the caller.
+    manifest.cpus = vm.cpus;
+    manifest.mem = vm.mem;
     manifest.network = vm.network;
     manifest.gpu = vm.gpu.unwrap_or(false);
     manifest.cuda = vm.cuda;
@@ -978,5 +982,39 @@ mod env_merge_tests {
     fn machine_env_stands_alone_without_an_image() {
         let vm = vec![("FOO".to_string(), "bar".to_string())];
         assert_eq!(merge_env(&[], &vm), vec!["FOO=bar".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod from_vm_caps_tests {
+    use super::{seed_manifest_from_vm, FromVmAssets};
+    use crate::config::VmRecord;
+    use smolvm_pack::{PackManifest, PackMode};
+
+    /// A pack built from a machine must start from that machine's own caps. It
+    /// used to be seeded and then overwritten with the resolved default, so a
+    /// 2-vCPU / 1 GiB machine packed as 4 vCPU / 8 GiB.
+    #[test]
+    fn a_from_machine_pack_starts_from_the_machines_caps() {
+        let rec = VmRecord::new("m".to_string(), 2, 1024, vec![], vec![], false);
+        let mut m = PackManifest::new(
+            "vm://m".to_string(),
+            "none".to_string(),
+            "linux/amd64".to_string(),
+            "linux/amd64".to_string(),
+        );
+
+        seed_manifest_from_vm(
+            &mut m,
+            &rec,
+            &FromVmAssets {
+                mode: PackMode::Container,
+                image: Some("alpine".to_string()),
+                image_env: vec![],
+                layer_bytes: 0,
+            },
+        );
+
+        assert_eq!((m.cpus, m.mem), (2, 1024));
     }
 }

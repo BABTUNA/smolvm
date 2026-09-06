@@ -393,10 +393,14 @@ pub struct PackConfig {
     pub entrypoint: Vec<String>,
     /// Resolved cmd.
     pub cmd: Vec<String>,
-    /// Resolved vCPU count.
-    pub cpus: u8,
-    /// Resolved memory in MiB.
-    pub mem: u32,
+    /// vCPU cap from the CLI, [artifact] or Smolfile, if any of them set one.
+    /// `None` means nothing spoke, and the caller supplies its own fallback:
+    /// the source machine's cap when packing from a machine, the default
+    /// otherwise. Resolving to a number here hid that difference and made a
+    /// pack from a 2-vCPU machine come out at the 4-vCPU default.
+    pub cpus: Option<u8>,
+    /// Memory cap in MiB, on the same terms as `cpus`.
+    pub mem: Option<u32>,
     /// Target OCI platform.
     pub oci_platform: Option<String>,
     /// Resolved environment variables.
@@ -438,8 +442,6 @@ pub fn resolve_pack_config(
     cli_gpu: bool,
     smolfile_path: Option<PathBuf>,
 ) -> smolvm::Result<PackConfig> {
-    let default_cpus = DEFAULT_MICROVM_CPU_COUNT;
-    let default_mem = crate::cli::pack::PACK_DEFAULT_MEMORY_MIB;
     let sf = match smolfile_path {
         Some(path) => load(&path)?,
         None => {
@@ -447,8 +449,8 @@ pub fn resolve_pack_config(
                 image: cli_image,
                 entrypoint: cli_entrypoint_override(cli_entrypoint).unwrap_or_default(),
                 cmd: vec![],
-                cpus: cli_cpus.unwrap_or(default_cpus),
-                mem: cli_mem.unwrap_or(default_mem),
+                cpus: cli_cpus,
+                mem: cli_mem,
                 oci_platform: cli_oci_platform,
                 env: vec![],
                 workdir: None,
@@ -481,16 +483,10 @@ pub fn resolve_pack_config(
         sf.cmd
     };
 
-    // Scalars: CLI non-default > [artifact] > top-level > default
-    // Resource caps: CLI > [artifact] > Smolfile > default.
-    let cpus = cli_cpus
-        .or(artifact.cpus)
-        .or(sf.cpus)
-        .unwrap_or(default_cpus);
-    let mem = cli_mem
-        .or(artifact.memory)
-        .or(sf.memory)
-        .unwrap_or(default_mem);
+    // Resource caps: CLI > [artifact] > Smolfile. The fallback below those is
+    // the caller's to choose, so it stays unresolved here.
+    let cpus = cli_cpus.or(artifact.cpus).or(sf.cpus);
+    let mem = cli_mem.or(artifact.memory).or(sf.memory);
 
     // oci_platform: CLI > [artifact]
     let oci_platform = cli_oci_platform.or(artifact.oci_platform);
@@ -983,13 +979,13 @@ mod resource_cap_precedence_tests {
             Some(path.clone()),
         )
         .expect("resolves");
-        assert_eq!(cfg.cpus, DEFAULT_MICROVM_CPU_COUNT);
-        assert_eq!(cfg.mem, crate::cli::pack::PACK_DEFAULT_MEMORY_MIB);
+        assert_eq!(cfg.cpus, Some(DEFAULT_MICROVM_CPU_COUNT));
+        assert_eq!(cfg.mem, Some(crate::cli::pack::PACK_DEFAULT_MEMORY_MIB));
 
         // And without a flag, [artifact] outranks the top level.
         let cfg =
             resolve_pack_config(None, None, None, None, None, false, Some(path)).expect("resolves");
-        assert_eq!((cfg.cpus, cfg.mem), (16, 32768));
+        assert_eq!((cfg.cpus, cfg.mem), (Some(16), Some(32768)));
     }
 
     /// A trailing `""` is not a command, any more than `--entrypoint ""` is an

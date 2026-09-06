@@ -9,6 +9,7 @@
 
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager, VmResources};
+use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 
 /// Default memory for packed VMs. Same as machine create — memory is elastic
 /// via virtio balloon, so the host only commits what the guest actually uses.
@@ -564,8 +565,8 @@ impl PackCreateCmd {
         let mut manifest =
             PackManifest::new(image, image_info.digest.clone(), platform, host_platform);
         manifest.image_size = image_info.size;
-        manifest.cpus = pack_config.cpus;
-        manifest.mem = pack_config.mem;
+        manifest.cpus = pack_config.cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT);
+        manifest.mem = pack_config.mem.unwrap_or(PACK_DEFAULT_MEMORY_MIB);
         manifest.network = pack_config.net.unwrap_or(false);
         manifest.gpu = pack_config.gpu;
 
@@ -697,8 +698,13 @@ impl PackCreateCmd {
             host_platform,
         );
         smolvm::pack_export::seed_manifest_from_vm(&mut manifest, vm, &assets);
-        manifest.cpus = pack_config.cpus;
-        manifest.mem = pack_config.mem;
+        // CLI > [artifact] > Smolfile > the source machine's own caps.
+        if let Some(cpus) = pack_config.cpus {
+            manifest.cpus = cpus;
+        }
+        if let Some(mem) = pack_config.mem {
+            manifest.mem = mem;
+        }
         // Smolfile > source VM record > default
         if let Some(net) = pack_config.net {
             manifest.network = net;
