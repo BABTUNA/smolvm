@@ -2123,6 +2123,126 @@ fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
 /// Pull an OCI image with progress callback and optional authentication.
 ///
 /// The callback is called for each layer being pulled with (current, total, layer_id).
+/// Fetch one layer blob from the registry and unpack it into `layer_dir`.
+///
+/// Runs on a worker thread, so it touches only this layer's own directory and
+/// reports nothing: progress belongs to the caller's thread.
+#[allow(clippy::too_many_arguments)]
+fn fetch_and_extract_layer(
+    image: &str,
+    layer_digest: &str,
+    layer_id: &str,
+    layer_dir: &Path,
+    oci_platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    index: usize,
+    total_layers: usize,
+) -> Result<u64> {
+    // Clean up an incomplete or unverified layer directory: empty, or left
+    // by an interrupted/unflushed earlier extraction (no completion marker).
+    if layer_dir.exists() {
+        warn!(layer = %layer_id, "removing incomplete or unverified layer directory");
+        if let Err(e) = std::fs::remove_dir_all(layer_dir) {
+            warn!(layer = %layer_id, error = %e, "failed to remove incomplete layer directory");
+        }
+    }
+    let _ = std::fs::remove_file(layer_ok_marker(layer_dir));
+    let _ = std::fs::remove_file(layer_size_marker(layer_dir));
+
+    info!(
+        layer = %layer_id,
+        progress = format!("{}/{}", index + 1, total_layers),
+        "extracting layer"
+    );
+
+    std::fs::create_dir_all(layer_dir)?;
+
+    // Set up auth if provided (temp_dir must stay alive until command completes)
+    let temp_dir = setup_docker_auth(image, auth)?;
+
+    let mut crane_cmd = Command::new("crane");
+    crane_cmd.arg("blob");
+    crane_cmd.arg(format!("{}@{}", image_repo(image), layer_digest));
+    if let Some(p) = oci_platform {
+        crane_cmd.arg("--platform").arg(p);
+    }
+    crane_cmd.stdout(Stdio::piped());
+    // Capture crane stderr to a file (not a pipe — a file can't deadlock on a
+    // full buffer) so the real fetch failure (DNS, TLS, 4xx, redirect) is
+    // surfaced instead of a bare "crane blob failed".
+    let crane_stderr_path = layer_dir.join(".crane-stderr");
+    match std::fs::File::create(&crane_stderr_path) {
+        Ok(f) => {
+            crane_cmd.stderr(Stdio::from(f));
+        }
+        Err(_) => {
+            crane_cmd.stderr(Stdio::null());
+        }
+    }
+    if let Some(ref td) = temp_dir {
+        crane_cmd.env("DOCKER_CONFIG", td.path());
+    }
+    apply_proxy_env(&mut crane_cmd, proxy, no_proxy);
+
+    let mut crane = crane_cmd
+        .spawn()
+        .map_err(|e| StorageError::new(format!("failed to spawn crane: {}", e)))?;
+
+    // Extract straight from crane's stdout. `extract_oci_layer` transparently
+    // decompresses gzip- OR zstd-compressed layers in-process (the guest
+    // ships no zstd tool, and the old external `gunzip` pipe silently failed
+    // on every zstd layer). Reading the stream to EOF also drives the crane
+    // fetch to completion.
+    let crane_stdout = crane
+        .stdout
+        .take()
+        .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
+
+    let extract_result = extract_oci_layer_with_size(crane_stdout, layer_dir);
+
+    let crane_status = crane
+        .wait()
+        .map_err(|e| StorageError::new(format!("failed to wait for crane: {}", e)))?;
+
+    let crane_stderr = std::fs::read_to_string(&crane_stderr_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&crane_stderr_path);
+    let crane_stderr = crane_stderr.trim();
+
+    // Order matters. A genuine crane fetch failure (network/auth) prints a
+    // real message to its stderr, so surface that first. Otherwise, if
+    // extraction failed, THAT is the real cause — a crane that exited
+    // non-zero with empty stderr is just the SIGPIPE from us closing the pipe
+    // when extraction stopped reading (the exact trap that made every zstd
+    // layer look like "crane blob failed" when the real problem was that the
+    // old pipeline couldn't decompress it).
+    let layer_failure = if !crane_status.success() && !crane_stderr.is_empty() {
+        Some(format!(
+            "crane blob failed for layer {}: {}",
+            layer_digest, crane_stderr
+        ))
+    } else if let Err(ref e) = extract_result {
+        Some(format!(
+            "layer extraction failed for layer {}: {}",
+            layer_digest, e
+        ))
+    } else if !crane_status.success() {
+        Some(format!("crane blob failed for layer {}", layer_digest))
+    } else {
+        None
+    };
+
+    if let Some(message) = layer_failure {
+        if let Err(e) = std::fs::remove_dir_all(layer_dir) {
+            warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after extraction failure");
+        }
+        return Err(StorageError::new(message));
+    }
+
+    Ok(extract_result.unwrap_or(0))
+}
+
 pub fn pull_image_with_progress_and_auth<F>(
     image: &str,
     oci_platform: Option<&str>,
@@ -2268,141 +2388,109 @@ where
     let config_json: serde_json::Value =
         serde_json::from_str(&config).map_err(|e| StorageError::parse_error("config", e))?;
 
-    // Extract layers with progress updates
+    // Extract layers with progress updates.
+    //
+    // Each layer is fetched from the registry and unpacked into its OWN
+    // directory, so layers are independent and run concurrently: a serial loop
+    // leaves the network idle while a layer unpacks and the CPU idle while the
+    // next one downloads, which on a multi-layer image is most of the wall
+    // clock. Stacking order is applied later from the manifest, so completion
+    // order here does not matter. Concurrency is bounded because each worker
+    // holds a crane process and a decompressor.
+    //
     // Layers extracted by THIS pull; their completion markers are written only
     // after the writeback barrier below confirms the data reached the disk.
     let mut newly_extracted: Vec<(PathBuf, u64)> = Vec::new();
-    for (i, layer_digest) in layers.iter().enumerate() {
-        let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
-        let layer_dir = root.join(LAYERS_DIR).join(layer_id);
 
-        // A manifest can legally reference the same layer more than once. Its
-        // durable completion marker is delayed until the final writeback
-        // barrier, so remember successful work from this pull rather than
-        // deleting and extracting the same directory again.
-        if newly_extracted.iter().any(|(dir, _)| dir == &layer_dir) {
-            progress(i + 1, total_layers, layer_id);
+    // Decide what actually needs fetching before spawning anything: duplicate
+    // digests within one manifest, and layers a previous pull already
+    // completed, are reported as progress and skipped.
+    let mut pending: Vec<(usize, &String, String, PathBuf)> = Vec::new();
+    let mut seen_dirs: Vec<PathBuf> = Vec::new();
+    for (i, layer_digest) in layers.iter().enumerate() {
+        let layer_id = layer_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(layer_digest)
+            .to_string();
+        let layer_dir = root.join(LAYERS_DIR).join(&layer_id);
+        if seen_dirs.contains(&layer_dir) {
+            progress(i + 1, total_layers, &layer_id);
             continue;
         }
-
         if is_layer_cached(&layer_dir) {
             info!(layer = %layer_id, "layer already cached");
-            // Report progress after confirming cache hit
-            progress(i + 1, total_layers, layer_id);
+            progress(i + 1, total_layers, &layer_id);
             continue;
         }
+        seen_dirs.push(layer_dir.clone());
+        pending.push((i, layer_digest, layer_id, layer_dir));
+    }
 
-        // Clean up an incomplete or unverified layer directory: empty, or left
-        // by an interrupted/unflushed earlier extraction (no completion marker).
-        if layer_dir.exists() {
-            warn!(layer = %layer_id, "removing incomplete or unverified layer directory");
-            if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
-                warn!(layer = %layer_id, error = %e, "failed to remove incomplete layer directory");
-            }
-        }
-        let _ = std::fs::remove_file(layer_ok_marker(&layer_dir));
-        let _ = std::fs::remove_file(layer_size_marker(&layer_dir));
-
-        info!(
-            layer = %layer_id,
-            progress = format!("{}/{}", i + 1, total_layers),
-            "extracting layer"
+    if !pending.is_empty() {
+        // One crane fetch + decompress per worker; more than a handful of
+        // concurrent streams only competes for the same link and page cache.
+        let workers = pending.len().min(4);
+        let queue = std::sync::Mutex::new(
+            pending
+                .into_iter()
+                .collect::<std::collections::VecDeque<_>>(),
         );
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(usize, String, PathBuf, u64)>>();
 
-        std::fs::create_dir_all(&layer_dir)?;
-
-        // Stream layer directly to tar extraction using direct process piping
-        // (no shell to avoid injection risks)
-
-        // Set up auth if provided (temp_dir must stay alive until command completes)
-        let temp_dir = setup_docker_auth(image, auth)?;
-
-        // Build crane command
-        let mut crane_cmd = Command::new("crane");
-        crane_cmd.arg("blob");
-        crane_cmd.arg(format!("{}@{}", image_repo(image), layer_digest));
-        if let Some(p) = oci_platform {
-            crane_cmd.arg("--platform").arg(p);
-        }
-        crane_cmd.stdout(Stdio::piped());
-        // Capture crane stderr to a file (not a pipe — a file can't deadlock on a
-        // full buffer) so the real fetch failure (DNS, TLS, 4xx, redirect) is
-        // surfaced instead of a bare "crane blob failed".
-        let crane_stderr_path = layer_dir.join(".crane-stderr");
-        match std::fs::File::create(&crane_stderr_path) {
-            Ok(f) => {
-                crane_cmd.stderr(Stdio::from(f));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let queue = &queue;
+                scope.spawn(move || loop {
+                    let Some((i, layer_digest, layer_id, layer_dir)) =
+                        queue.lock().unwrap().pop_front()
+                    else {
+                        break;
+                    };
+                    let outcome = fetch_and_extract_layer(
+                        image,
+                        layer_digest,
+                        &layer_id,
+                        &layer_dir,
+                        oci_platform,
+                        auth,
+                        proxy,
+                        no_proxy,
+                        i,
+                        total_layers,
+                    )
+                    .map(|size| (i, layer_id, layer_dir, size));
+                    let failed = outcome.is_err();
+                    if tx.send(outcome).is_err() || failed {
+                        break;
+                    }
+                });
             }
-            Err(_) => {
-                crane_cmd.stderr(Stdio::null());
+            drop(tx);
+
+            // Progress stays on this thread: the caller's closure is FnMut and
+            // is not required to be thread-safe.
+            let mut done = 0usize;
+            let mut first_error: Option<StorageError> = None;
+            for received in rx {
+                match received {
+                    Ok((_, layer_id, layer_dir, size)) => {
+                        newly_extracted.push((layer_dir, size));
+                        done += 1;
+                        progress(done, total_layers, &layer_id);
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
             }
-        }
-
-        if let Some(ref td) = temp_dir {
-            crane_cmd.env("DOCKER_CONFIG", td.path());
-        }
-
-        apply_proxy_env(&mut crane_cmd, proxy, no_proxy);
-
-        // Spawn crane process
-        let mut crane = crane_cmd
-            .spawn()
-            .map_err(|e| StorageError::new(format!("failed to spawn crane: {}", e)))?;
-
-        // Extract straight from crane's stdout. `extract_oci_layer` transparently
-        // decompresses gzip- OR zstd-compressed layers in-process (the guest
-        // ships no zstd tool, and the old external `gunzip` pipe silently failed
-        // on every zstd layer). Reading the stream to EOF also drives the crane
-        // fetch to completion.
-        let crane_stdout = crane
-            .stdout
-            .take()
-            .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
-
-        let extract_result = extract_oci_layer_with_size(crane_stdout, &layer_dir);
-
-        let crane_status = crane
-            .wait()
-            .map_err(|e| StorageError::new(format!("failed to wait for crane: {}", e)))?;
-
-        let crane_stderr = std::fs::read_to_string(&crane_stderr_path).unwrap_or_default();
-        let _ = std::fs::remove_file(&crane_stderr_path);
-        let crane_stderr = crane_stderr.trim();
-
-        // Order matters. A genuine crane fetch failure (network/auth) prints a
-        // real message to its stderr, so surface that first. Otherwise, if
-        // extraction failed, THAT is the real cause — a crane that exited
-        // non-zero with empty stderr is just the SIGPIPE from us closing the pipe
-        // when extraction stopped reading (the exact trap that made every zstd
-        // layer look like "crane blob failed" when the real problem was that the
-        // old pipeline couldn't decompress it).
-        let layer_failure = if !crane_status.success() && !crane_stderr.is_empty() {
-            Some(format!(
-                "crane blob failed for layer {}: {}",
-                layer_digest, crane_stderr
-            ))
-        } else if let Err(ref e) = extract_result {
-            Some(format!(
-                "layer extraction failed for layer {}: {}",
-                layer_digest, e
-            ))
-        } else if !crane_status.success() {
-            Some(format!("crane blob failed for layer {}", layer_digest))
-        } else {
-            None
-        };
-
-        if let Some(message) = layer_failure {
-            if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
-                warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after extraction failure");
+            match first_error {
+                Some(e) => Err(e),
+                None => Ok(()),
             }
-            return Err(StorageError::new(message));
-        }
-
-        newly_extracted.push((layer_dir, extract_result.unwrap_or(0)));
-
-        // Report progress after successful extraction
-        progress(i + 1, total_layers, layer_id);
+        })?;
     }
 
     // Signal that layers are done and we're syncing — this can take a while
