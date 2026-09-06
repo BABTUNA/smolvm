@@ -41,16 +41,17 @@ impl EmbeddedRuntime {
         self.with_name_lock(&spec.name, || control::create_vm(&self.db, &spec))
     }
 
-    /// Create a persisted image machine with its launch-time environment and
-    /// working directory.
+    /// Create a persisted image machine with its launch-time environment,
+    /// working directory and user.
     pub fn create_machine_with_workload(
         &self,
         spec: MachineSpec,
         env: Vec<(String, String)>,
         workdir: Option<String>,
+        user: Option<String>,
     ) -> Result<()> {
         self.with_name_lock(&spec.name, || {
-            control::create_vm_with_workload(&self.db, &spec, env, workdir)
+            control::create_vm_with_workload(&self.db, &spec, env, workdir, user)
         })
     }
 

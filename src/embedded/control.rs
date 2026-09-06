@@ -96,7 +96,7 @@ impl MachineSpec {
 
 /// Create a DB record for a new SDK machine.
 pub fn create_vm(db: &SmolvmDb, spec: &MachineSpec) -> Result<()> {
-    create_vm_with_workload(db, spec, Vec::new(), None)
+    create_vm_with_workload(db, spec, Vec::new(), None, None)
 }
 
 /// Create a DB record with the image workload configuration supplied by an
@@ -106,6 +106,7 @@ pub(crate) fn create_vm_with_workload(
     spec: &MachineSpec,
     env: Vec<(String, String)>,
     workdir: Option<String>,
+    user: Option<String>,
 ) -> Result<()> {
     validate_vm_name(&spec.name, "name")
         .map_err(|reason| Error::config("validate machine name", reason))?;
@@ -122,6 +123,7 @@ pub(crate) fn create_vm_with_workload(
     record.cmd = spec.command.clone();
     record.env = env;
     record.workdir = workdir;
+    record.user = user;
     if db.insert_vm_if_not_exists(&spec.name, &record)? {
         Ok(())
     } else {
@@ -820,12 +822,14 @@ mod tests {
             &spec,
             vec![("SESSION".into(), "golden".into())],
             Some("/workspace".into()),
+            Some("1000:1000".into()),
         )
         .unwrap();
         let record = get_record(&db, "workload").unwrap();
         assert_eq!(record.image.as_deref(), Some("example/service:latest"));
         assert_eq!(record.cmd, vec!["python", "-m", "service"]);
         assert_eq!(record.env, vec![("SESSION".into(), "golden".into())]);
+        assert_eq!(record.user.as_deref(), Some("1000:1000"));
         assert_eq!(record.workdir.as_deref(), Some("/workspace"));
     }
 
