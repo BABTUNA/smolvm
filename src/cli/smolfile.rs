@@ -19,6 +19,23 @@ pub fn load(path: &std::path::Path) -> smolvm::Result<Smolfile> {
     smolvm::smolfile::load(path)
 }
 
+/// Parse a Smolfile `net_backend` value with the very parser `--net-backend`
+/// uses, so the two can never accept different spellings. Serde would also
+/// reject an unknown value, but only with its own vocabulary ("unknown
+/// variant"); naming the flag and listing the accepted values tells the reader
+/// what to write instead.
+fn parse_net_backend(raw: &str) -> smolvm::Result<NetworkBackend> {
+    <NetworkBackend as clap::ValueEnum>::from_str(raw, false).map_err(|_| {
+        smolvm::Error::config(
+            "Smolfile",
+            format!(
+                "net_backend = \"{raw}\" is not a networking backend; expected \"tsi\" or \
+                 \"virtio-net\" (the same values as --net-backend)"
+            ),
+        )
+    })
+}
+
 /// Build `CreateVmParams` by merging CLI flags with an optional Smolfile.
 ///
 /// CLI flags override Smolfile values. For Vec fields, CLI values are appended
@@ -226,6 +243,16 @@ pub fn build_create_params(
         sf.net.unwrap_or(false)
     };
 
+    // CLI wins over the Smolfile, like every other scalar here.
+    let network_backend = match cli_network_backend {
+        Some(backend) => Some(backend),
+        None => sf
+            .net_backend
+            .as_deref()
+            .map(parse_net_backend)
+            .transpose()?,
+    };
+
     let gpu = sf.gpu.unwrap_or(false);
     let rosetta = sf.rosetta.unwrap_or(false);
 
@@ -319,7 +346,7 @@ pub fn build_create_params(
         allow_system_mounts: false,
         port: ports,
         net,
-        network_backend: cli_network_backend,
+        network_backend,
         dns: cli_dns,
         network_name: cli_network_name,
         init,
@@ -548,6 +575,7 @@ mod tests {
             r#"
 image = "library/alpine:latest"
 net = true
+net_backend = "virtio-net"
 entrypoint = ["/bin/sh", "-c"]
 cmd = ["sleep infinity"]
 env = ["GREETING=hello", "EMPTY="]
@@ -567,6 +595,7 @@ init = ["echo init"]
         assert_eq!(params.workdir.as_deref(), Some("/srv/app"));
         assert_eq!(params.user.as_deref(), Some("501:20"));
         assert_eq!(params.init, vec!["echo init"]);
+        assert_eq!(params.network_backend, Some(NetworkBackend::VirtioNet));
 
         // Hop 2a: create params -> record, the `machine create` path.
         let created = build_vm_record(&params).unwrap();
@@ -583,6 +612,7 @@ init = ["echo init"]
         assert_eq!(created.workdir, params.workdir);
         assert_eq!(created.user, params.user);
         assert_eq!(created.init, params.init);
+        assert_eq!(created.network_backend, params.network_backend);
 
         // Hop 2b: create params -> overrides -> record, the `run` and
         // first-launch paths.
@@ -596,6 +626,7 @@ init = ["echo init"]
         assert_eq!(persisted.workdir, params.workdir);
         assert_eq!(persisted.user, params.user);
         assert_eq!(persisted.init, params.init);
+        assert_eq!(persisted.network_backend, params.network_backend);
 
         // Hop 3: record -> pack manifest, the `pack create --from-vm` path.
         let mut manifest = PackManifest::new(
@@ -616,6 +647,121 @@ init = ["echo init"]
         assert!(manifest.env.contains(&"GREETING=hello".to_string()));
         assert_eq!(manifest.workdir, params.workdir);
         assert_eq!(manifest.user, params.user);
+    }
+
+    /// A Smolfile must be able to express the backend the workload needs, so a
+    /// checked-in file fully describes the machine instead of relying on a flag
+    /// the next person forgets. Both spellings are the CLI's own, and are
+    /// parsed by the CLI's own value parser. See smol-machines/smolvm#1153.
+    #[test]
+    fn a_smolfile_can_select_either_networking_backend() {
+        for (declared, expected) in [
+            ("virtio-net", NetworkBackend::VirtioNet),
+            ("tsi", NetworkBackend::Tsi),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("Smolfile");
+            std::fs::write(
+                &path,
+                format!("image = \"alpine\"\nnet = true\nnet_backend = \"{declared}\"\n"),
+            )
+            .unwrap();
+
+            let params = build_from_smolfile(path).unwrap();
+
+            assert_eq!(
+                params.network_backend,
+                Some(expected),
+                "net_backend = \"{declared}\" must select {expected:?}"
+            );
+        }
+    }
+
+    /// An unusable value must be rejected where it is written, naming the flag
+    /// it mirrors and the values it accepts -- not deep in a launch failure
+    /// after the machine is already created.
+    #[test]
+    fn an_unknown_networking_backend_is_rejected_with_the_accepted_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\nnet = true\nnet_backend = \"virtio\"\n",
+        )
+        .unwrap();
+
+        // `unwrap_err` would require CreateVmParams: Debug, which it is not.
+        let error = match build_from_smolfile(path) {
+            Ok(_) => panic!("an unknown networking backend must be rejected"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(
+            error.contains("virtio"),
+            "must quote what was written: {error}"
+        );
+        assert!(
+            error.contains("tsi"),
+            "must list the accepted values: {error}"
+        );
+        assert!(
+            error.contains("virtio-net"),
+            "must list the accepted values: {error}"
+        );
+        assert!(
+            error.contains("--net-backend"),
+            "must name the flag it mirrors: {error}"
+        );
+    }
+
+    /// CLI over Smolfile, the same precedence every other scalar here follows.
+    #[test]
+    fn the_net_backend_flag_overrides_the_smolfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\nnet = true\nnet_backend = \"tsi\"\n",
+        )
+        .unwrap();
+
+        let params = build_create_params(
+            "test-vm".to_string(),
+            None,
+            None,
+            vec![],
+            DEFAULT_MICROVM_CPU_COUNT,
+            DEFAULT_MICROVM_MEMORY_MIB,
+            vec![],
+            vec![],
+            false,
+            Some(NetworkBackend::VirtioNet),
+            None,
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(path),
+            None,
+            None,
+            vec![],
+            Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(params.network_backend, Some(NetworkBackend::VirtioNet));
+    }
+
+    /// Absent stays absent: the launcher picks the default backend, and a
+    /// Smolfile without the key must not start pinning one.
+    #[test]
+    fn a_smolfile_without_the_key_leaves_the_backend_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, "image = \"alpine\"\nnet = true\n").unwrap();
+
+        assert_eq!(build_from_smolfile(path).unwrap().network_backend, None);
     }
 
     #[test]

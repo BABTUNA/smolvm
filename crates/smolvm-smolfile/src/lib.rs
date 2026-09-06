@@ -260,6 +260,14 @@ pub struct Smolfile {
     pub memory: Option<u32>,
     /// Enable outbound networking.
     pub net: Option<bool>,
+    /// Networking backend, matching the `--net-backend` flag: `"tsi"` or
+    /// `"virtio-net"`. Only meaningful alongside `net = true`.
+    ///
+    /// Held as a string rather than the backend enum because that enum lives in
+    /// the `smolvm` crate, which depends on this one. The CLI parses this value
+    /// with the flag's own `ValueEnum`, so the spellings a Smolfile accepts can
+    /// never drift from the ones `--net-backend` accepts.
+    pub net_backend: Option<String>,
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     pub gpu: Option<bool>,
     /// GPU VRAM (shared memory region) size in MiB. Ignored unless
