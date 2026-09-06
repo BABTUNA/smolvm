@@ -158,6 +158,12 @@ pub struct ExecRequest {
     #[serde(default)]
     #[schema(example = "/workspace")]
     pub workdir: Option<String>,
+    /// Run as this user: a name from the image or a numeric `uid[:gid]`,
+    /// overriding the image's USER. Only meaningful for image machines; a bare
+    /// VM has no container user to become.
+    #[serde(default)]
+    #[schema(example = "1000:1000")]
+    pub user: Option<String>,
     /// Timeout in seconds.
     #[serde(default)]
     #[schema(example = 30)]
@@ -314,6 +320,11 @@ pub struct RunRequest {
     /// Working directory.
     #[serde(default)]
     pub workdir: Option<String>,
+    /// Run as this user: a name from the image or a numeric `uid[:gid]`,
+    /// overriding the image's USER.
+    #[serde(default)]
+    #[schema(example = "1000:1000")]
+    pub user: Option<String>,
     /// Timeout in seconds.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -1256,6 +1267,28 @@ mod deny_unknown_field_tests {
     use super::*;
 
     /// The correct camelCase `timeoutSecs` deserializes and applies.
+    /// `user` is accepted on both exec and ephemeral run, and is absent by
+    /// default so every existing client keeps working. `deny_unknown_fields`
+    /// on these types is what makes an older serve REJECT the field instead of
+    /// silently running as the wrong account, so this is the contract both
+    /// the control plane and the CLI rely on.
+    #[test]
+    fn exec_and_run_requests_carry_an_optional_user() {
+        let exec: ExecRequest = serde_json::from_value(
+            serde_json::json!({"command": ["id", "-u"], "user": "1000:1000"}),
+        )
+        .unwrap();
+        assert_eq!(exec.user.as_deref(), Some("1000:1000"));
+        let bare: ExecRequest =
+            serde_json::from_value(serde_json::json!({"command": ["id", "-u"]})).unwrap();
+        assert_eq!(bare.user, None);
+        let run: RunRequest = serde_json::from_value(
+            serde_json::json!({"image": "alpine", "command": ["id", "-u"], "user": "app"}),
+        )
+        .unwrap();
+        assert_eq!(run.user.as_deref(), Some("app"));
+    }
+
     #[test]
     fn exec_request_accepts_camelcase_timeout() {
         let req: ExecRequest = serde_json::from_value(
