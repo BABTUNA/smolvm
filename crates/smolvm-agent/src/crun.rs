@@ -42,7 +42,7 @@ pub(crate) fn augmented_exec_env(
     container_id: &str,
 ) -> Vec<(String, String)> {
     crate::vulkan::augment_exec_env(
-        crate::cuda::augment_exec_env(ensure_path_in_env(env)),
+        crate::cuda::augment_exec_env(crate::forkpoint::augment_exec_env(ensure_path_in_env(env))),
         container_id,
     )
 }

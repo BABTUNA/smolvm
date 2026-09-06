@@ -99,6 +99,29 @@ pub fn inject_into_container(spec: &mut crate::oci::OciSpec) {
     inject_into_container_if(spec, enabled(), arming_enabled(), AGENT_BINARY, STATE_DIR);
 }
 
+/// Keep a `crun exec` process on the same negotiated arming protocol as the
+/// container it joins.
+///
+/// `crun exec --env` builds a fresh process environment instead of inheriting
+/// the container spec. Without restoring this internal variable, a
+/// `smolvm-branch-ready` helper launched through `machine exec` falls back to
+/// the legacy spin loop while the host waits for an arming acknowledgement.
+pub fn augment_exec_env(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    augment_exec_env_if(&mut env, arming_enabled());
+    env
+}
+
+fn augment_exec_env_if(env: &mut Vec<(String, String)>, armable: bool) {
+    let key = smolvm_protocol::guest_env::BRANCHPOINT_ARMING;
+    env.retain(|(existing, _)| existing != key);
+    if armable {
+        env.push((
+            key.to_string(),
+            smolvm_protocol::guest_env::VALUE_ON.to_string(),
+        ));
+    }
+}
+
 fn inject_into_container_if(
     spec: &mut crate::oci::OciSpec,
     enabled: bool,
@@ -577,6 +600,29 @@ mod tests {
             .env
             .iter()
             .all(|entry| !entry.starts_with(&prefix)));
+    }
+
+    #[test]
+    fn exec_env_matches_the_negotiated_arming_protocol() {
+        let key = smolvm_protocol::guest_env::BRANCHPOINT_ARMING;
+        let mut env = vec![
+            ("USER_VALUE".to_string(), "kept".to_string()),
+            (key.to_string(), "stale".to_string()),
+        ];
+
+        augment_exec_env_if(&mut env, true);
+        assert!(env.contains(&("USER_VALUE".to_string(), "kept".to_string())));
+        assert_eq!(
+            env.iter().filter(|(existing, _)| existing == key).count(),
+            1
+        );
+        assert!(env.contains(&(
+            key.to_string(),
+            smolvm_protocol::guest_env::VALUE_ON.to_string()
+        )));
+
+        augment_exec_env_if(&mut env, false);
+        assert!(env.iter().all(|(existing, _)| existing != key));
     }
 
     #[test]
