@@ -19,20 +19,6 @@ use std::io::Write;
 // Display Helpers
 // ============================================================================
 
-/// Truncate a string to max length, adding "..." if needed.
-///
-/// If the string fits within `max` characters, returns it unchanged.
-/// Otherwise, truncates to `max - 3` characters and appends "...".
-pub fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else if max <= 3 {
-        "...".to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
-    }
-}
-
 /// Format an optional PID as a suffix string.
 ///
 /// Returns " (PID: N)" if pid is Some, or empty string if None.

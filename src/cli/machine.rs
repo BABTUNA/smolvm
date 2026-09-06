@@ -4429,11 +4429,15 @@ pub struct LsCmd {
     /// Output in JSON format
     #[arg(long)]
     pub json: bool,
+
+    /// Print only machine names, one per line
+    #[arg(short, long, conflicts_with = "verbose")]
+    pub quiet: bool,
 }
 
 impl LsCmd {
     pub fn run(&self) -> smolvm::Result<()> {
-        vm_common::list_vms(self.verbose, self.json)
+        vm_common::list_vms(self.verbose, self.json, self.quiet)
     }
 }
 

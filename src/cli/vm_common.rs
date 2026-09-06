@@ -4,7 +4,7 @@
 //! (create, start, stop, delete, ls). This module provides the common
 //! implementations used by those commands.
 
-use crate::cli::{format_pid_suffix, truncate};
+use crate::cli::format_pid_suffix;
 use smolvm::agent::{vm_data_dir, AgentManager};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
 use smolvm::data::network::PortMapping;
@@ -2749,17 +2749,25 @@ pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
 // ============================================================================
 
 /// List all machines.
-pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
+pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
     let config = SmolvmConfig::load()?;
     let vms: Vec<_> = config.list_vms().collect();
 
     let empty_label = "No machines found";
 
     if vms.is_empty() {
-        if !json {
-            println!("{}", empty_label);
-        } else {
+        if json {
             println!("[]");
+        } else if !quiet {
+            println!("{}", empty_label);
+        }
+        return Ok(());
+    }
+    // Names only, one per line: the scriptable form, and the one place a full
+    // name is guaranteed whatever the terminal is doing.
+    if quiet && !json {
+        for (name, _) in vms {
+            println!("{}", name);
         }
         return Ok(());
     }
@@ -2773,8 +2781,25 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
             .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
         println!("{}", json);
     } else {
+        // Size the free-text columns to what is actually there rather than to a
+        // fixed width: a name is at most MAX_VM_NAME_LENGTH, so showing it whole
+        // is always affordable, and truncating it hid the one thing `ls` exists
+        // to tell you. The fixed-width numeric columns keep their alignment.
+        let name_w = vms
+            .iter()
+            .map(|(name, _)| name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("NAME".len());
+        let from_w = vms
+            .iter()
+            .filter_map(|(_, record)| record.golden.as_deref())
+            .map(|g| g.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("BRANCHED FROM".len());
         println!(
-            "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}  {:<18}",
+            "{:<name_w$} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}  {:<from_w$}",
             "NAME",
             "STATE",
             "CPUS",
@@ -2785,7 +2810,11 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
             "OVERLAY",
             "BRANCHED FROM"
         );
-        println!("{}", "-".repeat(108));
+        // 8 single-space separators + the double space before the last column.
+        println!(
+            "{}",
+            "-".repeat(name_w + 12 + 5 + 10 + 7 + 7 + 8 + 8 + from_w + 9)
+        );
 
         for (name, record) in vms {
             let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
@@ -2798,14 +2827,10 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
             let overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
             // A branch's source, so a tree of clones reads as a tree rather than
             // a flat list of unrelated machines.
-            let branched_from = record
-                .golden
-                .as_deref()
-                .map(|g| truncate(g, 16))
-                .unwrap_or_else(|| "-".to_string());
+            let branched_from = record.golden.as_deref().unwrap_or("-");
             println!(
-                "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}  {:<18}",
-                truncate(name, 18),
+                "{:<name_w$} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}  {:<from_w$}",
+                name,
                 state_display,
                 record.cpus,
                 format!("{} MiB", record.mem),
