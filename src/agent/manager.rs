@@ -995,6 +995,33 @@ impl AgentManager {
         Ok(data_dir.join("smolvm").join("agent-rootfs"))
     }
 
+    /// Resolve the agent rootfs an operation should use, and insist it is real.
+    ///
+    /// `explicit` is a caller-supplied override (`--rootfs-dir`, a checkpoint's
+    /// `rootfs_dir`) and wins outright. Otherwise this is exactly what a machine
+    /// boots with — [`Self::default_rootfs_path`] — so `pack create`, checkpoints
+    /// and `machine run` can never disagree about which agent they mean.
+    ///
+    /// The result is checked for `sbin/init` via `symlink_metadata`: that entry
+    /// is a symlink to a guest-only path, so `exists()` would follow it and
+    /// wrongly report a perfectly good rootfs as missing.
+    pub fn resolve_rootfs_path(explicit: Option<PathBuf>, what: &str) -> Result<PathBuf> {
+        let dir = match explicit {
+            Some(dir) => dir,
+            None => Self::default_rootfs_path()?,
+        };
+        if std::fs::symlink_metadata(dir.join("sbin/init")).is_ok() {
+            return Ok(dir);
+        }
+        Err(Error::agent(
+            what,
+            format!(
+                "could not find agent rootfs at {}; set SMOLVM_AGENT_ROOTFS or reinstall",
+                dir.display()
+            ),
+        ))
+    }
+
     /// Extract a bundled agent-rootfs tarball to a cache dir (idempotent) and
     /// return that dir. Keyed by the tarball's size+mtime so a newer SDK build
     /// re-extracts; extraction is staged in a temp dir then atomically renamed so
@@ -3250,6 +3277,30 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
 
 #[cfg(test)]
 mod tests {
+    /// An explicit override must win even over a real default, and a rootfs
+    /// is only accepted when `sbin/init` is present — checked without following
+    /// the symlink, because in a real rootfs it points at a guest-only path.
+    #[test]
+    fn resolve_rootfs_path_honours_override_and_requires_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = tmp.path().join("good");
+        std::fs::create_dir_all(good.join("sbin")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", good.join("sbin/init")).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(good.join("sbin/init"), b"").unwrap();
+        let got = super::AgentManager::resolve_rootfs_path(Some(good.clone()), "test").unwrap();
+        assert_eq!(got, good);
+
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let err = super::AgentManager::resolve_rootfs_path(Some(bare.clone()), "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not find agent rootfs"), "{err}");
+        assert!(err.contains(&bare.display().to_string()), "{err}");
+    }
+
     use super::*;
 
     #[test]

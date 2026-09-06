@@ -300,24 +300,11 @@ fn checkpoint_lib_dir(options: &CaptureOptions) -> Result<PathBuf> {
 }
 
 fn checkpoint_rootfs_dir(options: &CaptureOptions) -> Result<PathBuf> {
-    let candidates = [
+    // The same resolver a machine boots with; see `AgentManager::resolve_rootfs_path`.
+    crate::agent::AgentManager::resolve_rootfs_path(
         options.rootfs_dir.clone(),
-        std::env::var_os("SMOLVM_AGENT_ROOTFS").map(PathBuf::from),
-        dirs::data_dir().map(|dir| dir.join("smolvm/agent-rootfs")),
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|dir| dir.join("agent-rootfs"))),
-    ];
-    candidates
-        .into_iter()
-        .flatten()
-        .find(|candidate| std::fs::symlink_metadata(candidate.join("sbin/init")).is_ok())
-        .ok_or_else(|| {
-            Error::agent(
-                "find checkpoint agent rootfs",
-                "could not find agent rootfs; set SMOLVM_AGENT_ROOTFS",
-            )
-        })
+        "find checkpoint agent rootfs",
+    )
 }
 
 fn validated_capture_source(name: &str) -> Result<SmolvmConfig> {
