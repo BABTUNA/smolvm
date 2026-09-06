@@ -464,6 +464,48 @@ pub fn init_packed_layers() -> Option<PathBuf> {
 }
 
 /// Get the packed layers directory if available.
+/// Seed `/storage/workspace` from a pack's workspace seed, once.
+///
+/// `pack create --from-vm --include-workspace` ships the source machine's
+/// `/workspace` as `workspace-seed/workspace.tar` beside the staged layers. The
+/// workspace lives on the storage disk, which is fresh for every ephemeral run
+/// and for a machine's first boot, so this is the only way those files reach
+/// it. Runs as root, so ownership is exactly what the source machine had.
+///
+/// Guarded by a marker on the storage disk: a persistent machine seeds on its
+/// first boot only, and later boots leave whatever the user has done since.
+/// Absent seed, or any failure, leaves the workspace as it was.
+pub fn seed_workspace_from_pack() {
+    const SEED_DIR: &str = "workspace-seed";
+    const SEED_FILE: &str = "workspace.tar";
+    const MARKER: &str = ".smolvm-workspace-seeded";
+    let Some(packed) = get_packed_layers_dir() else {
+        return;
+    };
+    let seed = packed.join(SEED_DIR).join(SEED_FILE);
+    if !seed.is_file() {
+        return;
+    }
+    let workspace = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
+    let marker = workspace.join(MARKER);
+    if marker.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&workspace) {
+        warn!(error = %e, "workspace seed: cannot create workspace dir");
+        return;
+    }
+    info!("seeding /workspace from the pack");
+    match extract_layer_tar(&seed, &workspace) {
+        Ok(()) => {
+            if let Err(e) = std::fs::write(&marker, b"") {
+                warn!(error = %e, "workspace seed: cannot write marker");
+            }
+        }
+        Err(e) => warn!(error = %e, "workspace seed: extraction failed; workspace left as-is"),
+    }
+}
+
 pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
     PACKED_LAYERS_DIR.get_or_init(init_packed_layers).as_ref()
 }

@@ -36,6 +36,9 @@ fn ensure_storage_mounted() -> bool {
                 "INFO",
                 &format!("storage disk mounted (duration_ms={})", uptime_ms() - t0),
             );
+            // Before anything reads /workspace: a pack made with
+            // --include-workspace seeds it onto this (fresh) storage disk.
+            storage::seed_workspace_from_pack();
         } else {
             boot_log(
                 "ERROR",

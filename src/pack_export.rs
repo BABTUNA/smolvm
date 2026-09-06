@@ -39,6 +39,10 @@ pub struct FromVmExportOptions {
     /// For artifact-sourced machines: rebuild base layers from `vm.image`
     /// (re-pull from the registry) instead of preserving imported layers.
     pub rebase_from_image: bool,
+    /// Also capture the machine's `/workspace` so a machine made from the pack
+    /// starts with those files. It lives on the storage disk, which container
+    /// packs otherwise never carry, so without this a pack silently loses it.
+    pub include_workspace: bool,
 }
 
 /// What the export decided about the machine, for the caller's manifest.
@@ -124,6 +128,7 @@ pub fn collect_from_vm_assets(
             &vm_dir,
             staging_dir,
             vm.source_smolmachine.as_deref(),
+            opts.include_workspace,
         )?;
     } else if is_image_based {
         let image = vm.image.clone().unwrap();
@@ -137,7 +142,13 @@ pub fn collect_from_vm_assets(
             // reachable: an archive was flattened onto the machine's own storage
             // disk at boot, and a rootfs dir is still the host directory the
             // machine boots from. Either can be the lower layer.
-            export_flattened_from_local_image(collector, vm_name, &vm_dir, &image)?;
+            export_flattened_from_local_image(
+                collector,
+                vm_name,
+                &vm_dir,
+                &image,
+                opts.include_workspace,
+            )?;
         } else {
             image_env =
                 export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
@@ -393,7 +404,13 @@ fn export_flattened_from_registry_image(
         })
         .collect();
 
-    flatten_and_export(collector, &mut client, vm_name, &lowers)?;
+    flatten_and_export(
+        collector,
+        &mut client,
+        vm_name,
+        &lowers,
+        opts.include_workspace,
+    )?;
     Ok(image_info.env)
 }
 
@@ -422,6 +439,7 @@ fn export_flattened_from_local_image(
     vm_name: &str,
     vm_dir: &Path,
     image: &str,
+    include_workspace: bool,
 ) -> crate::Result<()> {
     let host_dir = crate::data::image_source::packed_layers_dir_for_ref(image);
     let is_dir_source = image.starts_with("local-dir:");
@@ -478,7 +496,7 @@ fn export_flattened_from_local_image(
         ));
     }
 
-    flatten_and_export(collector, &mut client, vm_name, &[dst])
+    flatten_and_export(collector, &mut client, vm_name, &[dst], include_workspace)
 }
 
 /// The flattened rootfs of a local *archive* image on the source machine's
@@ -536,6 +554,7 @@ fn export_flattened_from_artifact_sourced(
     vm_dir: &Path,
     _staging_dir: &Path,
     source_smolmachine: Option<&str>,
+    include_workspace: bool,
 ) -> crate::Result<()> {
     let cache_dir = machine_layers_cache_dir(vm_name);
     let pack_content_dir = read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir.clone());
@@ -613,7 +632,7 @@ fn export_flattened_from_artifact_sourced(
         lowers.push(dst);
     }
 
-    flatten_and_export(collector, &mut client, vm_name, &lowers)
+    flatten_and_export(collector, &mut client, vm_name, &lowers, include_workspace)
 }
 
 /// The cached layers of an imported pack, bottom -> top, as paths relative to
@@ -670,6 +689,7 @@ fn flatten_and_export(
     client: &mut AgentClient,
     vm_name: &str,
     lowers: &[String],
+    include_workspace: bool,
 ) -> crate::Result<()> {
     if lowers.is_empty() {
         return Err(Error::agent("flatten layers", "no layers to flatten"));
@@ -739,6 +759,63 @@ fn flatten_and_export(
         .register_layer(&digest)
         .map_err(|e| Error::agent("register flattened layer", e.to_string()))?;
     println!("  Flattened layer: {} bytes", total);
+    if include_workspace {
+        export_workspace_seed(collector, client)?;
+    }
+    Ok(())
+}
+
+/// Capture the source machine's `/workspace` as the pack's workspace seed.
+///
+/// The flattened layer above is the container's root filesystem; `/workspace`
+/// is a directory on the machine's storage disk, mounted at
+/// `/mnt/source-storage` in the helper, and is not part of any layer. Same
+/// mechanics as the layer: the agent tars it in the guest (so ownership is
+/// exactly what the machine had) and the host streams the result to disk. An
+/// empty workspace records nothing.
+fn export_workspace_seed(
+    collector: &mut AssetCollector,
+    client: &mut AgentClient,
+) -> crate::Result<()> {
+    const GUEST_WORKSPACE: &str = "/mnt/source-storage/workspace";
+    const GUEST_TAR: &str = "/storage/workspace-seed.tar";
+    let listing = client
+        .vm_exec(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!("find {GUEST_WORKSPACE} -mindepth 1 -print -quit 2>/dev/null"),
+            ],
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| Error::agent("inspect workspace", e.to_string()))?;
+    if String::from_utf8_lossy(&listing.1).trim().is_empty() {
+        return Ok(());
+    }
+    println!("Capturing /workspace...");
+    client.flatten_layers(&[GUEST_WORKSPACE.to_string()], GUEST_TAR)?;
+    let tmp_file = collector
+        .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
+        .with_file_name("workspace-seed.tmp");
+    let total = client
+        .read_file_to_path_capped(
+            GUEST_TAR,
+            &tmp_file,
+            crate::agent::pack_export_max_total(),
+            |_| {},
+        )
+        .map_err(|e| Error::agent("export workspace", e.to_string()))?;
+    if total == 0 {
+        let _ = std::fs::remove_file(&tmp_file);
+        return Ok(());
+    }
+    collector
+        .add_workspace_seed(&tmp_file)
+        .map_err(|e| Error::agent("register workspace seed", e.to_string()))?;
+    println!("  Workspace seed: {} bytes", total);
     Ok(())
 }
 

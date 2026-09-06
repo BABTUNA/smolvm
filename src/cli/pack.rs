@@ -151,6 +151,10 @@ pub struct PackCreateCmd {
     #[arg(long = "rebase-from-image", requires = "from_vm")]
     pub rebase_from_image: bool,
 
+    /// Also capture the machine's /workspace, so a machine made from the pack starts with those files. It lives on the storage disk, which packs otherwise never carry.
+    #[arg(long = "include-workspace", requires = "from_vm")]
+    pub include_workspace: bool,
+
     /// Output file path for the packed binary
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
@@ -660,6 +664,7 @@ impl PackCreateCmd {
             proxy: self.proxy_opts.resolved_proxy()?,
             no_proxy: self.proxy_opts.no_proxy(),
             rebase_from_image: self.rebase_from_image,
+            include_workspace: self.include_workspace,
         };
         let assets = smolvm::pack_export::collect_from_vm_assets(
             &mut collector,
@@ -1864,6 +1869,7 @@ mod tests {
             image: Some("./local-image.tar".to_string()),
             from_vm: None,
             rebase_from_image: false,
+            include_workspace: false,
             output: PathBuf::from("test-output"),
             cpus: 2,
             mem: 1024,

@@ -645,6 +645,11 @@ pub struct AssetInventory {
     /// this size via `ftruncate`, restoring the sparse skeleton the VM expects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_logical_size: Option<u64>,
+    /// Contents of the machine's `/workspace` at pack time, as a tar the guest
+    /// unpacks onto a fresh storage disk on first boot. Absent from packs made
+    /// without `--include-workspace`, and from packs older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_seed: Option<AssetEntry>,
 }
 
 /// An asset file entry.
@@ -711,6 +716,7 @@ impl PackManifest {
                 storage_logical_size: None,
                 overlay_template: None,
                 overlay_logical_size: None,
+                workspace_seed: None,
             },
             checkpoint: None,
         }

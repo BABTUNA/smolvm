@@ -1027,22 +1027,23 @@ fn ensure_init_layer(
         // even when the outer run was given --proxy.
         let start = bake_start_args(&tmp, proxy, no_proxy);
         run_smolvm(&exe, &start)?;
-        // The snapshot below captures the rootfs overlay only. /workspace is the
-        // machine's storage disk, so anything init wrote there is NOT in the
-        // cached artifact and every cached run starts without it. Say so
-        // rather than let a `cat $WORKDIR/file` fail with no explanation.
-        if !params.init.is_empty() && bake_workspace_has_files(&exe, &tmp) {
-            eprintln!(
-                "warning: init wrote files under /workspace, which the init-layer cache does not \
-                 capture (it snapshots the root filesystem only); cached runs will start \
-                 without them. Pass --no-init-cache to run init live instead."
-            );
-        }
         run_smolvm(&exe, &["machine", "stop", "--name", &tmp])?;
         println!("  · snapshotting...");
         run_smolvm(
             &exe,
-            &["pack", "create", "--from-vm", &tmp, "-o", &staged_out],
+            // `--include-workspace`: init may well have written into the workdir,
+            // which is the storage disk rather than the rootfs the snapshot
+            // captures; without it every cached run would start without those
+            // files and nothing would say why.
+            &[
+                "pack",
+                "create",
+                "--from-vm",
+                &tmp,
+                "--include-workspace",
+                "-o",
+                &staged_out,
+            ],
         )?;
         if !staged_sidecar.exists() {
             return Err(smolvm::Error::config(
@@ -1076,26 +1077,6 @@ fn ensure_init_layer(
 /// CAPTURED (not inherited) so the bake's internal create/pull/pack chatter — and
 /// the harmless "vm not found" from the best-effort pre-clean — never reach the
 /// user's terminal; on failure the captured stderr tail is surfaced in the error.
-/// Whether init left anything on the bake machine's /workspace (its storage
-/// disk). Best effort: a failed probe reads as "nothing there" so it can never
-/// turn a good bake into an error.
-fn bake_workspace_has_files(exe: &Path, name: &str) -> bool {
-    std::process::Command::new(exe)
-        .args([
-            "machine",
-            "exec",
-            "--name",
-            name,
-            "--",
-            "sh",
-            "-c",
-            "find /workspace -mindepth 1 -print -quit 2>/dev/null | grep -q .",
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 fn run_smolvm(exe: &Path, args: &[&str]) -> smolvm::Result<()> {
     let out = std::process::Command::new(exe)
         .args(args)
