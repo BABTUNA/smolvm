@@ -686,7 +686,9 @@ pub struct RunCmd {
     pub secret_file: Vec<String>,
 
     /// Run command before the workload (can be used multiple times); the same
-    /// as `init` in a Smolfile, and the CLI form wins when both are given
+    /// as `init` in a Smolfile, and the CLI form wins when both are given.
+    /// Init provisions the machine, so it runs as root regardless of `--user`
+    /// or the image's USER.
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
 
@@ -1774,7 +1776,6 @@ impl RunCmd {
                     image_info: image_info.as_ref(),
                     env: &init_env,
                     workdir: params.workdir.as_deref(),
-                    user: params.user.as_deref(),
                     record_mounts: &record_mounts,
                     overlay_id: &vm_name,
                 },
@@ -3268,7 +3269,8 @@ pub struct CreateCmd {
 
     /// Run the workload as this user, like `docker run --user`: a name from the
     /// image or a numeric `uid[:gid]`. Overrides the image's USER, so a workload
-    /// can match the owner of a mounted host directory.
+    /// can match the owner of a mounted host directory. `init` commands still
+    /// run as root.
     #[arg(short = 'u', long = "user", value_name = "USER")]
     pub user: Option<String>,
 

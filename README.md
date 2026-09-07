@@ -79,7 +79,8 @@ Unknown keys are rejected rather than ignored, so a typo fails at create time
 instead of silently doing nothing.
 
 Common keys: `image`, `cpus`, `memory`, `net`, `ports`, `volumes`, `env`,
-`init`, `workdir`, `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`, and the
+`init` (runs once as root, like a Dockerfile `RUN`), `workdir`, `user` (who the
+workload runs as), `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`, and the
 `[network]`, `[dev]`, `[auth]`, `[health]`, `[restart]`, `[service]` tables.
 
 ### Branch a running machine
