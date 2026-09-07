@@ -85,18 +85,64 @@ workload runs as), `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`, and the
 
 ### Branch a running machine
 
-Start a prepared machine as branchable, then create independent copy-on-write
-children from its live RAM and disk state:
+A branch is a live fork: an independent copy-on-write child that resumes with
+the source's running processes, memory, and disk. Start the source as
+branchable, then branch it:
 
 ```bash
 smolvm machine start --name source --branchable
-smolvm machine branch --from source --name child
+smolvm machine branch --from source --name child          # checkpoints the source wherever it is
+```
+
+To fan out many children from one checkpoint, the source's workload marks the
+point to take it by running `smolvm-branch-ready` once its setup is done, and
+names the program each child should run after it. The helper blocks in the
+source, which stays parked there; in each child it hands off to that program
+with the child's identity in its environment:
+
+```bash
+# the workload: install, warm up, then "fork me here, and run this in each child"
+smolvm machine create --name source --image python:3.12-alpine --net -- sh -c '
+  pip install -q requests
+  python3 serve.py &                    # keeps running in every child
+  exec smolvm-branch-ready -- python3 episode.py'
+
+smolvm machine start --name source --branchable
 smolvm machine branch --from source --count 8 --name-prefix worker --parallel 8
 ```
 
+`episode.py` starts in each child with `SMOLVM_BRANCH_NAME`,
+`SMOLVM_BRANCH_INDEX`, `SMOLVM_BRANCH_BATCH_ID`, and `SMOLVM_BRANCH_BATCH_SIZE`
+set, plus any `--env` the branch command passed. A shell script that wants to
+continue inline instead runs `eval "$(smolvm-branch-ready)"`: the same command,
+whose output is those variables as `export` lines. `machine exec` sessions in a
+child see them in their environment too.
+
+When a child has its own warm-up after the branch (loading a checkpoint,
+binding a port), it can report the moment it is actually usable by running
+`smolvm-worker-ready`, and the branch command can wait for that instead of
+for the release alone:
+
+```bash
+smolvm machine branch --from source --count 8 --name-prefix worker --wait-worker-ready
+```
+
+With `--wait-worker-ready` (window: `--worker-ready-timeout`, default 5m) a
+child that never reports is torn down with its batch rather than handed back
+looking alive. `machine branch-release` takes the same flags for a held pool
+slot.
+
+Container rules apply, as in Docker: the container lives as long as its main
+process. `exec smolvm-branch-ready` with no program simply parks; the child
+keeps running with the helper as its init. A batch branch waits
+(`--ready-timeout`, default 10m) for the source to reach its branchpoint; a
+single `--name` branch never waits. With `--name-prefix` or `--hold`, even a
+count of one is a batch and gets the same boundary, identity, and release.
+
 Add `--branchable` to a child when it must branch again. `fork`, `--golden`, and
-`--forkable` remain compatibility aliases; `checkpoint` is reserved for a
-durable `.smolcheckpoint` artifact that can be restored later or elsewhere.
+`--forkable` remain compatibility aliases. A branch takes a checkpoint of the
+source in memory; `machine checkpoint` saves that same state as a durable
+`.smolcheckpoint` artifact that can be restored later or elsewhere.
 
 ### Snapshot a machine into a reusable image
 
@@ -251,7 +297,7 @@ Known Limitations
 * macOS: binary must be signed with Hypervisor.framework entitlements (`com.apple.security.hypervisor`). The shipped release is; a re-signed or freshly built binary silently loses it and every VM start then fails with `krun_start_enter returned: -22 (EINVAL)`. Re-sign it (ad-hoc is fine): `codesign --force --sign - --entitlements hv.entitlements <smolvm-bin>` where `hv.entitlements` is a plist containing `<key>com.apple.security.hypervisor</key><true/>`.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 * GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).
-* Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. Not yet available on Windows: GPU acceleration and `machine branch` / snapshot. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
+* Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. Not yet available on Windows: GPU acceleration and `machine branch` / `machine checkpoint`. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
 
 Kubernetes
 ----------

@@ -855,7 +855,11 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     }
 
     if let Some(timeout) = options.wait_ready {
-        eprintln!("Waiting for source '{golden}' to reach its branchpoint...");
+        eprintln!(
+            "Waiting for source '{golden}' to reach its branchpoint (its workload declares one by \
+             running `smolvm-branch-ready` once setup is done; a single `--name` branch needs \
+             none)..."
+        );
         smolvm::agent::fork::wait_for_forkpoint(golden, timeout)?;
     }
 
@@ -979,7 +983,11 @@ pub fn fork_vm_batch(
     }
 
     if let Some(timeout) = wait_ready {
-        eprintln!("Waiting for source '{golden}' to reach its branchpoint...");
+        eprintln!(
+            "Waiting for source '{golden}' to reach its branchpoint (its workload declares one by \
+             running `smolvm-branch-ready` once setup is done; a single `--name` branch needs \
+             none)..."
+        );
         smolvm::agent::fork::wait_for_forkpoint(golden, timeout)?;
     }
 
