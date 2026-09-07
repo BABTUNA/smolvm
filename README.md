@@ -84,14 +84,44 @@ Common keys: `image`, `cpus`, `memory`, `net`, `ports`, `volumes`, `env`,
 
 ### Branch a running machine
 
-Start a prepared machine as branchable, then create independent copy-on-write
-children from its live RAM and disk state:
+A branch is a live fork: an independent copy-on-write child that resumes with
+the source's running processes, memory, and disk. Start the source as
+branchable, then branch it:
 
 ```bash
 smolvm machine start --name source --branchable
-smolvm machine branch --from source --name child
+smolvm machine branch --from source --name child          # snapshots the source wherever it is
+```
+
+To fan out many children from one snapshot, the source's workload marks the
+point to take it by running `smolvm-branch-ready` once its setup is done, and
+names the program each child should run after it. The helper blocks in the
+source, which stays parked there; in each child it hands off to that program
+with the child's identity in its environment:
+
+```bash
+# the workload: install, warm up, then "fork me here, and run this in each child"
+smolvm machine create --name source --image python:3.12-alpine --net -- sh -c '
+  pip install -q requests
+  python3 serve.py &                    # keeps running in every child
+  exec smolvm-branch-ready -- python3 episode.py'
+
+smolvm machine start --name source --branchable
 smolvm machine branch --from source --count 8 --name-prefix worker --parallel 8
 ```
+
+`episode.py` starts in each child with `SMOLVM_BRANCH_NAME`,
+`SMOLVM_BRANCH_INDEX`, `SMOLVM_BRANCH_BATCH_ID`, and `SMOLVM_BRANCH_BATCH_SIZE`
+set, plus any `--env` the branch command passed. A shell script that wants to
+continue inline instead runs `eval "$(smolvm-branch-ready)"`: the same command,
+whose output is those variables as `export` lines. `machine exec` sessions in a
+child see them in their environment too.
+
+Container rules apply, as in Docker: the container lives as long as its main
+process. `exec smolvm-branch-ready` with no program simply parks; the child
+keeps running with the helper as its init. A batch branch waits
+(`--ready-timeout`, default 10m) for the source to reach its branchpoint; a
+single `--name` branch never waits.
 
 Add `--branchable` to a child when it must branch again. `fork`, `--golden`, and
 `--forkable` remain compatibility aliases; `checkpoint` is reserved for a
