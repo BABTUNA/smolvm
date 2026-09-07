@@ -4051,11 +4051,11 @@ pub struct ForkCmd {
     #[arg(long)]
     pub share_weights: bool,
 
-    /// Per-branch parameter (repeatable, KEY=VALUE). Delivered to the child as
-    /// `/etc/smolvm/branch-env` (dotenv format) for the already-running workload
-    /// to read, and merged into the child's env for later `machine exec`
-    /// sessions. This is how sweep/rollout children learn which variant they
-    /// are — no shared-mount claim files needed.
+    /// Per-branch parameter (repeatable, KEY=VALUE). Reaches the child through
+    /// `smolvm-branch-ready`: the program it runs (`-- prog`) gets it in its
+    /// environment, a shell gets it from `eval "$(smolvm-branch-ready)"`, and
+    /// later `machine exec` sessions see it too. This is how sweep/rollout
+    /// children learn which variant they are — no shared-mount claim files needed.
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 

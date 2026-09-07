@@ -18,9 +18,10 @@ use std::os::unix::ffi::OsStrExt as _;
 const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
 use smolvm_protocol::forkpoint::{
     ARMED_PATH, ARMED_PREFIX, ARM_PATH, ARM_PREFIX, BRANCH_ENV_PATH, BRANCH_HELPER_PATH,
-    CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH, GENERATION_PREFIX, HELPER_PATH, LEGACY_RELEASE_TOKEN,
-    READY_PATH, READY_VERSION, RELEASE_PATH, RELEASE_PREFIX, RESTORED_CONTAINER_PATH,
-    RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH, WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
+    CONTAINER_INIT_ARG, CONTAINER_INIT_NAME, CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH,
+    GENERATION_PREFIX, HELPER_PATH, LEGACY_RELEASE_TOKEN, READY_PATH, READY_VERSION, RELEASE_PATH,
+    RELEASE_PREFIX, RESTORED_CONTAINER_PATH, RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH,
+    WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
 };
 
 fn enabled() -> bool {
@@ -144,14 +145,135 @@ fn inject_into_container_if(
     }
 }
 
+/// Reap exited children while parked, when the helper is the container's
+/// PID 1.
+///
+/// A parked source can sit at its branchpoint for a long time; if the
+/// workload `exec`'d the helper, every background job is its child, and a job
+/// that exits would otherwise stay a zombie — then be captured into every
+/// clone. Non-blocking, so it never delays the branch protocol; a no-op when
+/// some other process is PID 1.
+fn reap_children_if_init() {
+    if std::process::id() != 1 {
+        return;
+    }
+    // SAFETY: WNOHANG waitpid on any child only collects already-exited
+    // children; it blocks nothing and touches no memory of ours.
+    while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
+}
+
 /// Mark the workload ready and block until this VM is a released clone.
+///
+/// Returns 0 once released so the workload can continue — unless the helper
+/// is the container's PID 1 (the workload `exec`'d it), in which case it never
+/// returns: it becomes the container's init instead, so the clone keeps the
+/// processes the branch preserved.
 pub fn run_helper() -> i32 {
-    let preload_modules = std::env::args_os().any(|argument| argument == "--cuda-preload-modules");
+    let (preload_modules, command) = parse_helper_args(std::env::args_os().skip(1));
     if let Err(error) = run_helper_inner(preload_modules) {
         eprintln!("smolvm-branch-ready: {error}");
         return 1;
     }
+    // Released. The helper is the one mechanism in both directions: the
+    // workload declared the branchpoint by running it, and it hands the
+    // child's identity back the same way — as this command's result.
+    let identity = load_identity(Path::new(FORK_ENV_PATH));
+    if let Some(command) = command {
+        // `smolvm-branch-ready -- prog args…`: become the child's program, with
+        // its identity in the environment. If the helper was `exec`'d as PID 1,
+        // the program takes over PID 1 and every background job started before
+        // the branchpoint stays its child.
+        use std::os::unix::process::CommandExt;
+        let error = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .envs(identity.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .exec();
+        eprintln!(
+            "smolvm-branch-ready: exec {}: {error}",
+            command[0].to_string_lossy()
+        );
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            127
+        } else {
+            126
+        };
+    }
+    if std::process::id() == 1 {
+        // The workload `exec`'d the helper with nothing to run after the
+        // branchpoint, so it is now the container's PID 1. Returning would end
+        // PID 1 and the runtime would tear the container down with the very
+        // processes the branch preserved. Become the container's init instead
+        // — the same reaper every workload container runs — by `exec`ing into
+        // it: exec keeps this PID and its children but replaces the process
+        // image, so the init starts single-threaded whatever this helper had
+        // running, which its per-thread signal mask depends on.
+        // This helper is the agent binary invoked by name, and the same binary
+        // in `container-init` mode is the reaper; `/proc/self/exe` is always
+        // it, whatever is or is not mounted into this container.
+        use std::os::unix::process::CommandExt;
+        let error = std::process::Command::new("/proc/self/exe")
+            .arg0(CONTAINER_INIT_NAME)
+            .arg(CONTAINER_INIT_ARG)
+            .exec();
+        // Only reachable if exec itself failed; fall back to the in-process
+        // reaper rather than end PID 1.
+        eprintln!("smolvm-branch-ready: exec container-init: {error}; reaping in-process");
+        return crate::process::run_container_init();
+    }
+    // Inline use from a shell: `eval "$(smolvm-branch-ready)"` exports the
+    // identity into the calling script. Same rendering the host installs, so
+    // every value is quoted correctly.
+    print!("{}", render_identity_exports(&identity));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     0
+}
+
+/// Split the helper's arguments: the optional `--cuda-preload-modules` flag,
+/// and everything after `--` as the program to exec once released.
+fn parse_helper_args<I: Iterator<Item = std::ffi::OsString>>(
+    args: I,
+) -> (bool, Option<Vec<std::ffi::OsString>>) {
+    let mut preload = false;
+    let mut command: Option<Vec<std::ffi::OsString>> = None;
+    for argument in args {
+        if let Some(rest) = &mut command {
+            rest.push(argument);
+        } else if argument == "--" {
+            command = Some(Vec::new());
+        } else if argument == "--cuda-preload-modules" {
+            preload = true;
+        }
+    }
+    let command = command.filter(|c| !c.is_empty());
+    (preload, command)
+}
+
+/// The child's identity as installed by the host, read from the dotenv form
+/// (`KEY=VALUE`, one per line, values never contain newlines). Absent for a
+/// source or a single branch, which carry no per-child parameters.
+fn load_identity(path: &Path) -> Vec<(String, String)> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// Render the identity as `export KEY='VALUE'` lines, quoted so a shell can
+/// `eval` them for any value the host admits.
+fn render_identity_exports(identity: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (k, v) in identity {
+        out.push_str("export ");
+        out.push_str(k);
+        out.push_str("='");
+        out.push_str(&v.replace('\'', "'\\''"));
+        out.push_str("'\n");
+    }
+    out
 }
 
 fn run_helper_inner(preload_modules: bool) -> Result<(), String> {
@@ -211,7 +333,10 @@ impl StateChangeWaiter {
             revents: 0,
         };
         loop {
-            let ready = unsafe { libc::poll(&mut descriptor, 1, -1) };
+            // Bounded so a parked PID-1 helper wakes at least once a second to
+            // reap; a timeout is reported as a wake and the caller re-checks
+            // its markers, which is cheap and changes nothing else.
+            let ready = unsafe { libc::poll(&mut descriptor, 1, 1000) };
             if ready > 0 {
                 let mut events = [0_u8; 1024];
                 let _ = unsafe {
@@ -224,7 +349,7 @@ impl StateChangeWaiter {
                 return true;
             }
             if ready == 0 {
-                continue;
+                return true;
             }
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -281,7 +406,7 @@ fn run_helper_at(
             ready_path.display()
         )
     })?;
-    println!("smolvm branch point ready; waiting for child release");
+    eprintln!("smolvm branch point ready; waiting for child release");
     let _ = std::io::stdout().flush();
 
     #[cfg(target_os = "linux")]
@@ -298,6 +423,10 @@ fn run_helper_at(
     // arm marker parks it again instead of consuming one host core forever.
     if use_arming {
         while !restored_path.is_file() {
+            // Every wake reaps first — including the wake for the arm marker,
+            // so a job that exited while parked is collected before capture and
+            // never baked into a clone as a zombie.
+            reap_children_if_init();
             if release_matches(release_path, &generation) {
                 acknowledge_generation(ready_path, &generation);
                 return Ok(());
@@ -326,6 +455,7 @@ fn run_helper_at(
         }
     } else {
         while !restored_path.is_file() {
+            reap_children_if_init();
             if release_matches(release_path, &generation) {
                 acknowledge_generation(ready_path, &generation);
                 return Ok(());
@@ -339,6 +469,7 @@ fn run_helper_at(
             acknowledge_generation(ready_path, &generation);
             return Ok(());
         }
+        reap_children_if_init();
         std::thread::sleep(poll_interval);
     }
 }
@@ -361,14 +492,27 @@ pub fn run_worker_ready_helper() -> i32 {
     0
 }
 
+/// The value of `key` on a fork/branch env line, in either form the host
+/// writes: dotenv `KEY=VALUE` (the `fork-env` file) or the sourceable
+/// `export KEY='VALUE'` (the `branch-env` file, single-quoted with `'\''`
+/// escapes so a shell can `.`-source it).
+fn env_line_value(line: &str, key: &str) -> Option<String> {
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let rest = line.strip_prefix(key)?.strip_prefix('=')?;
+    let value = match rest.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        Some(quoted) => quoted.replace("'\\''", "'"),
+        None => rest.to_string(),
+    };
+    Some(value)
+}
+
 fn worker_ready_token(env_path: &Path) -> Result<String, String> {
     let contents = std::fs::read_to_string(env_path)
         .map_err(|error| format!("read {}: {error}", env_path.display()))?;
-    let prefix = format!("{WORKER_READY_TOKEN_ENV}=");
     let mut matches = contents
         .lines()
-        .filter_map(|line| line.strip_prefix(&prefix));
-    let token = matches
+        .filter_map(|line| env_line_value(line, WORKER_READY_TOKEN_ENV));
+    let token: String = matches
         .next()
         .ok_or_else(|| format!("{WORKER_READY_TOKEN_ENV} is not configured for this lease"))?;
     if matches.next().is_some() {
@@ -759,6 +903,73 @@ mod tests {
         helper.join().unwrap().unwrap();
         assert!(!ready.exists());
         assert!(!armed.exists());
+    }
+
+    /// Both files the host writes must yield the same value: the dotenv
+    /// `fork-env` and the sourceable `branch-env`, quotes and escapes included.
+    #[test]
+    fn env_line_value_reads_dotenv_and_sourceable_forms() {
+        assert_eq!(env_line_value("K=abc", "K").as_deref(), Some("abc"));
+        assert_eq!(
+            env_line_value("export K='abc'", "K").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            env_line_value("export K='a=b c'", "K").as_deref(),
+            Some("a=b c")
+        );
+        assert_eq!(
+            env_line_value("export Q='it'\\''s'", "Q").as_deref(),
+            Some("it's")
+        );
+        assert_eq!(env_line_value("KX=abc", "K"), None);
+        assert_eq!(env_line_value("export OTHER='1'", "K"), None);
+    }
+
+    /// `--` starts the program to exec on release; flags before it are the
+    /// helper's own; a bare `--` means no program.
+    #[test]
+    fn helper_args_split_flags_from_the_program() {
+        let os = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(parse_helper_args(os(&[]).into_iter()), (false, None));
+        assert_eq!(
+            parse_helper_args(os(&["--cuda-preload-modules"]).into_iter()),
+            (true, None)
+        );
+        assert_eq!(
+            parse_helper_args(os(&["--", "python3", "run.py", "--flag"]).into_iter()),
+            (false, Some(os(&["python3", "run.py", "--flag"])))
+        );
+        // a flag after `--` belongs to the program, not to us
+        assert_eq!(
+            parse_helper_args(os(&["--", "prog", "--cuda-preload-modules"]).into_iter()),
+            (false, Some(os(&["prog", "--cuda-preload-modules"])))
+        );
+        assert_eq!(parse_helper_args(os(&["--"]).into_iter()), (false, None));
+    }
+
+    /// Identity round-trips from the host's dotenv file to `export` lines a
+    /// shell can eval, quoting intact; a missing file is simply no identity.
+    #[test]
+    fn identity_loads_from_dotenv_and_renders_for_eval() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = temp.path().join("fork-env");
+        std::fs::write(&env, "SMOLVM_BRANCH_NAME=agent-3\nNOTE=a=b c\nQ=it's\n").unwrap();
+        let identity = load_identity(&env);
+        assert_eq!(
+            identity,
+            vec![
+                ("SMOLVM_BRANCH_NAME".to_string(), "agent-3".to_string()),
+                ("NOTE".to_string(), "a=b c".to_string()),
+                ("Q".to_string(), "it's".to_string()),
+            ]
+        );
+        assert_eq!(
+            render_identity_exports(&identity),
+            "export SMOLVM_BRANCH_NAME='agent-3'\nexport NOTE='a=b c'\nexport Q='it'\\''s'\n"
+        );
+        assert!(load_identity(&temp.path().join("absent")).is_empty());
+        assert_eq!(render_identity_exports(&[]), "");
     }
 
     #[test]

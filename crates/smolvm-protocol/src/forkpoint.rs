@@ -57,10 +57,13 @@ pub const RELEASE_PREFIX: &str = "smolvm-forkpoint-release-v2:";
 /// Marker written after a released worker finishes clone-local preparation.
 pub const WORKER_READY_PATH: &str = "/run/smolvm/forkpoint/worker-ready";
 
-/// Per-clone environment installed by the host before workload release.
+/// Per-clone environment installed by the host before workload release, as
+/// plain dotenv (`KEY=VALUE` per line) for machine readers.
 pub const FORK_ENV_PATH: &str = "/etc/smolvm/fork-env";
 
-/// Preferred branch-lifecycle alias for [`FORK_ENV_PATH`].
+/// The same parameters as a shell-sourceable file (`export KEY='VALUE'`,
+/// single-quoted). A workload that continues past `smolvm-branch-ready` runs
+/// `. /etc/smolvm/branch-env` to take its identity into its environment.
 pub const BRANCH_ENV_PATH: &str = "/etc/smolvm/branch-env";
 
 /// Host-generated readiness token delivered through [`FORK_ENV_PATH`].
@@ -71,6 +74,16 @@ pub const HELPER_PATH: &str = "/usr/local/bin/smolvm-fork-ready";
 
 /// Preferred branch-lifecycle alias for [`HELPER_PATH`].
 pub const BRANCH_HELPER_PATH: &str = "/usr/local/bin/smolvm-branch-ready";
+
+/// Argument that puts the agent binary into container-init mode: the reaper
+/// every workload container runs as PID 1. A branch helper that finds itself
+/// as PID 1 `exec`s its own binary with this argument on release, so it
+/// becomes that init by construction — a fresh, single-threaded image — rather
+/// than calling the reaper in-process and relying on no thread having been
+/// spawned.
+pub const CONTAINER_INIT_ARG: &str = "container-init";
+/// `argv[0]` the helper gives that init, so it reads clearly in `ps`.
+pub const CONTAINER_INIT_NAME: &str = "smolvm-container-init";
 
 /// Helper used by a released workload after clone-local preparation finishes.
 pub const WORKER_READY_HELPER_PATH: &str = "/usr/local/bin/smolvm-worker-ready";

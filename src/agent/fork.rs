@@ -2705,7 +2705,11 @@ fn rejuvenate_once(
 /// if the restored container is recycled — the overlay is the only surface
 /// shared by every instance and the running workload alike.
 pub const FORK_ENV_GUEST_PATH: &str = smolvm_protocol::forkpoint::FORK_ENV_PATH;
-/// Preferred branch-lifecycle alias for [`FORK_ENV_GUEST_PATH`].
+/// Guest path of the same per-fork parameters in a form a POSIX shell can
+/// `.`-source: every pair exported and single-quoted (see [`render_branch_env`]).
+/// Not an alias of [`FORK_ENV_GUEST_PATH`]: that file stays plain dotenv for
+/// machine readers; this one is for a workload that continues after
+/// `smolvm-branch-ready` and needs its identity in its own environment.
 pub const BRANCH_ENV_GUEST_PATH: &str = smolvm_protocol::forkpoint::BRANCH_ENV_PATH;
 
 /// Validate per-fork parameters: keys must be non-empty `[A-Za-z_][A-Za-z0-9_]*`
@@ -2743,6 +2747,46 @@ pub fn render_fork_env(env: &[(String, String)]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Render per-fork parameters as a file a POSIX shell can `.`-source directly.
+///
+/// The dotenv form is not safely sourceable: a bare `KEY=VALUE` line neither
+/// exports the variable (so an `exec`'d workload never sees it) nor survives a
+/// value with spaces (`NOTE=a=b c` runs `c` as a command). This form exports
+/// every pair and single-quotes every value, escaping embedded quotes, so
+/// `. /etc/smolvm/branch-env` is correct for any value the validator admits.
+pub fn render_branch_env(env: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (k, v) in env {
+        out.push_str("export ");
+        out.push_str(k);
+        out.push_str("='");
+        out.push_str(&v.replace('\'', "'\\''"));
+        out.push_str("'\n");
+    }
+    out
+}
+
+/// Shell fragment that writes the sourceable branch env to `path`.
+///
+/// Delivered inside the same install script as the dotenv file. A quoted
+/// heredoc performs no expansion, and no rendered line can equal the
+/// delimiter (every line starts with `export`), so the embedded content is
+/// injection-safe for any value the validator admits.
+///
+/// The `&& mv` sits on the heredoc's own command line: the body follows that
+/// line, so this keeps the caller's `&&` chain intact — `write_fork_env` has
+/// no `set -e`, and that chain is its only error handling. A rename into
+/// place makes the swap atomic for any reader. The fragment ends with the
+/// delimiter on a line of its own, newline-terminated: a heredoc terminator
+/// must be the whole line, so a caller continues on the next line and must
+/// not append `;` or `&&` to the fragment.
+fn branch_env_install_fragment(path: &str, env: &[(String, String)]) -> String {
+    format!(
+        "cat > '{path}.tmp' <<'SMOLVM_BRANCH_ENV_EOF' && mv '{path}.tmp' '{path}'\n{content}SMOLVM_BRANCH_ENV_EOF\n",
+        content = render_branch_env(env)
+    )
 }
 
 /// Merge assignment-time parameters into a held slot's initial fork
@@ -2812,13 +2856,14 @@ pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) 
             "if [ ! -d {merged} ]; then echo \"missing {merged}; overlays:\" >&2; \
              ls /storage/overlays >&2; exit 41; fi; \
              mkdir -p {merged}/etc/smolvm && umask 077 && \
-             cat > {merged}{FORK_ENV_GUEST_PATH} && \
-             ln -sfn fork-env {merged}{BRANCH_ENV_GUEST_PATH}"
+             cat > {merged}{FORK_ENV_GUEST_PATH} && {branch_env}",
+            branch_env =
+                branch_env_install_fragment(&format!("{merged}{BRANCH_ENV_GUEST_PATH}"), env)
         )
     } else {
         format!(
-            "mkdir -p /etc/smolvm && umask 077 && cat > {FORK_ENV_GUEST_PATH} && \
-             ln -sfn fork-env {BRANCH_ENV_GUEST_PATH}"
+            "mkdir -p /etc/smolvm && umask 077 && cat > {FORK_ENV_GUEST_PATH} && {branch_env}",
+            branch_env = branch_env_install_fragment(BRANCH_ENV_GUEST_PATH, env)
         )
     };
     let sock = vm_data_dir(clone).join("agent.sock");
@@ -2907,6 +2952,7 @@ pub fn activate_held_fork(
         },
         &ensure_env_parent,
         &activation_token,
+        &merged,
     );
     let socket = vm_data_dir(clone).join("agent.sock");
     for attempt in 1..=2 {
@@ -3090,6 +3136,7 @@ fn build_activation_script(
     paths: ActivationScriptPaths<'_>,
     ensure_env_parent: &str,
     activation_token: &str,
+    env: &[(String, String)],
 ) -> String {
     let ActivationScriptPaths {
         ready,
@@ -3120,11 +3167,11 @@ fn build_activation_script(
          release_tmp='{release}.{activation_token}.'$$; \
          trap 'rm -f \"$env_tmp\" \"$release_tmp\"' EXIT; \
          cat > \"$env_tmp\"; mv \"$env_tmp\" '{env_path}'; \
-         ln -sfn fork-env '{branch_env_path}'; \
-         if [ \"${{#generation}}\" -eq 32 ]; then \
+         {branch_env_install}if [ \"${{#generation}}\" -eq 32 ]; then \
            printf '%s%s\\n' '{release_prefix}' \"$generation\" > \"$release_tmp\"; \
          else printf '%s\\n' '{legacy_release}' > \"$release_tmp\"; fi; \
          mv \"$release_tmp\" '{release}'",
+        branch_env_install = branch_env_install_fragment(branch_env_path, env),
         generation_prefix = smolvm_protocol::forkpoint::GENERATION_PREFIX,
         legacy_release = smolvm_protocol::forkpoint::LEGACY_RELEASE_TOKEN,
         release_prefix = smolvm_protocol::forkpoint::RELEASE_PREFIX,
@@ -3824,6 +3871,50 @@ mod tests {
         assert_eq!(render_fork_env(&[]), "");
     }
 
+    /// The sourceable form must survive the values the dotenv form cannot:
+    /// spaces, `=`, and single quotes — and export everything, so an `exec`'d
+    /// workload sees it after a plain `. /etc/smolvm/branch-env`.
+    #[test]
+    fn branch_env_is_exported_and_quoted_for_any_admissible_value() {
+        let env = vec![
+            ("SMOLVM_BRANCH_NAME".to_string(), "agent-3".to_string()),
+            ("NOTE".to_string(), "a=b c".to_string()),
+            ("Q".to_string(), "it's".to_string()),
+        ];
+        assert_eq!(
+            render_branch_env(&env),
+            "export SMOLVM_BRANCH_NAME='agent-3'\nexport NOTE='a=b c'\nexport Q='it'\\''s'\n"
+        );
+        assert_eq!(render_branch_env(&[]), "");
+        // The install fragment embeds it in a quoted heredoc and moves it into place atomically.
+        let frag = branch_env_install_fragment("/etc/smolvm/branch-env", &env);
+        // `&& mv` on the heredoc line, body after it, delimiter last: the
+        // rename is conditional on the write, and a caller's `&&` chain holds.
+        assert!(frag.starts_with(
+            "cat > '/etc/smolvm/branch-env.tmp' <<'SMOLVM_BRANCH_ENV_EOF' && mv '/etc/smolvm/branch-env.tmp' '/etc/smolvm/branch-env'\n"
+        ));
+        assert!(frag.contains("export NOTE='a=b c'\n"));
+        assert!(frag.ends_with("SMOLVM_BRANCH_ENV_EOF\n"));
+        // And it really runs: a failed write must not leave the target behind.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("branch-env");
+        let ok = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &branch_env_install_fragment(target.to_str().unwrap(), &env),
+            ])
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            render_branch_env(&env)
+        );
+        assert!(
+            !target.with_extension("tmp").exists() && !dir.path().join("branch-env.tmp").exists()
+        );
+    }
+
     #[test]
     fn assignment_env_overrides_only_matching_pool_values() {
         let initial = vec![
@@ -3904,6 +3995,7 @@ mod tests {
             },
             &ensure_parent,
             token,
+            &[("LR".to_string(), "1e-4".to_string())],
         );
 
         let first = run_activation_script(&script, "LR=1e-4\n");
@@ -3915,7 +4007,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=1e-4\n");
         assert_eq!(
             std::fs::read_to_string(&branch_env_path).unwrap(),
-            "LR=1e-4\n"
+            "export LR='1e-4'\n"
         );
         #[cfg(unix)]
         {
@@ -3955,6 +4047,7 @@ mod tests {
             },
             &ensure_parent,
             "fedcba9876543210",
+            &[],
         );
         assert_eq!(
             run_activation_script(&other, "LR=other\n").status.code(),
@@ -3990,6 +4083,7 @@ mod tests {
             },
             &ensure_parent,
             token,
+            &[("LR".to_string(), "3e-4".to_string())],
         );
 
         let retry = run_activation_script(&script, "LR=3e-4\n");
@@ -3999,9 +4093,11 @@ mod tests {
             String::from_utf8_lossy(&retry.stderr)
         );
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=3e-4\n");
+        // branch-env is no longer an alias of the dotenv file: it is the same
+        // parameters in a form a shell can `.`-source, exported and quoted.
         assert_eq!(
             std::fs::read_to_string(&branch_env_path).unwrap(),
-            "LR=3e-4\n"
+            "export LR='3e-4'\n"
         );
         assert!(release.is_file());
     }
