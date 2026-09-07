@@ -292,7 +292,7 @@ impl ExportVm {
         let data_dir = vm_data_dir(&scratch_name);
 
         println!("Starting agent VM to export machine state...");
-        let manager = AgentManager::for_vm(&scratch_name)?;
+        let manager = AgentManager::for_vm_with_sizes(&scratch_name, None, None)?;
         let features = LaunchFeatures {
             extra_disks: vec![(storage_disk, false, storage_fmt)],
             packed_layers_dir,
@@ -848,7 +848,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
     );
     let data_dir = vm_data_dir(&scratch_name);
     println!("Flattening qcow2 overlay to raw...");
-    let manager = AgentManager::for_vm(&scratch_name)?;
+    let manager = AgentManager::for_vm_with_sizes(&scratch_name, None, None)?;
     let features = LaunchFeatures {
         extra_disks: vec![
             (qcow2_path.to_path_buf(), true, DiskFormat::Qcow2),

@@ -44,37 +44,72 @@ const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Timeout when waiting for agent to stop.
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How a manager opens a machine's disks.
+///
+/// Every command that merely reconnects, inspects, or stops a machine opens
+/// it to observe: nothing on disk may change. Only a launch may create a
+/// disk that does not exist yet, at the size the machine was created with,
+/// or grow one to an explicitly requested size. The distinction is the
+/// whole reason `machine status` on a never-started machine must not leave a
+/// default-sized disk behind that a later start then keeps.
+#[derive(Debug, Clone, Copy)]
+enum DiskAccess {
+    Observe,
+    Launch {
+        storage_gib: Option<u64>,
+        overlay_gib: Option<u64>,
+    },
+}
+
 fn open_storage_disk_for_manager(
     path: &Path,
     format: DiskFormat,
-    requested_gib: Option<u64>,
+    access: DiskAccess,
 ) -> Result<StorageDisk> {
-    match format {
-        DiskFormat::Qcow2 => StorageDisk::open_existing_with_format(path, format),
-        DiskFormat::Raw if requested_gib.is_none() && path.exists() => {
+    match (format, access) {
+        (DiskFormat::Qcow2, _) => StorageDisk::open_existing_with_format(path, format),
+        (DiskFormat::Raw, DiskAccess::Observe) if path.exists() => {
             StorageDisk::open_existing_with_format(path, format)
         }
-        DiskFormat::Raw => StorageDisk::open_or_overlay_at(
-            path,
-            requested_gib.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB),
-        ),
+        (DiskFormat::Raw, DiskAccess::Observe) => Ok(StorageDisk::absent_at(path)),
+        (
+            DiskFormat::Raw,
+            DiskAccess::Launch {
+                storage_gib: None, ..
+            },
+        ) if path.exists() => StorageDisk::open_existing_with_format(path, format),
+        (DiskFormat::Raw, DiskAccess::Launch { storage_gib, .. }) => {
+            StorageDisk::open_or_overlay_at(
+                path,
+                storage_gib.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB),
+            )
+        }
     }
 }
 
 fn open_overlay_disk_for_manager(
     path: &Path,
     format: DiskFormat,
-    requested_gib: Option<u64>,
+    access: DiskAccess,
 ) -> Result<OverlayDisk> {
-    match format {
-        DiskFormat::Qcow2 => OverlayDisk::open_existing_with_format(path, format),
-        DiskFormat::Raw if requested_gib.is_none() && path.exists() => {
+    match (format, access) {
+        (DiskFormat::Qcow2, _) => OverlayDisk::open_existing_with_format(path, format),
+        (DiskFormat::Raw, DiskAccess::Observe) if path.exists() => {
             OverlayDisk::open_existing_with_format(path, format)
         }
-        DiskFormat::Raw => OverlayDisk::open_or_overlay_at(
-            path,
-            requested_gib.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB),
-        ),
+        (DiskFormat::Raw, DiskAccess::Observe) => Ok(OverlayDisk::absent_at(path)),
+        (
+            DiskFormat::Raw,
+            DiskAccess::Launch {
+                overlay_gib: None, ..
+            },
+        ) if path.exists() => OverlayDisk::open_existing_with_format(path, format),
+        (DiskFormat::Raw, DiskAccess::Launch { overlay_gib, .. }) => {
+            OverlayDisk::open_or_overlay_at(
+                path,
+                overlay_gib.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB),
+            )
+        }
     }
 }
 
@@ -693,6 +728,19 @@ pub fn ensure_vm_dir(name: &str) -> std::io::Result<PathBuf> {
     ensure_vm_dir_at(&vm_data_dir(name), name)
 }
 
+/// The VM data directory for observation: verifies the `name → hash` binding
+/// when the directory exists, and otherwise just returns the path without
+/// creating anything. `machine status` on a name that was never created must
+/// not leave a directory behind.
+pub fn observe_vm_dir(name: &str) -> std::io::Result<PathBuf> {
+    let dir = vm_data_dir(name);
+    if dir.is_dir() {
+        ensure_vm_dir_at(&dir, name)
+    } else {
+        Ok(dir)
+    }
+}
+
 /// Lower-level form of [`ensure_vm_dir`] that operates on an explicit
 /// directory path. Factored out for testability — callers in production
 /// should use [`ensure_vm_dir`].
@@ -890,45 +938,55 @@ impl AgentManager {
         Self::for_vm("default")
     }
 
-    /// Get an agent manager for a named VM.
-    ///
-    /// Each named VM gets its own isolated storage and socket.
-    /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 10 GiB).
+    /// Open a named VM for launch: creates its data directory and any disk
+    /// that does not exist yet, at `storage_gb` / `overlay_gb` or the defaults
+    /// (20 GiB / 10 GiB), and grows an existing raw disk to an explicit size.
     pub fn for_vm_with_sizes(
         name: impl Into<String>,
         storage_gb: Option<u64>,
         overlay_gb: Option<u64>,
     ) -> Result<Self> {
+        Self::open(
+            name,
+            DiskAccess::Launch {
+                storage_gib: storage_gb,
+                overlay_gib: overlay_gb,
+            },
+        )
+    }
+
+    fn open(name: impl Into<String>, access: DiskAccess) -> Result<Self> {
         let name = name.into();
         let rootfs_path = Self::default_rootfs_path()?;
-        // Named VMs get their own storage disk. `ensure_vm_dir` commits the
-        // name→hash binding on first call and detects collisions on
-        // subsequent calls (refusing to open a hash dir that belongs to a
-        // different name).
-        let storage_dir = ensure_vm_dir(&name)?;
+        // Named VMs get their own storage disk. A launch commits the name→hash
+        // binding on first call and detects collisions on subsequent calls
+        // (refusing to open a hash dir that belongs to a different name); an
+        // observation only verifies an existing binding.
+        let storage_dir = match access {
+            DiskAccess::Observe => observe_vm_dir(&name)?,
+            DiskAccess::Launch { .. } => ensure_vm_dir(&name)?,
+        };
 
         // A fork clone has a `.qcow2` copy-on-write overlay in place of the
         // `.raw` disk; detect it by file presence (the on-disk file is the
         // source of truth) and open it as-is rather than creating/formatting.
         let (storage_path, storage_format) =
             resolve_disk_image(&storage_dir, crate::storage::STORAGE_DISK_FILENAME);
-        // Lifecycle helpers (`exec`, `stop`, `status`) reconnect through
-        // `for_vm`, which has no requested size. Reconnects must be strictly
-        // observational; only an explicit size may grow a disk.
-        let storage_disk =
-            open_storage_disk_for_manager(&storage_path, storage_format, storage_gb)?;
+        let storage_disk = open_storage_disk_for_manager(&storage_path, storage_format, access)?;
 
         let (overlay_path, overlay_format) =
             resolve_disk_image(&storage_dir, crate::storage::OVERLAY_DISK_FILENAME);
-        let overlay_disk =
-            open_overlay_disk_for_manager(&overlay_path, overlay_format, overlay_gb)?;
+        let overlay_disk = open_overlay_disk_for_manager(&overlay_path, overlay_format, access)?;
 
         Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
     }
 
-    /// Get an agent manager for a named VM with default sizes.
+    /// Open a named VM to observe or reconnect to it: status, list, stop,
+    /// exec. Creates nothing on disk; a machine that was never started is
+    /// opened with absent disk handles, and launching from such a manager is
+    /// refused. Launch paths use [`Self::for_vm_with_sizes`].
     pub fn for_vm(name: impl Into<String>) -> Result<Self> {
-        Self::for_vm_with_sizes(name, None, None)
+        Self::open(name, DiskAccess::Observe)
     }
 
     /// Get the VM name if this is a named agent.
@@ -1774,6 +1832,21 @@ impl AgentManager {
                 inner.state = AgentState::Stopped;
                 return Err(e);
             }
+        }
+
+        // A manager opened to observe a never-started machine has no disks to
+        // boot from; creating them here would be creating them at a guessed
+        // size. Launches go through a manager opened with the machine's sizes.
+        if !self.storage_disk.exists() || !self.overlay_disk.exists() {
+            let mut inner = self.inner.lock();
+            inner.state = AgentState::Stopped;
+            return Err(Error::agent(
+                "verify disks",
+                format!(
+                    "machine '{}' has no disks yet; they are created by a start with the machine's configured sizes",
+                    self.name.as_deref().unwrap_or("default")
+                ),
+            ));
         }
 
         // Validate rootfs exists
@@ -3323,13 +3396,76 @@ mod tests {
         StorageDisk::open_or_create_at(&storage_path, 1).unwrap();
         OverlayDisk::open_or_create_at(&overlay_path, 1).unwrap();
 
-        let storage = open_storage_disk_for_manager(&storage_path, DiskFormat::Raw, None).unwrap();
-        let overlay = open_overlay_disk_for_manager(&overlay_path, DiskFormat::Raw, None).unwrap();
-
-        assert_eq!(storage.size_gib(), 1);
-        assert_eq!(overlay.size_gib(), 1);
+        for access in [
+            DiskAccess::Observe,
+            DiskAccess::Launch {
+                storage_gib: None,
+                overlay_gib: None,
+            },
+        ] {
+            let storage =
+                open_storage_disk_for_manager(&storage_path, DiskFormat::Raw, access).unwrap();
+            let overlay =
+                open_overlay_disk_for_manager(&overlay_path, DiskFormat::Raw, access).unwrap();
+            assert_eq!(storage.size_gib(), 1);
+            assert_eq!(overlay.size_gib(), 1);
+        }
         assert_eq!(std::fs::metadata(storage_path).unwrap().len(), 1 << 30);
         assert_eq!(std::fs::metadata(overlay_path).unwrap().len(), 1 << 30);
+    }
+
+    /// `machine status` on a machine that was never started used to create a
+    /// default-sized disk that a later start then kept, ignoring the size the
+    /// machine was created with. Observation creates nothing; the launch does,
+    /// at the requested size.
+    #[test]
+    fn observing_a_never_started_machine_creates_no_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage_path = temp.path().join("storage.raw");
+        let overlay_path = temp.path().join("overlay.raw");
+
+        let storage =
+            open_storage_disk_for_manager(&storage_path, DiskFormat::Raw, DiskAccess::Observe)
+                .unwrap();
+        let overlay =
+            open_overlay_disk_for_manager(&overlay_path, DiskFormat::Raw, DiskAccess::Observe)
+                .unwrap();
+        assert!(!storage.exists());
+        assert!(!overlay.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+
+        let storage = open_storage_disk_for_manager(
+            &storage_path,
+            DiskFormat::Raw,
+            DiskAccess::Launch {
+                storage_gib: Some(2),
+                overlay_gib: Some(1),
+            },
+        )
+        .unwrap();
+        assert!(storage.exists());
+        assert_eq!(storage.size_gib(), 2);
+    }
+
+    /// Observing a name that was never created leaves no directory behind;
+    /// observing an existing one still verifies its name binding.
+    #[test]
+    fn observing_a_vm_dir_never_creates_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("deadbeef");
+        // Same logic as `observe_vm_dir`, on an explicit path.
+        assert!(!dir.exists());
+        let resolved = if dir.is_dir() {
+            ensure_vm_dir_at(&dir, "ghost").unwrap()
+        } else {
+            dir.clone()
+        };
+        assert_eq!(resolved, dir);
+        assert!(!dir.exists());
+
+        ensure_vm_dir_at(&dir, "real").unwrap();
+        let err = ensure_vm_dir_at(&dir, "impostor").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     #[test]
