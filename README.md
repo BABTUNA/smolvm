@@ -139,8 +139,9 @@ single `--name` branch never waits. With `--name-prefix` or `--hold`, even a
 count of one is a batch and gets the same boundary, identity, and release.
 
 Add `--branchable` to a child when it must branch again. `fork`, `--golden`, and
-`--forkable` remain compatibility aliases; `checkpoint` is reserved for a
-durable `.smolcheckpoint` artifact that can be restored later or elsewhere.
+`--forkable` remain compatibility aliases. A branch takes a checkpoint of the
+source in memory; `machine checkpoint` saves that same state as a durable
+`.smolcheckpoint` artifact that can be restored later or elsewhere.
 
 ### Snapshot a machine into a reusable image
 
