@@ -321,6 +321,32 @@ pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
     let socket = vm_data_dir(golden).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&socket)
         .map_err(|e| Error::agent("wait for forkpoint", format!("agent connect: {e}")))?;
+    if client
+        .supports_typed_branchpoint()
+        .map_err(|e| Error::agent("wait for forkpoint", e.to_string()))?
+    {
+        return match client
+            .branchpoint_wait(timeout)
+            .map_err(|e| Error::agent("wait for forkpoint", e.to_string()))?
+        {
+            Ok(contents) => {
+                let profile = parse_forkpoint_profile(contents.as_bytes());
+                persist_forkpoint_profile(golden, profile)?;
+                Ok(())
+            }
+            Err(f) => Err(Error::agent(
+                "wait for forkpoint",
+                format!(
+                    "source '{golden}' did not reach a branchpoint within {}s: {f}\n\
+                     A batch branch snapshots the source at a point its workload declares by running \
+                     `smolvm-branch-ready` after setup (see README, \"Branch a running machine\"). \
+                     If the workload never calls it, either add the call, raise --ready-timeout, or \
+                     take single `--name` branches, which snapshot the source wherever it is.",
+                    timeout.as_secs_f64()
+                ),
+            )),
+        };
+    }
     let script = format!(
         "while [ ! -f '{ready}' ]; do sleep 0.05; done; cat '{ready}'",
         ready = smolvm_protocol::forkpoint::READY_PATH,
@@ -392,6 +418,29 @@ fn arm_forkpoint_for_capture(golden: &str) -> Result<bool> {
     {
         return Ok(false);
     }
+    if client
+        .supports_typed_branchpoint()
+        .map_err(|e| Error::agent("arm branchpoint", e.to_string()))?
+    {
+        use smolvm_protocol::forkpoint::typed_error;
+        return match client
+            .branchpoint_arm()
+            .map_err(|e| Error::agent("arm branchpoint", e.to_string()))?
+        {
+            Ok(()) => Ok(true),
+            // No branchpoint declared: a branchable machine without a helper is
+            // a valid immediate snapshot source.
+            Err(f) if f.code.as_deref() == Some(typed_error::NOT_READY) => Ok(false),
+            Err(f) if f.code.as_deref() == Some(typed_error::NO_ACK) => Err(Error::agent(
+                "arm branchpoint",
+                format!("source '{golden}' did not acknowledge the capture arm marker: {f}"),
+            )),
+            Err(f) => Err(Error::agent(
+                "arm branchpoint",
+                format!("source '{golden}': {f}"),
+            )),
+        };
+    }
     match client.vm_exec(
         vec!["/bin/sh".into(), "-c".into(), build_arm_forkpoint_script()],
         vec![],
@@ -437,6 +486,21 @@ fn park_forkpoint_after_capture(golden: &str) -> Result<()> {
     let socket = vm_data_dir(golden).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&socket)
         .map_err(|e| Error::agent("park branchpoint", format!("agent connect: {e}")))?;
+    if client
+        .supports_typed_branchpoint()
+        .map_err(|e| Error::agent("park branchpoint", e.to_string()))?
+    {
+        return match client
+            .branchpoint_park()
+            .map_err(|e| Error::agent("park branchpoint", e.to_string()))?
+        {
+            Ok(()) => Ok(()),
+            Err(f) => Err(Error::agent(
+                "park branchpoint",
+                format!("source '{golden}': {f}"),
+            )),
+        };
+    }
     match client.vm_exec(
         vec!["/bin/sh".into(), "-c".into(), build_park_forkpoint_script()],
         vec![],
@@ -1451,6 +1515,21 @@ pub fn release_forkpoint(clone: &str) -> Result<()> {
     let socket = vm_data_dir(clone).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&socket)
         .map_err(|e| Error::agent("release forkpoint", format!("agent connect: {e}")))?;
+    if client
+        .supports_typed_branchpoint()
+        .map_err(|e| Error::agent("release forkpoint", e.to_string()))?
+    {
+        return match client
+            .branchpoint_release()
+            .map_err(|e| Error::agent("release forkpoint", e.to_string()))?
+        {
+            Ok(()) => Ok(()),
+            Err(f) => Err(Error::agent(
+                "release forkpoint",
+                format!("clone '{clone}': {f}"),
+            )),
+        };
+    }
     let script = build_release_forkpoint_script();
     match client.vm_exec(
         vec!["/bin/sh".into(), "-c".into(), script],
@@ -2954,6 +3033,15 @@ pub fn activate_held_fork(
         &activation_token,
         &merged,
     );
+    let (require_dir, env_dir) = if record.image.is_some() {
+        (
+            Some(merged_root.clone()),
+            format!("{merged_root}/etc/smolvm"),
+        )
+    } else {
+        (None, "/etc/smolvm".to_string())
+    };
+    let sourceable = render_branch_env(&merged);
     let socket = vm_data_dir(clone).join("agent.sock");
     for attempt in 1..=2 {
         let mut client = match AgentClient::connect_with_retry(&socket) {
@@ -2974,6 +3062,67 @@ pub fn activate_held_fork(
                 ));
             }
         };
+        if client
+            .supports_typed_branchpoint()
+            .map_err(|e| Error::agent("activate held fork", e.to_string()))?
+        {
+            use smolvm_protocol::forkpoint::typed_error;
+            match client.branchpoint_activate(crate::agent::client::BranchpointActivation {
+                env_dotenv: content.clone(),
+                env_sourceable: sourceable.clone(),
+                env_path: env_path.clone(),
+                branch_env_path: branch_env_path.clone(),
+                require_dir: require_dir.clone(),
+                env_dir: env_dir.clone(),
+                activation_token: activation_token.clone(),
+            }) {
+                // A repeat with the same token after an ambiguous reply is the
+                // partial commit completing, not a second activation.
+                Ok(Ok(_already_done)) => return Ok(merged),
+                Ok(Err(f)) if f.code.as_deref() == Some(typed_error::TOKEN_MISMATCH) => {
+                    return Err(Error::agent(
+                        "activate held fork",
+                        format!("clone '{clone}' was already released"),
+                    ));
+                }
+                Ok(Err(f)) if f.code.as_deref() == Some(typed_error::NOT_READY) => {
+                    return Err(Error::agent(
+                        "activate held fork",
+                        format!("clone '{clone}' is not parked at a forkpoint"),
+                    ));
+                }
+                Ok(Err(f)) if attempt == 1 => {
+                    tracing::warn!(
+                        clone,
+                        error = %f,
+                        "held-fork activation attempt failed; retrying idempotently"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                Ok(Err(f)) => {
+                    return Err(Error::agent(
+                        "activate held fork",
+                        format!("clone '{clone}': {f}"),
+                    ));
+                }
+                Err(error) if attempt == 1 => {
+                    tracing::warn!(
+                        clone,
+                        %error,
+                        "held-fork activation reply was ambiguous; retrying idempotently"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(Error::agent(
+                        "activate held fork",
+                        format!("clone '{clone}': {error}"),
+                    ));
+                }
+            }
+        }
         match client.vm_exec(
             vec!["/bin/sh".into(), "-c".into(), script.clone()],
             vec![],
@@ -3085,6 +3234,37 @@ pub fn wait_for_worker_ready(clone: &str, token: &str, timeout: Duration) -> Res
     // Keep this transport deadline within the controller's reserved activation
     // grace while allowing the script to report its specific timeout code.
     let command_timeout = worker_ready_command_timeout(timeout)?;
+    if client
+        .supports_typed_branchpoint()
+        .map_err(|error| Error::agent("wait for worker readiness", error.to_string()))?
+    {
+        use smolvm_protocol::forkpoint::typed_error;
+        return match client
+            .branchpoint_wait_worker_ready(&token.to_ascii_lowercase(), timeout)
+            .map_err(|error| {
+                Error::agent(
+                    "wait for worker readiness",
+                    format!("clone '{clone}': {error}"),
+                )
+            })? {
+            Ok(()) => Ok(()),
+            Err(f) if f.code.as_deref() == Some(typed_error::NO_ACK) => Err(Error::agent(
+                "wait for worker readiness",
+                format!(
+                    "clone '{clone}' did not signal readiness within {} seconds",
+                    timeout.as_secs()
+                ),
+            )),
+            Err(f) if f.code.as_deref() == Some(typed_error::TOKEN_MISMATCH) => Err(Error::agent(
+                "wait for worker readiness",
+                format!("clone '{clone}' published a stale or invalid readiness token"),
+            )),
+            Err(f) => Err(Error::agent(
+                "wait for worker readiness",
+                format!("clone '{clone}': {f}"),
+            )),
+        };
+    }
     match client.vm_exec(command, vec![], None, Some(command_timeout), None) {
         Ok((0, _, _)) => Ok(()),
         Ok((44, _, _)) => Err(Error::agent(

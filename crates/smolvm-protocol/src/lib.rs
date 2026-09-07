@@ -374,6 +374,48 @@ pub enum AgentRequest {
         output: String,
     },
 
+    /// Wait until the workload has declared a branchpoint, returning the ready
+    /// marker's contents (its profile lines) in `data.contents`.
+    BranchpointWait {
+        /// Give up after this many milliseconds.
+        timeout_ms: u64,
+    },
+    /// Put a negotiated helper into its restore-safe loop before capture.
+    BranchpointArm,
+    /// Return a parked source to its ordinary wait after capture.
+    BranchpointPark,
+    /// Release a restored clone: write the release marker for the generation
+    /// recorded in its ready marker and wait for the helper to acknowledge.
+    BranchpointRelease,
+    /// Assign and release a held clone in one idempotent step: claim it with
+    /// `activation_token` (a retry with the same token completes a partial
+    /// commit; a different token is refused), install the per-clone
+    /// parameters, then write the release marker.
+    BranchpointActivate {
+        /// Per-clone parameters, dotenv form, written to `env_path`.
+        env_dotenv: String,
+        /// The same parameters in shell-sourceable form, written to `branch_env_path`.
+        env_sourceable: String,
+        /// Guest path of the dotenv file (under the clone's overlay for image machines).
+        env_path: String,
+        /// Guest path of the sourceable file.
+        branch_env_path: String,
+        /// Directory that must already exist, typically the clone's merged
+        /// overlay root; activation refuses rather than fabricating it.
+        require_dir: Option<String>,
+        /// Directory to create before writing the env files.
+        env_dir: String,
+        /// Token identifying this activation attempt.
+        activation_token: String,
+    },
+    /// Wait until a released clone's workload publishes its worker-ready token.
+    BranchpointWaitWorkerReady {
+        /// The token the workload must publish; any other is a mismatch.
+        token: String,
+        /// Give up after this many milliseconds.
+        timeout_ms: u64,
+    },
+
     /// Execute a command directly in the VM (not in a container).
     ///
     /// This runs the command in the agent's Alpine rootfs without any
@@ -688,6 +730,12 @@ impl AgentRequest {
                 format!("FlattenLayers {{ count: {} }}", lowerdirs.len())
             }
             AgentRequest::VmExec { .. } => "VmExec".into(),
+            AgentRequest::BranchpointWait { .. } => "BranchpointWait".into(),
+            AgentRequest::BranchpointArm => "BranchpointArm".into(),
+            AgentRequest::BranchpointPark => "BranchpointPark".into(),
+            AgentRequest::BranchpointRelease => "BranchpointRelease".into(),
+            AgentRequest::BranchpointActivate { .. } => "BranchpointActivate".into(),
+            AgentRequest::BranchpointWaitWorkerReady { .. } => "BranchpointWaitWorkerReady".into(),
             AgentRequest::Run { image, .. } => format!("Run {{ image: {image} }}"),
             AgentRequest::Stdin { .. } => "Stdin".into(),
             AgentRequest::Resize { .. } => "Resize".into(),

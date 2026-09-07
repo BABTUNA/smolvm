@@ -22,6 +22,29 @@ pub const WORKER_READY_CAPABILITY: &str = "fork-worker-ready-v1";
 /// Agent capability for parking an idle branchpoint until the host arms it.
 pub const ARMING_CAPABILITY: &str = "branchpoint-arming-v1";
 
+/// Agent capability: the branchpoint handshake is driven by typed requests
+/// (`AgentRequest::Branchpoint*`) the agent executes natively, instead of shell
+/// scripts the host builds and runs through `VmExec`. Same marker files and
+/// generation rules on the guest, so a helper of either vintage keeps working;
+/// what changes is that the protocol lives in one typed schema rather than in
+/// `sed` patterns mirrored across three languages.
+pub const TYPED_BRANCHPOINT_CAPABILITY: &str = "branchpoint-typed-v1";
+
+/// Error codes the agent returns for typed branchpoint requests, mirroring the
+/// exit statuses the shell scripts used so host-side handling stays uniform.
+pub mod typed_error {
+    /// No `ready` marker: the workload has not declared a branchpoint.
+    pub const NOT_READY: &str = "branchpoint.not_ready";
+    /// The `ready` marker carries no usable generation.
+    pub const BAD_GENERATION: &str = "branchpoint.bad_generation";
+    /// The helper did not acknowledge within the protocol's window.
+    pub const NO_ACK: &str = "branchpoint.no_ack";
+    /// Another activation token already claimed this clone.
+    pub const TOKEN_MISMATCH: &str = "branchpoint.token_mismatch";
+    /// A filesystem step failed; the message names it.
+    pub const IO: &str = "branchpoint.io";
+}
+
 /// Host marker that asks the branchpoint helper to enter its capture-safe loop.
 pub const ARM_PATH: &str = "/run/smolvm/forkpoint/arm";
 
