@@ -906,7 +906,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     }
     if options.wait_ready.is_some() && !options.hold {
         if let Err(error) = smolvm::agent::fork::fail_closed_on_rejuvenation(
-            smolvm::agent::fork::release_forkpoint(clone),
+            smolvm::agent::fork::release_forkpoint(clone, options.fork_env),
             || teardown_fork_clone(&db, clone),
         ) {
             return retain_failed_fork(golden, &snapshot_dir, error);
@@ -931,15 +931,31 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
 /// Fork several indexed clones from one snapshot and boot them with bounded
 /// concurrency. All clone workloads remain at the forkpoint until every clone
 /// has booted, received a fresh identity, and received its per-clone env.
+/// How a batch of children is created from one snapshot.
+pub struct ForkBatchOptions<'a> {
+    pub share_weights: bool,
+    pub fork_secrets: &'a BTreeMap<String, SecretRef>,
+    pub wait_ready: Option<std::time::Duration>,
+    pub parallel: usize,
+    pub hold: bool,
+    /// Wait this long for each released child to run `smolvm-worker-ready`,
+    /// tearing the batch down if one never does.
+    pub worker_ready: Option<std::time::Duration>,
+}
+
 pub fn fork_vm_batch(
     golden: &str,
     clones: &[(String, Vec<(String, String)>)],
-    share_weights: bool,
-    fork_secrets: &BTreeMap<String, SecretRef>,
-    wait_ready: Option<std::time::Duration>,
-    parallel: usize,
-    hold: bool,
+    options: ForkBatchOptions<'_>,
 ) -> smolvm::Result<()> {
+    let ForkBatchOptions {
+        share_weights,
+        fork_secrets,
+        wait_ready,
+        parallel,
+        hold,
+        worker_ready,
+    } = options;
     let db = SmolvmDb::open()?;
     let _source_lock = smolvm::agent::fork::lock_fork_source(golden)?;
 
@@ -1073,9 +1089,37 @@ pub fn fork_vm_batch(
 
     if first_error.is_none() && wait_ready.is_some() && !hold {
         if let Err(error) = run_bounded_clone_jobs(&all_names, width, |name| {
-            smolvm::agent::fork::release_forkpoint(name)
+            let env = clones
+                .iter()
+                .find(|(clone, _)| clone == name)
+                .map(|(_, env)| env.as_slice())
+                .unwrap_or(&[]);
+            smolvm::agent::fork::release_forkpoint(name, env)
         }) {
             first_error = Some(error);
+        }
+    }
+
+    // Fail closed: a batch is only as ready as its slowest child, so one that
+    // never publishes readiness takes the whole batch down rather than leaving
+    // the caller with a set of children it cannot tell apart.
+    if first_error.is_none() && !hold {
+        if let Some(timeout) = worker_ready {
+            if let Err(error) = run_bounded_clone_jobs(&all_names, width, |name| {
+                let token = clones
+                    .iter()
+                    .find(|(clone, _)| clone == name)
+                    .and_then(|(_, env)| smolvm::agent::fork::worker_ready_token_of(env))
+                    .ok_or_else(|| {
+                        smolvm::Error::agent(
+                            "worker readiness",
+                            format!("child '{name}' carries no readiness token"),
+                        )
+                    })?;
+                smolvm::agent::fork::wait_for_worker_ready(name, token, timeout)
+            }) {
+                first_error = Some(error);
+            }
         }
     }
 
@@ -1088,13 +1132,23 @@ pub fn fork_vm_batch(
 
     if hold {
         eprintln!(
-            "Provisioned {} held branch slots from '{golden}' with one snapshot.",
-            all_names.len()
+            "Provisioned {} held branch {} from '{golden}' with one snapshot.",
+            all_names.len(),
+            if all_names.len() == 1 {
+                "slot"
+            } else {
+                "slots"
+            }
         );
     } else {
         eprintln!(
-            "Branched {} children from '{golden}' with one snapshot.",
-            all_names.len()
+            "Branched {} {} from '{golden}' with one snapshot.",
+            all_names.len(),
+            if all_names.len() == 1 {
+                "child"
+            } else {
+                "children"
+            }
         );
     }
     Ok(())
@@ -1103,7 +1157,11 @@ pub fn fork_vm_batch(
 /// Assign and release one held clone. This is intentionally one-way: after the
 /// workload begins, the clone is dirty and must be replaced from its golden
 /// before it can serve another independent job.
-pub fn release_held_fork(clone: &str, assignment: &[(String, String)]) -> smolvm::Result<()> {
+pub fn release_held_fork(
+    clone: &str,
+    assignment: &[(String, String)],
+    worker_ready: Option<std::time::Duration>,
+) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
     let record = db
         .get_vm(clone)?
@@ -1148,6 +1206,23 @@ pub fn release_held_fork(clone: &str, assignment: &[(String, String)]) -> smolvm
         },
     )?;
     debug_assert_eq!(activated, merged);
+    if let Some(timeout) = worker_ready {
+        let token = smolvm::agent::fork::worker_ready_token_of(assignment).ok_or_else(|| {
+            smolvm::Error::agent(
+                "worker readiness",
+                format!("slot '{clone}' carries no readiness token"),
+            )
+        })?;
+        // Fail closed: the slot is consumed either way, so a worker that never
+        // reports ready is torn down instead of left running unverified.
+        if let Err(error) = smolvm::agent::fork::wait_for_worker_ready(clone, token, timeout) {
+            teardown_fork_clone(&db, clone);
+            return Err(smolvm::Error::agent(
+                "release held fork",
+                format!("slot '{clone}' was torn down because {error}"),
+            ));
+        }
+    }
     eprintln!(
         "Released held branch slot '{clone}'. Replace it from '{}' after the workload completes.",
         record.golden.as_deref().unwrap_or("its source")
@@ -1353,7 +1428,7 @@ where
     {
         return Err(smolvm::Error::agent(
             "batch fork",
-            format!("clone '{clone}' release failed: {error}"),
+            format!("clone '{clone}': {error}"),
         ));
     }
     Ok(())
@@ -3197,7 +3272,7 @@ mod init_runner_tests {
         .expect_err("the batch must fail closed");
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(error.to_string().contains("clone 'bad' release failed"));
+        assert!(error.to_string().contains("clone 'bad': "));
     }
 
     #[test]

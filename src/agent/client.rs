@@ -937,6 +937,54 @@ fn with_term_default(mut env: Vec<(String, String)>, tty: bool) -> Vec<(String, 
 }
 
 /// Expect an `Ok` response, ignoring any data.
+/// A typed branchpoint step's protocol outcome: `Err` carries the agent's
+/// error code (one of `smolvm_protocol::forkpoint::typed_error`) so the host
+/// can tell "no branchpoint declared" from "the helper went silent".
+pub type BranchpointOutcome<T> = std::result::Result<T, BranchpointFailure>;
+
+/// Everything a held clone needs to become a working branch: its per-clone
+/// parameters in both file forms, where to put them, and the idempotency token.
+#[derive(Debug, Clone)]
+pub struct BranchpointActivation {
+    pub env_dotenv: String,
+    pub env_sourceable: String,
+    pub env_path: String,
+    pub branch_env_path: String,
+    /// Must already exist (the clone's merged overlay root for image machines).
+    pub require_dir: Option<String>,
+    pub env_dir: String,
+    pub activation_token: String,
+}
+
+/// Why a typed branchpoint step did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchpointFailure {
+    /// The protocol error code, when the agent supplied one.
+    pub code: Option<String>,
+    /// The agent's explanation.
+    pub message: String,
+}
+
+impl std::fmt::Display for BranchpointFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn branchpoint_outcome<T>(
+    resp: AgentResponse,
+    from_data: impl FnOnce(Option<serde_json::Value>) -> T,
+) -> Result<BranchpointOutcome<T>> {
+    match resp {
+        AgentResponse::Ok { data } => Ok(Ok(from_data(data))),
+        AgentResponse::Error { message, code } => Ok(Err(BranchpointFailure { code, message })),
+        other => Err(Error::agent(
+            "branchpoint",
+            format!("unexpected response: {other:?}"),
+        )),
+    }
+}
+
 fn expect_ok(resp: AgentResponse, op: &str) -> Result<()> {
     match resp {
         AgentResponse::Ok { .. } => Ok(()),
@@ -1430,6 +1478,86 @@ impl AgentClient {
     pub fn format_storage(&mut self) -> Result<()> {
         let resp = self.request(&AgentRequest::FormatStorage)?;
         expect_ok(resp, "format storage")
+    }
+
+    /// Whether this agent speaks the branch protocol.
+    pub fn supports_typed_branchpoint(&mut self) -> Result<bool> {
+        self.supports_capability(smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY)
+    }
+
+    /// Wait for the workload's branchpoint; `Ok(Ok(contents))` is the ready
+    /// marker's contents.
+    pub fn branchpoint_wait(&mut self, timeout: Duration) -> Result<BranchpointOutcome<String>> {
+        let _timeout_guard = self.set_exec_timeout(Some(timeout + Duration::from_secs(5)))?;
+        let resp = self.request(&AgentRequest::BranchpointWait {
+            timeout_ms: timeout.as_millis() as u64,
+        })?;
+        branchpoint_outcome(resp, |data| {
+            data.and_then(|d| {
+                d.get("contents")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+        })
+    }
+
+    /// Put the helper into its restore-safe loop before capture.
+    pub fn branchpoint_arm(&mut self) -> Result<BranchpointOutcome<()>> {
+        let resp = self.request(&AgentRequest::BranchpointArm)?;
+        branchpoint_outcome(resp, |_| ())
+    }
+
+    /// Return a parked source to its ordinary wait after capture.
+    pub fn branchpoint_park(&mut self) -> Result<BranchpointOutcome<()>> {
+        let resp = self.request(&AgentRequest::BranchpointPark)?;
+        branchpoint_outcome(resp, |_| ())
+    }
+
+    /// Release a restored clone, handing it `env_dotenv` as its identity, and
+    /// wait for its helper to acknowledge.
+    pub fn branchpoint_release(&mut self, env_dotenv: &str) -> Result<BranchpointOutcome<()>> {
+        let _timeout_guard = self.set_exec_timeout(Some(Duration::from_secs(20)))?;
+        let resp = self.request(&AgentRequest::BranchpointRelease {
+            env_dotenv: Some(env_dotenv.to_string()),
+        })?;
+        branchpoint_outcome(resp, |_| ())
+    }
+
+    /// Assign and release a held clone; `Ok(Ok(true))` when an earlier attempt
+    /// with the same token had already done it.
+    pub fn branchpoint_activate(
+        &mut self,
+        activation: BranchpointActivation,
+    ) -> Result<BranchpointOutcome<bool>> {
+        let resp = self.request(&AgentRequest::BranchpointActivate {
+            env_dotenv: activation.env_dotenv,
+            env_sourceable: activation.env_sourceable,
+            env_path: activation.env_path,
+            branch_env_path: activation.branch_env_path,
+            require_dir: activation.require_dir,
+            env_dir: activation.env_dir,
+            activation_token: activation.activation_token,
+        })?;
+        branchpoint_outcome(resp, |data| {
+            data.and_then(|d| d.get("already_done").and_then(|v| v.as_bool()))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Block until the released workload publishes `token` as worker-ready,
+    /// or until `timeout`; `NO_ACK` on timeout, `TOKEN_MISMATCH` on a stale token.
+    pub fn branchpoint_wait_worker_ready(
+        &mut self,
+        token: &str,
+        timeout: Duration,
+    ) -> Result<BranchpointOutcome<()>> {
+        let _timeout_guard = self.set_exec_timeout(Some(timeout + Duration::from_secs(5)))?;
+        let resp = self.request(&AgentRequest::BranchpointWaitWorkerReady {
+            token: token.to_string(),
+            timeout_ms: timeout.as_millis() as u64,
+        })?;
+        branchpoint_outcome(resp, |_| ())
     }
 
     /// Merge `lowerdirs` (bottom -> top) into a single tar at `output` in the guest.

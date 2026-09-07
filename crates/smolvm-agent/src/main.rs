@@ -82,7 +82,9 @@ fn boot_log(level: &str, msg: &str) {
         }
     }
 }
+mod branchpoint;
 mod cuda;
+mod dirwatch;
 mod disk_trim;
 mod dns_proxy;
 mod docker_bridge;
@@ -2317,11 +2319,8 @@ fn handle_request(
 
     match request {
         AgentRequest::Ping => {
-            let mut capabilities =
-                vec![smolvm_protocol::forkpoint::WORKER_READY_CAPABILITY.to_string()];
-            if forkpoint::arming_enabled() {
-                capabilities.push(smolvm_protocol::forkpoint::ARMING_CAPABILITY.to_string());
-            }
+            let capabilities =
+                vec![smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string()];
             AgentResponse::Pong {
                 version: PROTOCOL_VERSION,
                 capabilities,
@@ -2349,6 +2348,56 @@ fn handle_request(
 
         AgentRequest::StorageStatus => handle_storage_status(),
 
+        AgentRequest::BranchpointWait { timeout_ms } => {
+            let markers = branchpoint::Markers::standard();
+            match branchpoint::wait_ready(&markers, std::time::Duration::from_millis(timeout_ms)) {
+                Ok(contents) => AgentResponse::Ok {
+                    data: Some(serde_json::json!({ "contents": contents })),
+                },
+                Err(e) => branchpoint_error(e),
+            }
+        }
+        AgentRequest::BranchpointArm => {
+            branchpoint_outcome(branchpoint::arm(&branchpoint::Markers::standard()))
+        }
+        AgentRequest::BranchpointPark => {
+            branchpoint_outcome(branchpoint::park(&branchpoint::Markers::standard()))
+        }
+        AgentRequest::BranchpointRelease { env_dotenv } => branchpoint_outcome(
+            branchpoint::release(&branchpoint::Markers::standard(), env_dotenv.as_deref()),
+        ),
+        AgentRequest::BranchpointActivate {
+            env_dotenv,
+            env_sourceable,
+            env_path,
+            branch_env_path,
+            require_dir,
+            env_dir,
+            activation_token,
+        } => match branchpoint::activate(
+            &branchpoint::Markers::standard(),
+            &env_dotenv,
+            &env_sourceable,
+            std::path::Path::new(&env_path),
+            std::path::Path::new(&branch_env_path),
+            require_dir.as_deref().map(std::path::Path::new),
+            std::path::Path::new(&env_dir),
+            &activation_token,
+        ) {
+            Ok(outcome) => AgentResponse::Ok {
+                data: Some(serde_json::json!({
+                    "already_done": matches!(outcome, branchpoint::Activation::AlreadyDone)
+                })),
+            },
+            Err(e) => branchpoint_error(e),
+        },
+        AgentRequest::BranchpointWaitWorkerReady { token, timeout_ms } => {
+            branchpoint_outcome(branchpoint::wait_worker_ready(
+                &branchpoint::Markers::standard(),
+                &token,
+                std::time::Duration::from_millis(timeout_ms),
+            ))
+        }
         AgentRequest::FlattenLayers { lowerdirs, output } => {
             handle_flatten_layers(&lowerdirs, &output)
         }
@@ -7834,5 +7883,20 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&line)
             .unwrap_or_else(|e| panic!("Invalid JSON: {}\nLine: {}", e, line));
         assert!(parsed["message"].as_str().unwrap().contains("\"device\""));
+    }
+}
+
+/// Map a typed branchpoint step's result onto the wire.
+fn branchpoint_outcome(result: Result<(), branchpoint::TypedError>) -> AgentResponse {
+    match result {
+        Ok(()) => AgentResponse::Ok { data: None },
+        Err(e) => branchpoint_error(e),
+    }
+}
+
+fn branchpoint_error(e: branchpoint::TypedError) -> AgentResponse {
+    AgentResponse::Error {
+        message: e.message,
+        code: Some(e.code.to_string()),
     }
 }

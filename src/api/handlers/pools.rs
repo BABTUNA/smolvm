@@ -41,7 +41,7 @@ const LEASE_PAYLOAD_STAGE_ATTEMPTS: usize = 2;
 // before the controller's five-minute activating-lease grace period expires.
 const MAX_WORKER_READY_TIMEOUT_SECS: u64 = crate::pool::FORK_LEASE_ACTIVATION_GRACE_SECS - 60;
 const DEFAULT_WORKER_READY_TIMEOUT_SECS: u64 = MAX_WORKER_READY_TIMEOUT_SECS;
-const WORKER_READY_TIMEOUT_ENV: &str = "SMOLVM_WORKER_READY_TIMEOUT_SECS";
+use crate::agent::fork::WORKER_READY_TIMEOUT_ENV;
 
 const RESERVED_LEASE_ENV: &[&str] = &[
     smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV,
@@ -96,22 +96,13 @@ fn add_worker_ready_assignment(
     idempotency_key: &str,
     timeout_secs: u64,
 ) -> Result<String, ApiError> {
-    for reserved in [
-        smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV,
-        WORKER_READY_TIMEOUT_ENV,
-    ] {
-        if assignment.iter().any(|(key, _)| key == reserved) {
-            return Err(ApiError::BadRequest(format!(
-                "{reserved} is reserved for smolvm worker readiness"
-            )));
-        }
-    }
     let token = worker_ready_token(pool, idempotency_key);
-    assignment.push((
-        smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV.into(),
-        token.clone(),
-    ));
-    assignment.push((WORKER_READY_TIMEOUT_ENV.into(), timeout_secs.to_string()));
+    crate::agent::fork::add_worker_ready_assignment(
+        assignment,
+        &token,
+        Duration::from_secs(timeout_secs),
+    )
+    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     Ok(token)
 }
 

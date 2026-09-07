@@ -2470,21 +2470,35 @@ mod tests {
         assert_eq!(batch.parallel.get(), 3);
         assert!(!batch.wait_ready);
         assert_eq!(batch.ready_timeout, Duration::from_secs(120));
+        let plain = is_plain_branch(batch.count.get(), batch.name_prefix.is_some(), batch.hold);
+        assert_eq!(
+            forkpoint_timeout(plain, batch.wait_ready, batch.ready_timeout),
+            Some(Duration::from_secs(120))
+        );
+        // A plain branch waits only when asked; every batch shape waits, so a
+        // one-child batch is released at the boundary like any other.
+        assert_eq!(
+            forkpoint_timeout(true, false, Duration::from_secs(120)),
+            None
+        );
+        assert_eq!(
+            forkpoint_timeout(true, true, Duration::from_secs(120)),
+            Some(Duration::from_secs(120))
+        );
         assert_eq!(
             forkpoint_timeout(
-                batch.count.get(),
-                batch.wait_ready,
-                batch.hold,
-                batch.ready_timeout,
+                is_plain_branch(1, true, false),
+                false,
+                Duration::from_secs(120)
             ),
             Some(Duration::from_secs(120))
         );
         assert_eq!(
-            forkpoint_timeout(1, false, false, Duration::from_secs(120)),
-            None
-        );
-        assert_eq!(
-            forkpoint_timeout(1, false, true, Duration::from_secs(120)),
+            forkpoint_timeout(
+                is_plain_branch(1, false, true),
+                false,
+                Duration::from_secs(120)
+            ),
             Some(Duration::from_secs(120))
         );
 
@@ -2516,6 +2530,14 @@ mod tests {
         };
         assert_eq!(legacy.golden, "base");
         assert!(legacy.forkable);
+    }
+
+    #[test]
+    fn only_a_named_single_child_skips_the_batch_path() {
+        assert!(is_plain_branch(1, false, false));
+        assert!(!is_plain_branch(1, true, false));
+        assert!(!is_plain_branch(1, false, true));
+        assert!(!is_plain_branch(2, true, false));
     }
 
     #[test]
@@ -3996,7 +4018,9 @@ pub struct ForkCmd {
     #[arg(long, default_value = "1", value_name = "COUNT")]
     pub count: std::num::NonZeroU32,
 
-    /// Name batch children PREFIX-0 through PREFIX-(COUNT-1).
+    /// Name batch children PREFIX-0 through PREFIX-(COUNT-1). With a prefix (or
+    /// --hold) even a count of one is a batch: it waits for the boundary and
+    /// releases the child with its identity, unlike a plain --name branch.
     #[arg(long, value_name = "PREFIX")]
     pub name_prefix: Option<String>,
 
@@ -4026,6 +4050,22 @@ pub struct ForkCmd {
     )]
     pub ready_timeout: Duration,
 
+    /// Count a batch child as branched only once its workload has run
+    /// `smolvm-worker-ready`; a child that does not within the window is torn
+    /// down with the rest of the batch. Held slots take this at release.
+    #[arg(long, conflicts_with = "hold")]
+    pub wait_worker_ready: bool,
+
+    /// Window for `--wait-worker-ready`.
+    #[arg(
+        long,
+        default_value = "5m",
+        value_parser = parse_duration,
+        value_name = "DURATION",
+        requires = "wait_worker_ready",
+    )]
+    pub worker_ready_timeout: Duration,
+
     /// Make the child itself branchable (memfd RAM + control socket), so it can
     /// in turn be branched.
     #[arg(
@@ -4046,11 +4086,11 @@ pub struct ForkCmd {
     #[arg(long)]
     pub share_weights: bool,
 
-    /// Per-branch parameter (repeatable, KEY=VALUE). Delivered to the child as
-    /// `/etc/smolvm/branch-env` (dotenv format) for the already-running workload
-    /// to read, and merged into the child's env for later `machine exec`
-    /// sessions. This is how sweep/rollout children learn which variant they
-    /// are — no shared-mount claim files needed.
+    /// Per-branch parameter (repeatable, KEY=VALUE). Reaches the child through
+    /// `smolvm-branch-ready`: the program it runs (`-- prog`) gets it in its
+    /// environment, a shell gets it from `eval "$(smolvm-branch-ready)"`, and
+    /// later `machine exec` sessions see it too. This is how sweep/rollout
+    /// children learn which variant they are — no shared-mount claim files needed.
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 
@@ -4088,7 +4128,11 @@ impl ForkCmd {
         // they merge into the clone's secret_refs and resolve fresh per exec.
         let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
         let count = self.count.get();
-        let wait_ready = forkpoint_timeout(count, self.wait_ready, self.hold, self.ready_timeout);
+        let wait_ready = forkpoint_timeout(
+            is_plain_branch(count, self.name_prefix.is_some(), self.hold),
+            self.wait_ready,
+            self.ready_timeout,
+        );
         if count > 1024 {
             return Err(smolvm::Error::config(
                 "branch",
@@ -4102,7 +4146,7 @@ impl ForkCmd {
             ));
         }
 
-        if count == 1 {
+        if is_plain_branch(count, self.name_prefix.is_some(), self.hold) {
             let clone = match (self.clone, self.name_prefix) {
                 (Some(clone), None) => clone,
                 (None, Some(prefix)) => format!("{prefix}-0"),
@@ -4135,18 +4179,31 @@ impl ForkCmd {
             );
         }
 
-        if self.clone.is_some() {
+        if self.clone.is_some() && count > 1 {
             return Err(smolvm::Error::config(
                 "branch",
                 "--name cannot be used with --count greater than 1; use --name-prefix",
             ));
         }
-        let prefix = self.name_prefix.ok_or_else(|| {
-            smolvm::Error::config(
+        if self.clone.is_some() && self.name_prefix.is_some() {
+            return Err(smolvm::Error::config(
                 "branch",
-                "--name-prefix is required with --count greater than 1",
-            )
-        })?;
+                "use either --name or --name-prefix, not both",
+            ));
+        }
+        let (prefix, names): (String, Vec<String>) = match (self.clone, self.name_prefix) {
+            (Some(name), None) => (name.clone(), vec![name]),
+            (None, Some(prefix)) => {
+                let names = (0..count).map(|i| format!("{prefix}-{i}")).collect();
+                (prefix, names)
+            }
+            _ => {
+                return Err(smolvm::Error::config(
+                    "branch",
+                    "--name-prefix is required with --count greater than 1",
+                ));
+            }
+        };
         if self.forkable {
             return Err(smolvm::Error::config(
                 "branch",
@@ -4164,21 +4221,32 @@ impl ForkCmd {
             id: fork_batch_id(&self.golden, &prefix),
             size: count,
         });
-        let clones: Vec<_> = (0..count)
-            .map(|index| {
-                let name = format!("{prefix}-{index}");
-                let env = render_indexed_fork_env(&self.env, index, &name, true, batch.as_ref());
-                (name, env)
+        let worker_ready = self.wait_worker_ready.then_some(self.worker_ready_timeout);
+        let clones = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let index = index as u32;
+                let mut env =
+                    render_indexed_fork_env(&self.env, index, &name, true, batch.as_ref());
+                if let Some(timeout) = worker_ready {
+                    let token = smolvm::agent::fork::random_worker_ready_token()?;
+                    smolvm::agent::fork::add_worker_ready_assignment(&mut env, &token, timeout)?;
+                }
+                Ok((name, env))
             })
-            .collect();
+            .collect::<smolvm::Result<Vec<_>>>()?;
         vm_common::fork_vm_batch(
             &self.golden,
             &clones,
-            self.share_weights,
-            &fork_secrets,
-            wait_ready,
-            self.parallel.get() as usize,
-            self.hold,
+            vm_common::ForkBatchOptions {
+                share_weights: self.share_weights,
+                fork_secrets: &fork_secrets,
+                wait_ready,
+                parallel: self.parallel.get() as usize,
+                hold: self.hold,
+                worker_ready,
+            },
         )
     }
 }
@@ -4194,13 +4262,42 @@ pub struct ForkReleaseCmd {
     /// parameters installed when the slot was provisioned.
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
+
+    /// Report the slot as released only once its workload has run
+    /// `smolvm-worker-ready`; a slot that does not within the window is torn
+    /// down, since a consumed slot cannot be returned to the pool anyway.
+    #[arg(long)]
+    pub wait_worker_ready: bool,
+
+    /// Window for `--wait-worker-ready`.
+    #[arg(
+        long,
+        default_value = "5m",
+        value_parser = parse_duration,
+        value_name = "DURATION",
+        requires = "wait_worker_ready",
+    )]
+    pub worker_ready_timeout: Duration,
 }
 
 impl ForkReleaseCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let env = smolvm::util::parse_env_list(&self.env);
-        vm_common::release_held_fork(&self.name, &env)
+        let mut env = smolvm::util::parse_env_list(&self.env);
+        let worker_ready = self.wait_worker_ready.then_some(self.worker_ready_timeout);
+        if let Some(timeout) = worker_ready {
+            let token = smolvm::agent::fork::random_worker_ready_token()?;
+            smolvm::agent::fork::add_worker_ready_assignment(&mut env, &token, timeout)?;
+        }
+        vm_common::release_held_fork(&self.name, &env, worker_ready)
     }
+}
+
+/// One child by `--name` is a plain branch: the source is snapshotted wherever
+/// it is and the child keeps the parked helper. Anything with `--name-prefix`
+/// or `--hold` is a batch of that size, even one, so a pool of one slot gets
+/// the same boundary, identity and release as a pool of eight.
+fn is_plain_branch(count: u32, has_prefix: bool, hold: bool) -> bool {
+    count == 1 && !has_prefix && !hold
 }
 
 fn render_indexed_fork_env(
@@ -4268,13 +4365,14 @@ fn fork_batch_id(golden: &str, prefix: &str) -> String {
     hex::encode(digest.finalize())[..32].to_string()
 }
 
+/// A batch always waits for the source's branchpoint and releases each child
+/// there; a plain branch waits only when asked.
 fn forkpoint_timeout(
-    count: u32,
+    plain: bool,
     explicitly_requested: bool,
-    hold: bool,
     timeout: Duration,
 ) -> Option<Duration> {
-    (count > 1 || explicitly_requested || hold).then_some(timeout)
+    (!plain || explicitly_requested).then_some(timeout)
 }
 
 // ============================================================================

@@ -361,7 +361,9 @@ fn boot_prepared_fork(
             // clone-local barrier only after identity reset succeeds, matching
             // the CLI and serve fork paths. Publishing a release marker is
             // harmless for an arbitrary checkpoint with no waiting helper.
-            if let Err(error) = crate::agent::fork::release_forkpoint(clone) {
+            if let Err(error) =
+                crate::agent::fork::release_forkpoint(clone, &prep.clone_record.fork_env)
+            {
                 let _ = handle.stop();
                 return Err(error);
             }
