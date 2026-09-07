@@ -3997,7 +3997,7 @@ impl StartCmd {
 ///
 /// Captures the source through its control socket, copy-on-write
 /// branches its disks, and boots the new machine from the source's in-memory
-/// snapshot instead of cold-booting. Linux/x86_64 resumes the source after the
+/// checkpoint instead of cold-booting. Linux/x86_64 resumes the source after the
 /// boundary; other hosts retain it as the frozen copy-on-write base.
 ///
 /// The source must have been started with `--branchable`.
@@ -4011,7 +4011,7 @@ pub struct ForkCmd {
     #[arg(short = 'n', long = "name", value_name = "NAME")]
     pub clone: Option<String>,
 
-    /// Number of children to create from one snapshot. Batch branches wait for the
+    /// Number of children to create from one checkpoint. Batch branches wait for the
     /// standard `smolvm-branch-ready` boundary automatically. Direct batches
     /// receive one shared `SMOLVM_BRANCH_BATCH_ID` and `SMOLVM_BRANCH_BATCH_SIZE`;
     /// held slots remain independent until assigned by their controller.
@@ -4292,7 +4292,7 @@ impl ForkReleaseCmd {
     }
 }
 
-/// One child by `--name` is a plain branch: the source is snapshotted wherever
+/// One child by `--name` is a plain branch: the source is checkpointed wherever
 /// it is and the child keeps the parked helper. Anything with `--name-prefix`
 /// or `--hold` is a batch of that size, even one, so a pool of one slot gets
 /// the same boundary, identity and release as a pool of eight.
