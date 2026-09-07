@@ -1466,11 +1466,11 @@ mod tests {
     fn test_agent_response_serialization() {
         let resp = AgentResponse::Pong {
             version: PROTOCOL_VERSION,
-            capabilities: vec![forkpoint::WORKER_READY_CAPABILITY.to_string()],
+            capabilities: vec![forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string()],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("pong"));
-        assert!(json.contains(forkpoint::WORKER_READY_CAPABILITY));
+        assert!(json.contains(forkpoint::TYPED_BRANCHPOINT_CAPABILITY));
 
         let legacy: AgentResponse =
             serde_json::from_str(r#"{"status":"pong","version":1}"#).unwrap();

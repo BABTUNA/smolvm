@@ -295,234 +295,96 @@ fn persist_forkpoint_profile(golden: &str, profile: ForkpointProfile) -> Result<
     Ok(())
 }
 
+/// Connect to a machine's agent and insist on the branch protocol. There is
+/// one protocol; a machine whose agent does not speak it is refused with a
+/// message that says what to update, never driven through an older mechanism.
+fn branch_client(machine: &str, what: &str) -> Result<AgentClient> {
+    let socket = vm_data_dir(machine).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&socket)
+        .map_err(|e| Error::agent(what, format!("agent connect: {e}")))?;
+    if !client
+        .supports_typed_branchpoint()
+        .map_err(|e| Error::agent(what, e.to_string()))?
+    {
+        return Err(Error::agent(
+            what,
+            format!(
+                "machine '{machine}' runs a guest agent without the branch protocol \
+                 ({}); update its agent rootfs to this smolvm version",
+                smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY
+            ),
+        ));
+    }
+    Ok(client)
+}
+
 /// Wait until the golden workload reaches the standard live-fork boundary.
 ///
 /// The workload signals this by calling `smolvm-fork-ready`, which writes the
 /// marker and blocks. Keeping the wait in the VM namespace avoids coupling the
 /// host to container logs, PIDs, or workload-specific files.
 pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
-    // On hosts without fork-and-continue, a successful first fork leaves the
-    // golden paused as the CoW base. Pool replenishment must not try to run a
-    // new agent exec inside that paused VM: its vCPUs cannot answer, even
-    // though the already-proven forkpoint remains the exact snapshot source.
-    // The VMM control plane remains live, so recognize it before touching the
-    // guest. A continuing source reports `OK running` and takes the
-    // ordinary agent readiness path below.
-    let control = control_socket_path(golden);
-    if control.exists() {
-        if let Ok(status) = control_socket_cmd(&control, "STATUS") {
-            if fork_base_already_paused(&status) {
-                tracing::debug!(golden, %status, "fork base is already paused; reusing its forkpoint");
-                return Ok(());
-            }
-        }
-    }
-
-    let socket = vm_data_dir(golden).join("agent.sock");
-    let mut client = AgentClient::connect_with_retry(&socket)
-        .map_err(|e| Error::agent("wait for forkpoint", format!("agent connect: {e}")))?;
-    if client
-        .supports_typed_branchpoint()
+    let mut client = branch_client(golden, "wait for forkpoint")?;
+    match client
+        .branchpoint_wait(timeout)
         .map_err(|e| Error::agent("wait for forkpoint", e.to_string()))?
     {
-        return match client
-            .branchpoint_wait(timeout)
-            .map_err(|e| Error::agent("wait for forkpoint", e.to_string()))?
-        {
-            Ok(contents) => {
-                let profile = parse_forkpoint_profile(contents.as_bytes());
-                persist_forkpoint_profile(golden, profile)?;
-                Ok(())
-            }
-            Err(f) => Err(Error::agent(
-                "wait for forkpoint",
-                format!(
-                    "source '{golden}' did not reach a branchpoint within {}s: {f}\n\
-                     A batch branch snapshots the source at a point its workload declares by running \
-                     `smolvm-branch-ready` after setup (see README, \"Branch a running machine\"). \
-                     If the workload never calls it, either add the call, raise --ready-timeout, or \
-                     take single `--name` branches, which snapshot the source wherever it is.",
-                    timeout.as_secs_f64()
-                ),
-            )),
-        };
-    }
-    let script = format!(
-        "while [ ! -f '{ready}' ]; do sleep 0.05; done; cat '{ready}'",
-        ready = smolvm_protocol::forkpoint::READY_PATH,
-    );
-    match client.vm_exec(
-        vec!["/bin/sh".into(), "-c".into(), script],
-        vec![],
-        None,
-        Some(timeout),
-        None,
-    ) {
-        Ok((0, stdout, _)) => {
-            let profile = parse_forkpoint_profile(&stdout);
-            persist_forkpoint_profile(golden, profile)?;
-            Ok(())
+        Ok(contents) => {
+            let profile = parse_forkpoint_profile(contents.as_bytes());
+            persist_forkpoint_profile(golden, profile)
         }
-        Ok((code, _, stderr)) => Err(Error::agent(
+        Err(f) => Err(Error::agent(
             "wait for forkpoint",
             format!(
-                "golden '{golden}' did not become ready within {}s (exit {code}): {}",
-                timeout.as_secs_f64(),
-                String::from_utf8_lossy(&stderr).trim()
-            ),
-        )),
-        Err(e) => Err(Error::agent(
-            "wait for forkpoint",
-            format!(
-                "golden '{golden}' did not become ready within {}s: {e}",
+                "source '{golden}' did not reach a branchpoint within {}s: {f}\n\
+                 A batch branch snapshots the source at a point its workload declares by running \
+                 `smolvm-branch-ready` after setup (see README, \"Branch a running machine\"). \
+                 If the workload never calls it, either add the call, raise --ready-timeout, or \
+                 take single `--name` branches, which snapshot the source wherever it is.",
                 timeout.as_secs_f64()
             ),
         )),
     }
 }
 
-fn build_arm_forkpoint_script() -> String {
-    format!(
-        "if [ ! -f '{ready}' ]; then exit 3; fi; \
-         generation=$(sed -n 's/^{generation_prefix}//p' '{ready}' | head -n 1); \
-         case \"$generation\" in ''|*[!0-9a-fA-F]*) exit 4 ;; esac; \
-         [ \"${{#generation}}\" -eq 32 ] || exit 4; \
-         rm -f '{arm}'; \
-         i=0; while [ -e '{armed}' ]; do \
-           i=$((i + 1)); [ \"$i\" -lt 400 ] || exit 47; sleep 0.005; \
-         done; \
-         printf '%s%s\\n' '{arm_prefix}' \"$generation\" > '{arm}.tmp'; \
-         mv '{arm}.tmp' '{arm}'; \
-         i=0; until grep -q -x '{armed_prefix}'\"$generation\" '{armed}' 2>/dev/null; do \
-           i=$((i + 1)); [ \"$i\" -lt 400 ] || exit 47; sleep 0.005; \
-         done",
-        arm = smolvm_protocol::forkpoint::ARM_PATH,
-        armed = smolvm_protocol::forkpoint::ARMED_PATH,
-        arm_prefix = smolvm_protocol::forkpoint::ARM_PREFIX,
-        armed_prefix = smolvm_protocol::forkpoint::ARMED_PREFIX,
-        generation_prefix = smolvm_protocol::forkpoint::GENERATION_PREFIX,
-        ready = smolvm_protocol::forkpoint::READY_PATH,
-    )
-}
-
 /// Put a negotiated workload helper into its restore-safe userspace loop just
 /// before capture. A branchable machine without a helper remains a valid
 /// immediate snapshot source, and an older guest keeps its legacy loop.
 fn arm_forkpoint_for_capture(golden: &str) -> Result<bool> {
-    let socket = vm_data_dir(golden).join("agent.sock");
-    let mut client = AgentClient::connect_with_retry(&socket)
-        .map_err(|e| Error::agent("arm branchpoint", format!("agent connect: {e}")))?;
-    if !client
-        .supports_capability(smolvm_protocol::forkpoint::ARMING_CAPABILITY)
+    use smolvm_protocol::forkpoint::typed_error;
+    let mut client = branch_client(golden, "arm branchpoint")?;
+    match client
+        .branchpoint_arm()
         .map_err(|e| Error::agent("arm branchpoint", e.to_string()))?
     {
-        return Ok(false);
-    }
-    if client
-        .supports_typed_branchpoint()
-        .map_err(|e| Error::agent("arm branchpoint", e.to_string()))?
-    {
-        use smolvm_protocol::forkpoint::typed_error;
-        return match client
-            .branchpoint_arm()
-            .map_err(|e| Error::agent("arm branchpoint", e.to_string()))?
-        {
-            Ok(()) => Ok(true),
-            // No branchpoint declared: a branchable machine without a helper is
-            // a valid immediate snapshot source.
-            Err(f) if f.code.as_deref() == Some(typed_error::NOT_READY) => Ok(false),
-            Err(f) if f.code.as_deref() == Some(typed_error::NO_ACK) => Err(Error::agent(
-                "arm branchpoint",
-                format!("source '{golden}' did not acknowledge the capture arm marker: {f}"),
-            )),
-            Err(f) => Err(Error::agent(
-                "arm branchpoint",
-                format!("source '{golden}': {f}"),
-            )),
-        };
-    }
-    match client.vm_exec(
-        vec!["/bin/sh".into(), "-c".into(), build_arm_forkpoint_script()],
-        vec![],
-        None,
-        Some(Duration::from_secs(3)),
-        None,
-    ) {
-        Ok((0, _, _)) => Ok(true),
-        Ok((3, _, _)) => Ok(false),
-        Ok((47, _, _)) => Err(Error::agent(
+        Ok(()) => Ok(true),
+        // No branchpoint declared: a branchable machine without a helper is
+        // a valid immediate snapshot source.
+        Err(f) if f.code.as_deref() == Some(typed_error::NOT_READY) => Ok(false),
+        Err(f) if f.code.as_deref() == Some(typed_error::NO_ACK) => Err(Error::agent(
             "arm branchpoint",
-            format!("source '{golden}' did not acknowledge the capture arm marker"),
+            format!("source '{golden}' did not acknowledge the capture arm marker: {f}"),
         )),
-        Ok((code, _, stderr)) => Err(Error::agent(
+        Err(f) => Err(Error::agent(
             "arm branchpoint",
-            format!(
-                "source '{golden}' arm exited {code}: {}",
-                String::from_utf8_lossy(&stderr).trim()
-            ),
-        )),
-        Err(error) => Err(Error::agent(
-            "arm branchpoint",
-            format!("source '{golden}': {error}"),
+            format!("source '{golden}': {f}"),
         )),
     }
-}
-
-fn build_park_forkpoint_script() -> String {
-    format!(
-        "rm -f '{arm}'; \
-         i=0; while [ -e '{armed}' ]; do \
-           i=$((i + 1)); [ \"$i\" -lt 400 ] || exit 47; sleep 0.005; \
-         done",
-        arm = smolvm_protocol::forkpoint::ARM_PATH,
-        armed = smolvm_protocol::forkpoint::ARMED_PATH,
-    )
 }
 
 /// Park the continued source after capture. Failure is reported to the caller,
 /// which can retain the valid snapshot while making the performance fault
 /// visible instead of corrupting a completed branch generation.
 fn park_forkpoint_after_capture(golden: &str) -> Result<()> {
-    let socket = vm_data_dir(golden).join("agent.sock");
-    let mut client = AgentClient::connect_with_retry(&socket)
-        .map_err(|e| Error::agent("park branchpoint", format!("agent connect: {e}")))?;
-    if client
-        .supports_typed_branchpoint()
+    let mut client = branch_client(golden, "park branchpoint")?;
+    match client
+        .branchpoint_park()
         .map_err(|e| Error::agent("park branchpoint", e.to_string()))?
     {
-        return match client
-            .branchpoint_park()
-            .map_err(|e| Error::agent("park branchpoint", e.to_string()))?
-        {
-            Ok(()) => Ok(()),
-            Err(f) => Err(Error::agent(
-                "park branchpoint",
-                format!("source '{golden}': {f}"),
-            )),
-        };
-    }
-    match client.vm_exec(
-        vec!["/bin/sh".into(), "-c".into(), build_park_forkpoint_script()],
-        vec![],
-        None,
-        Some(Duration::from_secs(3)),
-        None,
-    ) {
-        Ok((0, _, _)) => Ok(()),
-        Ok((47, _, _)) => Err(Error::agent(
+        Ok(()) => Ok(()),
+        Err(f) => Err(Error::agent(
             "park branchpoint",
-            format!("source '{golden}' did not leave its capture loop"),
-        )),
-        Ok((code, _, stderr)) => Err(Error::agent(
-            "park branchpoint",
-            format!(
-                "source '{golden}' park exited {code}: {}",
-                String::from_utf8_lossy(&stderr).trim()
-            ),
-        )),
-        Err(error) => Err(Error::agent(
-            "park branchpoint",
-            format!("source '{golden}': {error}"),
+            format!("source '{golden}': {f}"),
         )),
     }
 }
@@ -1482,30 +1344,6 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
     }
 }
 
-/// Build the clone-local release and acknowledgement script.
-fn build_release_forkpoint_script() -> String {
-    format!(
-        "set -e; mkdir -p '{dir}'; umask 077; \
-         if [ -f '{ready}' ]; then generation=$(sed -n 's/^{generation_prefix}//p' '{ready}' | head -n 1); else generation=''; fi; \
-         case \"$generation\" in ''|*[!0-9a-fA-F]*) generation='' ;; esac; \
-         if [ \"${{#generation}}\" -eq 32 ]; then \
-           printf '%s%s\\n' '{release_prefix}' \"$generation\" > '{release}.tmp'; \
-         else \
-           generation=''; printf '%s\\n' '{legacy_release}' > '{release}.tmp'; \
-         fi; \
-         mv '{release}.tmp' '{release}'; i=0; \
-         while if [ -n \"$generation\" ]; then grep -q -x \"{generation_prefix}$generation\" '{ready}' 2>/dev/null; else [ -f '{ready}' ]; fi; do \
-           i=$((i + 1)); [ \"$i\" -lt 500 ] || exit 46; sleep 0.02; \
-         done",
-        dir = smolvm_protocol::forkpoint::STATE_DIR,
-        generation_prefix = smolvm_protocol::forkpoint::GENERATION_PREFIX,
-        legacy_release = smolvm_protocol::forkpoint::LEGACY_RELEASE_TOKEN,
-        release = smolvm_protocol::forkpoint::RELEASE_PATH,
-        release_prefix = smolvm_protocol::forkpoint::RELEASE_PREFIX,
-        ready = smolvm_protocol::forkpoint::READY_PATH,
-    )
-}
-
 /// Release the workload restored in `clone` after its identity and per-fork
 /// environment are installed. The state directory is private guest RAM, so a
 /// release marker wakes only this clone even though every clone inherited the
@@ -1515,47 +1353,15 @@ fn build_release_forkpoint_script() -> String {
 /// the same parameters [`write_fork_env`] installed; a typed agent carries it
 /// inside the release marker so the helper receives both in one atomic step.
 pub fn release_forkpoint(clone: &str, env: &[(String, String)]) -> Result<()> {
-    let socket = vm_data_dir(clone).join("agent.sock");
-    let mut client = AgentClient::connect_with_retry(&socket)
-        .map_err(|e| Error::agent("release forkpoint", format!("agent connect: {e}")))?;
-    if client
-        .supports_typed_branchpoint()
+    let mut client = branch_client(clone, "release forkpoint")?;
+    match client
+        .branchpoint_release(&render_fork_env(env))
         .map_err(|e| Error::agent("release forkpoint", e.to_string()))?
     {
-        return match client
-            .branchpoint_release(&render_fork_env(env))
-            .map_err(|e| Error::agent("release forkpoint", e.to_string()))?
-        {
-            Ok(()) => Ok(()),
-            Err(f) => Err(Error::agent(
-                "release forkpoint",
-                format!("clone '{clone}': {f}"),
-            )),
-        };
-    }
-    let script = build_release_forkpoint_script();
-    match client.vm_exec(
-        vec!["/bin/sh".into(), "-c".into(), script],
-        vec![],
-        None,
-        Some(Duration::from_secs(15)),
-        None,
-    ) {
-        Ok((0, _, _)) => Ok(()),
-        Ok((46, _, _)) => Err(Error::agent(
+        Ok(()) => Ok(()),
+        Err(f) => Err(Error::agent(
             "release forkpoint",
-            format!("clone '{clone}' did not acknowledge its release marker"),
-        )),
-        Ok((code, _, stderr)) => Err(Error::agent(
-            "release forkpoint",
-            format!(
-                "clone '{clone}' release exited {code}: {}",
-                String::from_utf8_lossy(&stderr).trim()
-            ),
-        )),
-        Err(e) => Err(Error::agent(
-            "release forkpoint",
-            format!("clone '{clone}': {e}"),
+            format!("clone '{clone}': {f}"),
         )),
     }
 }
@@ -2864,39 +2670,11 @@ pub fn render_branch_env(env: &[(String, String)]) -> String {
 /// delimiter on a line of its own, newline-terminated: a heredoc terminator
 /// must be the whole line, so a caller continues on the next line and must
 /// not append `;` or `&&` to the fragment.
-fn branch_env_install_fragment(
-    path: &str,
-    env: &[(String, String)],
-    form: BranchEnvForm,
-) -> String {
-    let content = match form {
-        BranchEnvForm::Sourceable => render_branch_env(env),
-        BranchEnvForm::Dotenv => render_fork_env(env),
-    };
+fn branch_env_install_fragment(path: &str, env: &[(String, String)]) -> String {
     format!(
-        "cat > '{path}.tmp' <<'SMOLVM_BRANCH_ENV_EOF' && mv '{path}.tmp' '{path}'\n{content}SMOLVM_BRANCH_ENV_EOF\n"
+        "cat > '{path}.tmp' <<'SMOLVM_BRANCH_ENV_EOF' && mv '{path}.tmp' '{path}'\n{content}SMOLVM_BRANCH_ENV_EOF\n",
+        content = render_branch_env(env)
     )
-}
-
-/// The shape of `branch-env`, chosen by the agent that will read it. An agent
-/// with the typed branchpoint protocol reads either form, so it gets the
-/// sourceable one; an older agent's `smolvm-worker-ready` parses only plain
-/// `KEY=VALUE` lines from this file, so it must keep receiving those or a
-/// pool lease that awaits readiness would never see its token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BranchEnvForm {
-    Sourceable,
-    Dotenv,
-}
-
-impl BranchEnvForm {
-    fn for_agent(client: &mut AgentClient) -> Result<Self> {
-        Ok(if client.supports_typed_branchpoint()? {
-            Self::Sourceable
-        } else {
-            Self::Dotenv
-        })
-    }
 }
 
 /// Merge assignment-time parameters into a held slot's initial fork
@@ -2960,8 +2738,6 @@ pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) 
     let sock = vm_data_dir(clone).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&sock)
         .map_err(|e| Error::agent("fork env: agent connect", e.to_string()))?;
-    let form = BranchEnvForm::for_agent(&mut client)
-        .map_err(|e| Error::agent("fork env", e.to_string()))?;
     // Image machines MUST land the file in the workload container's rootfs
     // (the overlay merged dir): falling through silently would strand it in
     // the agent rootfs where no workload will ever look. Fail with the actual
@@ -2973,12 +2749,12 @@ pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) 
              mkdir -p {merged}/etc/smolvm && umask 077 && \
              cat > {merged}{FORK_ENV_GUEST_PATH} && {branch_env}",
             branch_env =
-                branch_env_install_fragment(&format!("{merged}{BRANCH_ENV_GUEST_PATH}"), env, form)
+                branch_env_install_fragment(&format!("{merged}{BRANCH_ENV_GUEST_PATH}"), env)
         )
     } else {
         format!(
             "mkdir -p /etc/smolvm && umask 077 && cat > {FORK_ENV_GUEST_PATH} && {branch_env}",
-            branch_env = branch_env_install_fragment(BRANCH_ENV_GUEST_PATH, env, form)
+            branch_env = branch_env_install_fragment(BRANCH_ENV_GUEST_PATH, env)
         )
     };
     match client.vm_exec(
@@ -3034,14 +2810,6 @@ pub fn activate_held_fork(
     } else {
         BRANCH_ENV_GUEST_PATH.to_string()
     };
-    let ensure_env_parent = if record.image.is_some() {
-        format!(
-            "if [ ! -d '{merged_root}' ]; then echo 'missing {merged_root}' >&2; exit 41; fi; \
-             mkdir -p '{merged_root}/etc/smolvm'"
-        )
-    } else {
-        "mkdir -p /etc/smolvm".to_string()
-    };
     // The token makes this operation safe to repeat after an ambiguous socket
     // timeout. A release can wake a CUDA-heavy workload before the guest agent's
     // reply reaches the host; without an idempotency receipt, retrying could vend
@@ -3052,20 +2820,6 @@ pub fn activate_held_fork(
         crate::util::generate_short_id(),
         crate::util::generate_short_id()
     );
-    let receipt = format!("{}/activation", smolvm_protocol::forkpoint::STATE_DIR);
-    let script = build_activation_script(
-        ActivationScriptPaths {
-            ready: smolvm_protocol::forkpoint::READY_PATH,
-            release: smolvm_protocol::forkpoint::RELEASE_PATH,
-            worker_ready: smolvm_protocol::forkpoint::WORKER_READY_PATH,
-            receipt: &receipt,
-            env: &env_path,
-            branch_env: &branch_env_path,
-        },
-        &ensure_env_parent,
-        &activation_token,
-        &merged,
-    );
     let (require_dir, env_dir) = if record.image.is_some() {
         (
             Some(merged_root.clone()),
@@ -3074,10 +2828,18 @@ pub fn activate_held_fork(
     } else {
         (None, "/etc/smolvm".to_string())
     };
-    let sourceable = render_branch_env(&merged);
-    let socket = vm_data_dir(clone).join("agent.sock");
+    let activation = crate::agent::client::BranchpointActivation {
+        env_dotenv: content,
+        env_sourceable: render_branch_env(&merged),
+        env_path,
+        branch_env_path,
+        require_dir,
+        env_dir,
+        activation_token,
+    };
+    use smolvm_protocol::forkpoint::typed_error;
     for attempt in 1..=2 {
-        let mut client = match AgentClient::connect_with_retry(&socket) {
+        let mut client = match branch_client(clone, "activate held fork") {
             Ok(client) => client,
             Err(error) if attempt == 1 => {
                 tracing::warn!(
@@ -3088,110 +2850,36 @@ pub fn activate_held_fork(
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
-            Err(error) => {
-                return Err(Error::agent(
-                    "activate held fork",
-                    format!("agent connect: {error}"),
-                ));
-            }
+            Err(error) => return Err(error),
         };
-        if client
-            .supports_typed_branchpoint()
-            .map_err(|e| Error::agent("activate held fork", e.to_string()))?
-        {
-            use smolvm_protocol::forkpoint::typed_error;
-            match client.branchpoint_activate(crate::agent::client::BranchpointActivation {
-                env_dotenv: content.clone(),
-                env_sourceable: sourceable.clone(),
-                env_path: env_path.clone(),
-                branch_env_path: branch_env_path.clone(),
-                require_dir: require_dir.clone(),
-                env_dir: env_dir.clone(),
-                activation_token: activation_token.clone(),
-            }) {
-                // A repeat with the same token after an ambiguous reply is the
-                // partial commit completing, not a second activation.
-                Ok(Ok(_already_done)) => return Ok(merged),
-                Ok(Err(f)) if f.code.as_deref() == Some(typed_error::TOKEN_MISMATCH) => {
-                    return Err(Error::agent(
-                        "activate held fork",
-                        format!("clone '{clone}' was already released"),
-                    ));
-                }
-                Ok(Err(f)) if f.code.as_deref() == Some(typed_error::NOT_READY) => {
-                    return Err(Error::agent(
-                        "activate held fork",
-                        format!("clone '{clone}' is not parked at a forkpoint"),
-                    ));
-                }
-                Ok(Err(f)) if attempt == 1 => {
-                    tracing::warn!(
-                        clone,
-                        error = %f,
-                        "held-fork activation attempt failed; retrying idempotently"
-                    );
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-                Ok(Err(f)) => {
-                    return Err(Error::agent(
-                        "activate held fork",
-                        format!("clone '{clone}': {f}"),
-                    ));
-                }
-                Err(error) if attempt == 1 => {
-                    tracing::warn!(
-                        clone,
-                        %error,
-                        "held-fork activation reply was ambiguous; retrying idempotently"
-                    );
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-                Err(error) => {
-                    return Err(Error::agent(
-                        "activate held fork",
-                        format!("clone '{clone}': {error}"),
-                    ));
-                }
-            }
-        }
-        match client.vm_exec(
-            vec!["/bin/sh".into(), "-c".into(), script.clone()],
-            vec![],
-            None,
-            Some(Duration::from_secs(10)),
-            Some(content.clone()),
-        ) {
-            Ok((0, _, _)) => return Ok(merged),
-            Ok((42, _, _)) => {
+        match client.branchpoint_activate(activation.clone()) {
+            // A repeat with the same token after an ambiguous reply is the
+            // partial commit completing, not a second activation.
+            Ok(Ok(_already_done)) => return Ok(merged),
+            Ok(Err(f)) if f.code.as_deref() == Some(typed_error::TOKEN_MISMATCH) => {
                 return Err(Error::agent(
                     "activate held fork",
                     format!("clone '{clone}' was already released"),
                 ));
             }
-            Ok((43, _, _)) => {
+            Ok(Err(f)) if f.code.as_deref() == Some(typed_error::NOT_READY) => {
                 return Err(Error::agent(
                     "activate held fork",
                     format!("clone '{clone}' is not parked at a forkpoint"),
                 ));
             }
-            Ok((code, _, stderr)) if attempt == 1 => {
+            Ok(Err(f)) if attempt == 1 => {
                 tracing::warn!(
                     clone,
-                    code,
-                    stderr = %String::from_utf8_lossy(&stderr).trim(),
+                    error = %f,
                     "held-fork activation attempt failed; retrying idempotently"
                 );
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Ok((code, _, stderr)) => {
+            Ok(Err(f)) => {
                 return Err(Error::agent(
                     "activate held fork",
-                    format!(
-                        "clone '{clone}' activation exited {code}: {}",
-                        String::from_utf8_lossy(&stderr).trim()
-                    ),
+                    format!("clone '{clone}': {f}"),
                 ));
             }
             Err(error) if attempt == 1 => {
@@ -3210,15 +2898,10 @@ pub fn activate_held_fork(
             }
         }
     }
-    unreachable!("held-fork activation loop always returns")
-}
-
-const WORKER_READY_TRANSPORT_MARGIN: Duration = Duration::from_secs(30);
-
-fn worker_ready_command_timeout(timeout: Duration) -> Result<Duration> {
-    timeout
-        .checked_add(WORKER_READY_TRANSPORT_MARGIN)
-        .ok_or_else(|| Error::config("worker readiness", "timeout is too large"))
+    Err(Error::agent(
+        "activate held fork",
+        format!("clone '{clone}' activation did not complete"),
+    ))
 }
 
 /// Guest env key telling a workload how long it has to publish readiness.
@@ -3275,6 +2958,7 @@ pub fn worker_ready_token_of(env: &[(String, String)]) -> Option<&str> {
 
 /// Wait until a released workload proves that clone-local preparation finished.
 pub fn wait_for_worker_ready(clone: &str, token: &str, timeout: Duration) -> Result<()> {
+    use smolvm_protocol::forkpoint::typed_error;
     if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(Error::config(
             "worker readiness",
@@ -3287,163 +2971,32 @@ pub fn wait_for_worker_ready(clone: &str, token: &str, timeout: Duration) -> Res
             "timeout must be positive",
         ));
     }
-    let polls = timeout
-        .as_secs()
-        .checked_mul(10)
-        .ok_or_else(|| Error::config("worker readiness", "timeout is too large"))?;
-    let script = build_worker_ready_wait_script(smolvm_protocol::forkpoint::WORKER_READY_PATH);
-    let socket = vm_data_dir(clone).join("agent.sock");
-    let mut client = AgentClient::connect_with_retry(&socket)
-        .map_err(|error| Error::agent("wait for worker readiness", error.to_string()))?;
-    if !client
-        .supports_capability(smolvm_protocol::forkpoint::WORKER_READY_CAPABILITY)
-        .map_err(|error| Error::agent("check worker readiness capability", error.to_string()))?
-    {
-        return Err(Error::agent(
-            "wait for worker readiness",
-            format!(
-                "clone '{clone}' uses an incompatible guest agent without the worker-readiness capability; rebuild the agent rootfs or remove the stale SMOLVM_AGENT_ROOTFS override"
-            ),
-        ));
-    }
-    let command = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        script,
-        "smolvm-worker-ready-wait".into(),
-        token.to_ascii_lowercase(),
-        polls.to_string(),
-    ];
-    // The guest poll loop launches `sleep` on every iteration, so its elapsed
-    // wall time can exceed the nominal polling window under CPU contention.
-    // Keep this transport deadline within the controller's reserved activation
-    // grace while allowing the script to report its specific timeout code.
-    let command_timeout = worker_ready_command_timeout(timeout)?;
-    if client
-        .supports_typed_branchpoint()
-        .map_err(|error| Error::agent("wait for worker readiness", error.to_string()))?
-    {
-        use smolvm_protocol::forkpoint::typed_error;
-        return match client
-            .branchpoint_wait_worker_ready(&token.to_ascii_lowercase(), timeout)
-            .map_err(|error| {
-                Error::agent(
-                    "wait for worker readiness",
-                    format!("clone '{clone}': {error}"),
-                )
-            })? {
-            Ok(()) => Ok(()),
-            Err(f) if f.code.as_deref() == Some(typed_error::NO_ACK) => Err(Error::agent(
+    let mut client = branch_client(clone, "wait for worker readiness")?;
+    match client
+        .branchpoint_wait_worker_ready(&token.to_ascii_lowercase(), timeout)
+        .map_err(|error| {
+            Error::agent(
                 "wait for worker readiness",
-                format!(
-                    "clone '{clone}' did not signal readiness within {} seconds",
-                    timeout.as_secs()
-                ),
-            )),
-            Err(f) if f.code.as_deref() == Some(typed_error::TOKEN_MISMATCH) => Err(Error::agent(
-                "wait for worker readiness",
-                format!("clone '{clone}' published a stale or invalid readiness token"),
-            )),
-            Err(f) => Err(Error::agent(
-                "wait for worker readiness",
-                format!("clone '{clone}': {f}"),
-            )),
-        };
-    }
-    match client.vm_exec(command, vec![], None, Some(command_timeout), None) {
-        Ok((0, _, _)) => Ok(()),
-        Ok((44, _, _)) => Err(Error::agent(
+                format!("clone '{clone}': {error}"),
+            )
+        })? {
+        Ok(()) => Ok(()),
+        Err(f) if f.code.as_deref() == Some(typed_error::NO_ACK) => Err(Error::agent(
             "wait for worker readiness",
             format!(
                 "clone '{clone}' did not signal readiness within {} seconds",
                 timeout.as_secs()
             ),
         )),
-        Ok((45, _, _)) => Err(Error::agent(
+        Err(f) if f.code.as_deref() == Some(typed_error::TOKEN_MISMATCH) => Err(Error::agent(
             "wait for worker readiness",
             format!("clone '{clone}' published a stale or invalid readiness token"),
         )),
-        Ok((code, _, stderr)) => Err(Error::agent(
+        Err(f) => Err(Error::agent(
             "wait for worker readiness",
-            format!(
-                "clone '{clone}' readiness wait exited {code}: {}",
-                String::from_utf8_lossy(&stderr).trim()
-            ),
-        )),
-        Err(error) => Err(Error::agent(
-            "wait for worker readiness",
-            format!("clone '{clone}': {error}"),
+            format!("clone '{clone}': {f}"),
         )),
     }
-}
-
-fn build_worker_ready_wait_script(worker_ready: &str) -> String {
-    format!(
-        "set -e; i=0; while [ \"$i\" -lt \"$2\" ]; do \
-         if [ -f '{worker_ready}' ]; then \
-           [ \"$(cat '{worker_ready}')\" = \"$1\" ] && exit 0; exit 45; \
-         fi; \
-         i=$((i + 1)); sleep 0.1; \
-         done; exit 44"
-    )
-}
-
-struct ActivationScriptPaths<'a> {
-    ready: &'a str,
-    release: &'a str,
-    worker_ready: &'a str,
-    receipt: &'a str,
-    env: &'a str,
-    branch_env: &'a str,
-}
-
-fn build_activation_script(
-    paths: ActivationScriptPaths<'_>,
-    ensure_env_parent: &str,
-    activation_token: &str,
-    env: &[(String, String)],
-) -> String {
-    let ActivationScriptPaths {
-        ready,
-        release,
-        worker_ready,
-        receipt,
-        env: env_path,
-        branch_env: branch_env_path,
-    } = paths;
-    format!(
-        "set -e; \
-         if [ -f '{release}' ]; then \
-           [ \"$(cat '{receipt}' 2>/dev/null)\" = '{activation_token}' ] && exit 0; \
-           exit 42; \
-         fi; \
-         if [ ! -f '{ready}' ]; then exit 43; fi; \
-         generation=$(sed -n 's/^{generation_prefix}//p' '{ready}' | head -n 1); \
-         case \"$generation\" in ''|*[!0-9a-fA-F]*) generation='' ;; esac; \
-         rm -f '{worker_ready}'; \
-         receipt_tmp='{receipt}.{activation_token}.'$$; \
-         printf '%s\\n' '{activation_token}' > \"$receipt_tmp\"; \
-         if ! ln \"$receipt_tmp\" '{receipt}' 2>/dev/null; then \
-           rm -f \"$receipt_tmp\"; \
-           [ \"$(cat '{receipt}' 2>/dev/null)\" = '{activation_token}' ] || exit 42; \
-         else rm -f \"$receipt_tmp\"; fi; \
-         {ensure_env_parent}; umask 077; \
-         env_tmp='{env_path}.{activation_token}.'$$; \
-         release_tmp='{release}.{activation_token}.'$$; \
-         trap 'rm -f \"$env_tmp\" \"$release_tmp\"' EXIT; \
-         cat > \"$env_tmp\"; mv \"$env_tmp\" '{env_path}'; \
-         {branch_env_install}if [ \"${{#generation}}\" -eq 32 ]; then \
-           printf '%s%s\\n' '{release_prefix}' \"$generation\" > \"$release_tmp\"; \
-         else printf '%s\\n' '{legacy_release}' > \"$release_tmp\"; fi; \
-         mv \"$release_tmp\" '{release}'",
-        // Only an agent without the typed protocol runs this script, and its
-        // worker-ready helper parses plain lines from this file.
-        branch_env_install =
-            branch_env_install_fragment(branch_env_path, env, BranchEnvForm::Dotenv),
-        generation_prefix = smolvm_protocol::forkpoint::GENERATION_PREFIX,
-        legacy_release = smolvm_protocol::forkpoint::LEGACY_RELEASE_TOKEN,
-        release_prefix = smolvm_protocol::forkpoint::RELEASE_PREFIX,
-    )
 }
 
 /// Fail-closed fork finalizer. A clone whose identity could not be rejuvenated
@@ -3829,54 +3382,6 @@ mod tests {
     }
 
     #[test]
-    fn forkpoint_release_waits_for_clone_acknowledgement() {
-        let script = build_release_forkpoint_script();
-        let publish = script
-            .find(smolvm_protocol::forkpoint::RELEASE_PATH)
-            .expect("release marker must be published");
-        let acknowledge = script
-            .rfind(smolvm_protocol::forkpoint::READY_PATH)
-            .expect("ready marker must be observed");
-        assert!(publish < acknowledge);
-        assert!(script.contains("exit 46"));
-    }
-
-    #[test]
-    fn forkpoint_arm_is_generation_scoped_and_waits_for_acknowledgement() {
-        let script = build_arm_forkpoint_script();
-        let ready = script
-            .find(smolvm_protocol::forkpoint::READY_PATH)
-            .expect("ready marker must be read");
-        let publish = script
-            .find(smolvm_protocol::forkpoint::ARM_PATH)
-            .expect("arm marker must be published");
-        let acknowledge = script
-            .rfind(smolvm_protocol::forkpoint::ARMED_PATH)
-            .expect("armed marker must be observed");
-
-        assert!(ready < publish);
-        assert!(publish < acknowledge);
-        assert!(script.contains(smolvm_protocol::forkpoint::GENERATION_PREFIX));
-        assert!(script.contains(smolvm_protocol::forkpoint::ARM_PREFIX));
-        assert!(script.contains(smolvm_protocol::forkpoint::ARMED_PREFIX));
-        assert!(script.contains("exit 47"));
-    }
-
-    #[test]
-    fn forkpoint_park_disarms_before_waiting_for_idle_acknowledgement() {
-        let script = build_park_forkpoint_script();
-        let disarm = script
-            .find(smolvm_protocol::forkpoint::ARM_PATH)
-            .expect("arm marker must be removed");
-        let idle_ack = script
-            .rfind(smolvm_protocol::forkpoint::ARMED_PATH)
-            .expect("armed marker removal must be observed");
-
-        assert!(disarm < idle_ack);
-        assert!(script.contains("exit 47"));
-    }
-
-    #[test]
     fn golden_rollback_reapplies_a_completed_checkpoint_only() {
         let temp = tempfile::tempdir().unwrap();
         assert_eq!(golden_resume_command(temp.path()).unwrap(), "RESUME");
@@ -4178,13 +3683,7 @@ mod tests {
         );
         assert_eq!(render_branch_env(&[]), "");
         // The install fragment embeds it in a quoted heredoc and moves it into place atomically.
-        let frag =
-            branch_env_install_fragment("/etc/smolvm/branch-env", &env, BranchEnvForm::Sourceable);
-        // An older agent's readiness helper reads plain lines, so it gets them.
-        assert!(
-            branch_env_install_fragment("/etc/smolvm/branch-env", &env, BranchEnvForm::Dotenv)
-                .contains("\nNOTE=a=b c\n")
-        );
+        let frag = branch_env_install_fragment("/etc/smolvm/branch-env", &env);
         // `&& mv` on the heredoc line, body after it, delimiter last: the
         // rename is conditional on the write, and a caller's `&&` chain holds.
         assert!(frag.starts_with(
@@ -4198,11 +3697,7 @@ mod tests {
         let ok = std::process::Command::new("/bin/sh")
             .args([
                 "-c",
-                &branch_env_install_fragment(
-                    target.to_str().unwrap(),
-                    &env,
-                    BranchEnvForm::Sourceable,
-                ),
+                &branch_env_install_fragment(target.to_str().unwrap(), &env),
             ])
             .status()
             .unwrap();
@@ -4237,211 +3732,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn run_activation_script(script: &str, stdin: &str) -> std::process::Output {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", script])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn activation script");
-        child
-            .stdin
-            .take()
-            .expect("activation stdin")
-            .write_all(stdin.as_bytes())
-            .expect("write activation input");
-        child
-            .wait_with_output()
-            .expect("wait for activation script")
-    }
-
     #[cfg(unix)]
-    #[test]
-    fn held_fork_activation_is_idempotent_after_an_ambiguous_reply() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = temp.path().join("state");
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(&state).unwrap();
-        let generation = "0123456789abcdef0123456789abcdef";
-        std::fs::write(
-            state.join("ready"),
-            format!(
-                "{}\n{}{generation}\n",
-                smolvm_protocol::forkpoint::READY_VERSION,
-                smolvm_protocol::forkpoint::GENERATION_PREFIX
-            ),
-        )
-        .unwrap();
-        let ready = state.join("ready");
-        let release = state.join("release");
-        let worker_ready = state.join("worker-ready");
-        let receipt = state.join("activation");
-        let env_path = workspace.join("fork-env");
-        let branch_env_path = workspace.join("branch-env");
-        let ensure_parent = format!("mkdir -p '{}'", workspace.display());
-        let token = "0123456789abcdef";
-        std::fs::write(&worker_ready, b"stale\n").unwrap();
-        let script = build_activation_script(
-            ActivationScriptPaths {
-                ready: ready.to_str().unwrap(),
-                release: release.to_str().unwrap(),
-                worker_ready: worker_ready.to_str().unwrap(),
-                receipt: receipt.to_str().unwrap(),
-                env: env_path.to_str().unwrap(),
-                branch_env: branch_env_path.to_str().unwrap(),
-            },
-            &ensure_parent,
-            token,
-            &[("LR".to_string(), "1e-4".to_string())],
-        );
-
-        let first = run_activation_script(&script, "LR=1e-4\n");
-        assert!(
-            first.status.success(),
-            "{}",
-            String::from_utf8_lossy(&first.stderr)
-        );
-        assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=1e-4\n");
-        // The script path serves older agents, whose readiness helper reads
-        // plain lines from branch-env.
-        assert_eq!(
-            std::fs::read_to_string(&branch_env_path).unwrap(),
-            "LR=1e-4\n"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-        assert_eq!(
-            std::fs::read_to_string(&receipt).unwrap(),
-            format!("{token}\n")
-        );
-        assert_eq!(
-            std::fs::read_to_string(&release).unwrap(),
-            format!(
-                "{}{generation}\n",
-                smolvm_protocol::forkpoint::RELEASE_PREFIX
-            )
-        );
-        assert!(!worker_ready.exists());
-
-        // A lost reply may cause the host to send the same activation again.
-        // The receipt proves ownership and makes that retry a successful no-op.
-        let retry = run_activation_script(&script, "LR=changed\n");
-        assert!(retry.status.success());
-        assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=1e-4\n");
-
-        let other = build_activation_script(
-            ActivationScriptPaths {
-                ready: ready.to_str().unwrap(),
-                release: release.to_str().unwrap(),
-                worker_ready: worker_ready.to_str().unwrap(),
-                receipt: receipt.to_str().unwrap(),
-                env: env_path.to_str().unwrap(),
-                branch_env: branch_env_path.to_str().unwrap(),
-            },
-            &ensure_parent,
-            "fedcba9876543210",
-            &[],
-        );
-        assert_eq!(
-            run_activation_script(&other, "LR=other\n").status.code(),
-            Some(42)
-        );
-    }
-
     #[cfg(unix)]
-    #[test]
-    fn held_fork_activation_retry_finishes_a_partial_commit() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = temp.path().join("state");
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(state.join("ready"), b"ready\n").unwrap();
-        let ready = state.join("ready");
-        let release = state.join("release");
-        let worker_ready = state.join("worker-ready");
-        let receipt = state.join("activation");
-        let env_path = workspace.join("fork-env");
-        let branch_env_path = workspace.join("branch-env");
-        let ensure_parent = format!("mkdir -p '{}'", workspace.display());
-        let token = "0123456789abcdef";
-        std::fs::write(&receipt, format!("{token}\n")).unwrap();
-        let script = build_activation_script(
-            ActivationScriptPaths {
-                ready: ready.to_str().unwrap(),
-                release: release.to_str().unwrap(),
-                worker_ready: worker_ready.to_str().unwrap(),
-                receipt: receipt.to_str().unwrap(),
-                env: env_path.to_str().unwrap(),
-                branch_env: branch_env_path.to_str().unwrap(),
-            },
-            &ensure_parent,
-            token,
-            &[("LR".to_string(), "3e-4".to_string())],
-        );
-
-        let retry = run_activation_script(&script, "LR=3e-4\n");
-        assert!(
-            retry.status.success(),
-            "{}",
-            String::from_utf8_lossy(&retry.stderr)
-        );
-        assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=3e-4\n");
-        assert_eq!(
-            std::fs::read_to_string(&branch_env_path).unwrap(),
-            "LR=3e-4\n"
-        );
-        assert!(release.is_file());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn worker_ready_wait_requires_the_exact_token_and_has_a_bounded_timeout() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker = temp.path().join("worker-ready");
-        let script = build_worker_ready_wait_script(marker.to_str().unwrap());
-        let expected = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-        std::fs::write(&marker, format!("{expected}\n")).unwrap();
-        let success = std::process::Command::new("/bin/sh")
-            .args(["-c", &script, "wait", expected, "1"])
-            .output()
-            .unwrap();
-        assert!(success.status.success());
-
-        std::fs::write(&marker, format!("{}\n", "f".repeat(64))).unwrap();
-        let stale = std::process::Command::new("/bin/sh")
-            .args(["-c", &script, "wait", expected, "1"])
-            .output()
-            .unwrap();
-        assert_eq!(stale.status.code(), Some(45));
-
-        std::fs::remove_file(marker).unwrap();
-        let timeout = std::process::Command::new("/bin/sh")
-            .args(["-c", &script, "wait", expected, "1"])
-            .output()
-            .unwrap();
-        assert_eq!(timeout.status.code(), Some(44));
-        assert!(!script.contains(expected));
-    }
-
-    #[test]
-    fn worker_ready_transport_deadline_allows_poll_loop_overhead() {
-        assert_eq!(
-            worker_ready_command_timeout(Duration::from_secs(120)).unwrap(),
-            Duration::from_secs(150)
-        );
-    }
-
     #[test]
     fn successful_activation_is_persisted_as_one_shot() {
         let mut record = VmRecord::new("slot-0".to_string(), 2, 1024, vec![], vec![], false);

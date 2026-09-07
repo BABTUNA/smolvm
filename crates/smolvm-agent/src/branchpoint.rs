@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use smolvm_protocol::forkpoint::{
-    typed_error, ARMED_PREFIX, ARM_PREFIX, GENERATION_PREFIX, LEGACY_RELEASE_TOKEN, RELEASE_PREFIX,
+    typed_error, ARMED_PREFIX, ARM_PREFIX, GENERATION_PREFIX, RELEASE_PREFIX,
 };
 
 /// A failed step, carrying the protocol error code the host handles on.
@@ -109,11 +109,9 @@ fn settled(markers: &Markers, window: Duration, condition: impl FnMut() -> bool)
     crate::dirwatch::wait_until(&markers.state_dir, window, condition)
 }
 
-/// The generation recorded in a ready marker: the first `generation=` line.
-/// `Ok(None)` when the marker carries none or it is not 32 hex digits, which
-/// is the legacy helper's marker and is handled by each caller as the script
-/// did.
-fn generation_of(ready: &Path) -> Result<Option<String>, TypedError> {
+/// The generation recorded in a ready marker: its `generation=` line, 32 hex
+/// digits. A marker without one is not a branchpoint this protocol can drive.
+fn generation_of(ready: &Path) -> Result<String, TypedError> {
     let contents = match std::fs::read_to_string(ready) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -130,10 +128,15 @@ fn generation_of(ready: &Path) -> Result<Option<String>, TypedError> {
         .find_map(|line| line.strip_prefix(GENERATION_PREFIX))
         .unwrap_or("");
     let valid = generation.len() == 32 && generation.bytes().all(|b| b.is_ascii_hexdigit());
-    Ok(valid.then(|| generation.to_string()))
+    if !valid {
+        return Err(TypedError::new(
+            typed_error::BAD_GENERATION,
+            "the ready marker carries no usable generation; the helper and agent disagree",
+        ));
+    }
+    Ok(generation.to_string())
 }
 
-/// Write `contents` to `path` atomically via a sibling temp file.
 fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<(), TypedError> {
     let tmp = path.with_extension("tmp");
     write_private(&tmp, contents, mode)?;
@@ -197,12 +200,7 @@ pub fn wait_ready(markers: &Markers, timeout: Duration) -> Result<String, TypedE
 
 /// Put a negotiated helper into its restore-safe loop before capture.
 pub fn arm(markers: &Markers) -> Result<(), TypedError> {
-    let generation = generation_of(&markers.ready)?.ok_or_else(|| {
-        TypedError::new(
-            typed_error::BAD_GENERATION,
-            "the ready marker carries no usable generation; the helper predates arming",
-        )
-    })?;
+    let generation = generation_of(&markers.ready)?;
     let _ = std::fs::remove_file(&markers.arm);
     if !settled(markers, ACK_WINDOW, || !markers.armed.exists()) {
         return Err(TypedError::new(
@@ -245,22 +243,20 @@ pub fn park(markers: &Markers) -> Result<(), TypedError> {
 pub fn release(markers: &Markers, env_dotenv: Option<&str>) -> Result<(), TypedError> {
     std::fs::create_dir_all(&markers.state_dir)
         .map_err(|error| TypedError::io("create state dir", error))?;
-    let generation = match std::fs::metadata(&markers.ready) {
-        Ok(_) => generation_of(&markers.ready)?,
-        Err(_) => None,
-    };
-    let marker = release_marker(generation.as_deref(), env_dotenv.unwrap_or(""));
+    // No ready marker means no parked helper: a checkpoint taken away from
+    // any branchpoint has nothing to release, and that is not an error.
+    if !markers.ready.exists() {
+        return Ok(());
+    }
+    let generation = generation_of(&markers.ready)?;
+    let marker = release_marker(&generation, env_dotenv.unwrap_or(""));
     write_atomic(&markers.release, &marker, 0o600)?;
-    // The helper acknowledges by dropping its generation line (or the whole
-    // marker, for a legacy helper).
-    let acknowledged = settled(markers, RELEASE_WINDOW, || match &generation {
-        Some(generation) => {
-            let line = format!("{GENERATION_PREFIX}{generation}");
-            !std::fs::read_to_string(&markers.ready)
-                .map(|c| c.lines().any(|l| l == line))
-                .unwrap_or(false)
-        }
-        None => !markers.ready.exists(),
+    // The helper acknowledges by dropping its generation line.
+    let line = format!("{GENERATION_PREFIX}{generation}");
+    let acknowledged = settled(markers, RELEASE_WINDOW, || {
+        !std::fs::read_to_string(&markers.ready)
+            .map(|c| c.lines().any(|l| l == line))
+            .unwrap_or(false)
     });
     if !acknowledged {
         return Err(TypedError::new(
@@ -339,7 +335,7 @@ pub fn activate(
     write_atomic(branch_env_path, env_sourceable, 0o600)?;
     write_atomic(
         &markers.release,
-        &release_marker(generation.as_deref(), env_dotenv),
+        &release_marker(&generation, env_dotenv),
         0o600,
     )?;
     Ok(Activation::Done)
@@ -348,12 +344,8 @@ pub fn activate(
 /// The release marker: the token line, then the identity as dotenv lines.
 /// One atomic rename hands the helper both, so it never has to order this
 /// file against the env files in the clone's root.
-fn release_marker(generation: Option<&str>, env_dotenv: &str) -> String {
-    let token = match generation {
-        Some(generation) => format!("{RELEASE_PREFIX}{generation}"),
-        None => LEGACY_RELEASE_TOKEN.to_string(),
-    };
-    let mut marker = format!("{token}\n");
+fn release_marker(generation: &str, env_dotenv: &str) -> String {
+    let mut marker = format!("{RELEASE_PREFIX}{generation}\n");
     for line in env_dotenv.lines().filter(|line| line.contains('=')) {
         marker.push_str(line);
         marker.push('\n');
@@ -488,19 +480,18 @@ mod tests {
         )
         .unwrap();
         helper.join().unwrap();
-        // A legacy helper (no generation) gets the legacy token and acks by removing ready.
+        // A ready marker without a generation is a protocol mismatch, not a
+        // case to accommodate.
         std::fs::write(&markers.ready, "ready\n").unwrap();
-        let ready = markers.ready.clone();
-        let helper = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(30));
-            std::fs::remove_file(&ready).unwrap();
-        });
-        release(&markers, None).unwrap();
-        helper.join().unwrap();
         assert_eq!(
-            std::fs::read_to_string(&markers.release).unwrap(),
-            format!("{LEGACY_RELEASE_TOKEN}\n")
+            release(&markers, None).unwrap_err().code,
+            typed_error::BAD_GENERATION
         );
+        // No ready marker at all: nothing is parked, so there is nothing to do.
+        std::fs::remove_file(&markers.ready).unwrap();
+        let _ = std::fs::remove_file(&markers.release);
+        release(&markers, None).unwrap();
+        assert!(!markers.release.exists());
     }
 
     #[test]

@@ -16,18 +16,10 @@ pub const GENERATION_PREFIX: &str = "generation=";
 /// Optional readiness-marker capability requesting eager clone module loading.
 pub const CUDA_PRELOAD_MODULES_HINT: &str = "cuda-preload-modules";
 
-/// Agent capability required by readiness-gated fork-pool leases.
-pub const WORKER_READY_CAPABILITY: &str = "fork-worker-ready-v1";
-
-/// Agent capability for parking an idle branchpoint until the host arms it.
-pub const ARMING_CAPABILITY: &str = "branchpoint-arming-v1";
-
-/// Agent capability: the branchpoint handshake is driven by typed requests
-/// (`AgentRequest::Branchpoint*`) the agent executes natively, instead of shell
-/// scripts the host builds and runs through `VmExec`. Same marker files and
-/// generation rules on the guest, so a helper of either vintage keeps working;
-/// what changes is that the protocol lives in one typed schema rather than in
-/// `sed` patterns mirrored across three languages.
+/// The agent capability the branch protocol requires: the branchpoint
+/// handshake is driven by typed requests (`AgentRequest::Branchpoint*`) the
+/// agent executes natively. A host refuses to branch a machine whose agent
+/// does not advertise it, rather than degrading to an older mechanism.
 pub const TYPED_BRANCHPOINT_CAPABILITY: &str = "branchpoint-typed-v1";
 
 /// Error codes the agent returns for typed branchpoint requests, mirroring the
@@ -73,12 +65,8 @@ pub const RESTORED_CONTAINER_PATH: &str = "/run/smolvm/forkpoint/restored-contai
 /// agent appends the clone's identity as `KEY=VALUE` lines, so the helper
 /// receives the go-ahead and the identity in one atomic rename and never has
 /// to order this file against [`FORK_ENV_PATH`]; a marker with no such lines
-/// (written by an older host's script) sends the helper to that file instead.
+/// is a clone with no parameters, such as a plain single branch.
 pub const RELEASE_PATH: &str = "/run/smolvm/forkpoint/release";
-
-/// Release token used before generation-addressed forkpoints. Accepting it in
-/// newer guests keeps independently-updated host and agent packages compatible.
-pub const LEGACY_RELEASE_TOKEN: &str = "smolvm-forkpoint-release-v1";
 
 /// Prefix of a generation-addressed release marker.
 pub const RELEASE_PREFIX: &str = "smolvm-forkpoint-release-v2:";

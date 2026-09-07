@@ -2319,12 +2319,8 @@ fn handle_request(
 
     match request {
         AgentRequest::Ping => {
-            let mut capabilities =
-                vec![smolvm_protocol::forkpoint::WORKER_READY_CAPABILITY.to_string()];
-            if forkpoint::arming_enabled() {
-                capabilities.push(smolvm_protocol::forkpoint::ARMING_CAPABILITY.to_string());
-            }
-            capabilities.push(smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string());
+            let capabilities =
+                vec![smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string()];
             AgentResponse::Pong {
                 version: PROTOCOL_VERSION,
                 capabilities,

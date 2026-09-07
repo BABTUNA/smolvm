@@ -14,22 +14,13 @@ const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
 use smolvm_protocol::forkpoint::{
     ARMED_PATH, ARMED_PREFIX, ARM_PATH, ARM_PREFIX, BRANCH_ENV_PATH, BRANCH_HELPER_PATH,
     CONTAINER_INIT_ARG, CONTAINER_INIT_NAME, CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH,
-    GENERATION_PREFIX, HELPER_PATH, LEGACY_RELEASE_TOKEN, READY_PATH, READY_VERSION, RELEASE_PATH,
-    RELEASE_PREFIX, RESTORED_CONTAINER_PATH, RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH,
-    WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
+    GENERATION_PREFIX, HELPER_PATH, READY_PATH, READY_VERSION, RELEASE_PATH, RELEASE_PREFIX,
+    RESTORED_CONTAINER_PATH, RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH, WORKER_READY_PATH,
+    WORKER_READY_TOKEN_ENV,
 };
 
 fn enabled() -> bool {
     std::env::var(smolvm_protocol::guest_env::FORKABLE).as_deref()
-        == Ok(smolvm_protocol::guest_env::VALUE_ON)
-}
-
-/// Whether the paired host supports parking and arming an idle branchpoint.
-///
-/// This is negotiated by the host at boot. A new guest launched by an older
-/// host leaves it unset and retains the legacy always-spinning behavior.
-pub fn arming_enabled() -> bool {
-    std::env::var(smolvm_protocol::guest_env::BRANCHPOINT_ARMING).as_deref()
         == Ok(smolvm_protocol::guest_env::VALUE_ON)
 }
 
@@ -92,25 +83,24 @@ pub fn setup() {
 /// Expose the forkpoint helper and its VM-private state directory inside a
 /// workload container. No-op for ordinary machines.
 pub fn inject_into_container(spec: &mut crate::oci::OciSpec) {
-    inject_into_container_if(spec, enabled(), arming_enabled(), AGENT_BINARY, STATE_DIR);
+    inject_into_container_if(spec, enabled(), AGENT_BINARY, STATE_DIR);
 }
 
-/// Keep a `crun exec` process on the same negotiated arming protocol as the
-/// container it joins.
+/// Keep a `crun exec` process on the same footing as the container it joins.
 ///
 /// `crun exec --env` builds a fresh process environment instead of inheriting
 /// the container spec. Without restoring this internal variable, a
-/// `smolvm-branch-ready` helper launched through `machine exec` falls back to
-/// the legacy spin loop while the host waits for an arming acknowledgement.
+/// `smolvm-branch-ready` helper launched through `machine exec` could not tell
+/// that the machine is branchable.
 pub fn augment_exec_env(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
-    augment_exec_env_if(&mut env, arming_enabled());
+    augment_exec_env_if(&mut env, enabled());
     env
 }
 
-fn augment_exec_env_if(env: &mut Vec<(String, String)>, armable: bool) {
-    let key = smolvm_protocol::guest_env::BRANCHPOINT_ARMING;
+fn augment_exec_env_if(env: &mut Vec<(String, String)>, branchable: bool) {
+    let key = smolvm_protocol::guest_env::FORKABLE;
     env.retain(|(existing, _)| existing != key);
-    if armable {
+    if branchable {
         env.push((
             key.to_string(),
             smolvm_protocol::guest_env::VALUE_ON.to_string(),
@@ -121,7 +111,6 @@ fn augment_exec_env_if(env: &mut Vec<(String, String)>, armable: bool) {
 fn inject_into_container_if(
     spec: &mut crate::oci::OciSpec,
     enabled: bool,
-    armable: bool,
     agent_binary: &str,
     state_dir: &str,
 ) {
@@ -132,12 +121,10 @@ fn inject_into_container_if(
     spec.add_bind_mount(agent_binary, BRANCH_HELPER_PATH, true);
     spec.add_bind_mount(agent_binary, WORKER_READY_HELPER_PATH, true);
     spec.add_bind_mount(state_dir, STATE_DIR, false);
-    if armable {
-        spec.add_env(
-            smolvm_protocol::guest_env::BRANCHPOINT_ARMING,
-            smolvm_protocol::guest_env::VALUE_ON,
-        );
-    }
+    spec.add_env(
+        smolvm_protocol::guest_env::FORKABLE,
+        smolvm_protocol::guest_env::VALUE_ON,
+    );
 }
 
 /// Reap exited children while parked, when the helper is the container's
@@ -172,7 +159,7 @@ pub fn run_helper() -> i32 {
     // Released. The helper is the one mechanism in both directions: the
     // workload declared the branchpoint by running it, and it hands the
     // child's identity back the same way — as this command's result.
-    let identity = load_identity(Path::new(RELEASE_PATH), Path::new(FORK_ENV_PATH));
+    let identity = load_identity(Path::new(RELEASE_PATH));
     if let Some(command) = command {
         // `smolvm-branch-ready -- prog args…`: become the child's program, with
         // its identity in the environment. If the helper was `exec`'d as PID 1,
@@ -247,18 +234,11 @@ fn parse_helper_args<I: Iterator<Item = std::ffi::OsString>>(
 /// (`KEY=VALUE`, one per line, values never contain newlines). Absent for a
 /// source or a single branch, which carry no per-child parameters.
 /// The child's identity: the `KEY=VALUE` lines the release marker carries,
-/// delivered in the same atomic rename as the go-ahead. A marker with none
-/// (an older host's script) points at the dotenv file instead; no file is
-/// simply no identity.
-fn load_identity(release_path: &Path, env_path: &Path) -> Vec<(String, String)> {
-    let from_marker = std::fs::read_to_string(release_path)
+/// delivered in the same atomic rename as the go-ahead. A clone released with
+/// no parameters (a plain single branch) has none.
+fn load_identity(release_path: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(release_path)
         .map(|marker| parse_dotenv(marker.lines().skip(1)))
-        .unwrap_or_default();
-    if !from_marker.is_empty() {
-        return from_marker;
-    }
-    std::fs::read_to_string(env_path)
-        .map(|contents| parse_dotenv(contents.lines()))
         .unwrap_or_default()
 }
 
@@ -284,6 +264,12 @@ fn render_identity_exports(identity: &[(String, String)]) -> String {
 }
 
 fn run_helper_inner(preload_modules: bool) -> Result<(), String> {
+    if !enabled() {
+        return Err(
+            "this machine is not branchable; start it with `smolvm machine start --branchable`"
+                .to_string(),
+        );
+    }
     run_helper_at(
         ForkpointPaths {
             state_dir: Path::new(STATE_DIR),
@@ -295,7 +281,6 @@ fn run_helper_inner(preload_modules: bool) -> Result<(), String> {
         },
         Duration::from_millis(20),
         preload_modules,
-        arming_enabled(),
     )
 }
 
@@ -312,7 +297,6 @@ fn run_helper_at(
     paths: ForkpointPaths<'_>,
     poll_interval: Duration,
     preload_modules: bool,
-    use_arming: bool,
 ) -> Result<(), String> {
     let ForkpointPaths {
         state_dir,
@@ -348,57 +332,42 @@ fn run_helper_at(
     eprintln!("smolvm branch point ready; waiting for child release");
     let _ = std::io::stdout().flush();
 
-    let mut watcher = use_arming
-        .then(|| crate::dirwatch::DirWatcher::new(state_dir).ok())
-        .flatten();
+    let mut watcher = crate::dirwatch::DirWatcher::new(state_dir).ok();
 
-    // A timed kernel wait captured in the snapshot is not reliably re-armed by
-    // every VMM restore path, so a host without the arming protocol gets the
-    // legacy userspace loop below. A paired host arms the source immediately
-    // before capture and parks it again afterwards. While parked the helper
-    // sleeps on directory events (bounded, so a PID-1 helper still reaps);
-    // while armed it sleeps on the same events with no time limit, which holds
-    // no kernel timer and so wakes correctly in the source and in every
-    // restored clone once its own state directory changes.
-    if use_arming {
-        while !restored_path.is_file() {
-            // Every wake reaps first — including the wake for the arm marker,
-            // so a job that exited while parked is collected before capture and
-            // never baked into a clone as a zombie.
-            reap_children_if_init();
-            if release_matches(release_path, &generation) {
-                acknowledge_generation(ready_path, &generation);
-                return Ok(());
-            }
-            if arm_matches(arm_path, &generation) {
-                publish_generation_marker(armed_path, ARMED_PREFIX, &generation)?;
-                while !restored_path.is_file() && arm_matches(arm_path, &generation) {
-                    if release_matches(release_path, &generation) {
-                        let _ = std::fs::remove_file(armed_path);
-                        acknowledge_generation(ready_path, &generation);
-                        return Ok(());
-                    }
-                    match watcher.as_ref().map(|w| w.wait(None)) {
-                        Some(Ok(_)) => {}
-                        Some(Err(_)) | None => {
-                            watcher = None;
-                            std::thread::yield_now();
-                        }
+    // The host arms the source immediately before capture and parks it again
+    // afterwards. While parked the helper sleeps on directory events
+    // (bounded, so a PID-1 helper still reaps); while armed it sleeps on the
+    // same events with no time limit, which holds no kernel timer and so wakes
+    // correctly in the source and in every restored clone once its own state
+    // directory changes.
+    while !restored_path.is_file() {
+        // Every wake reaps first — including the wake for the arm marker,
+        // so a job that exited while parked is collected before capture and
+        // never baked into a clone as a zombie.
+        reap_children_if_init();
+        if release_matches(release_path, &generation) {
+            acknowledge_generation(ready_path, &generation);
+            return Ok(());
+        }
+        if arm_matches(arm_path, &generation) {
+            publish_generation_marker(armed_path, ARMED_PREFIX, &generation)?;
+            while !restored_path.is_file() && arm_matches(arm_path, &generation) {
+                if release_matches(release_path, &generation) {
+                    let _ = std::fs::remove_file(armed_path);
+                    acknowledge_generation(ready_path, &generation);
+                    return Ok(());
+                }
+                match watcher.as_ref().map(|w| w.wait(None)) {
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => {
+                        watcher = None;
+                        std::thread::yield_now();
                     }
                 }
-                let _ = std::fs::remove_file(armed_path);
-            } else if !wait_for_change(&mut watcher, poll_interval) {
-                std::thread::sleep(poll_interval);
             }
-        }
-    } else {
-        while !restored_path.is_file() {
-            reap_children_if_init();
-            if release_matches(release_path, &generation) {
-                acknowledge_generation(ready_path, &generation);
-                return Ok(());
-            }
-            std::thread::yield_now();
+            let _ = std::fs::remove_file(armed_path);
+        } else if !wait_for_change(&mut watcher, poll_interval) {
+            std::thread::sleep(poll_interval);
         }
     }
 
@@ -531,7 +500,7 @@ fn ready_content(preload_modules: bool, generation: &str) -> String {
 fn release_matches(release_path: &Path, generation: &str) -> bool {
     std::fs::read_to_string(release_path).is_ok_and(|release| {
         let token = release.lines().next().unwrap_or("").trim();
-        token == format!("{RELEASE_PREFIX}{generation}") || token == LEGACY_RELEASE_TOKEN
+        token == format!("{RELEASE_PREFIX}{generation}")
     })
 }
 
@@ -615,7 +584,7 @@ mod tests {
     #[test]
     fn ordinary_container_does_not_receive_helper() {
         let mut spec = spec();
-        inject_into_container_if(&mut spec, false, false, "/missing-agent", "/missing-state");
+        inject_into_container_if(&mut spec, false, "/missing-agent", "/missing-state");
         assert!(spec
             .mounts
             .iter()
@@ -635,7 +604,6 @@ mod tests {
         let mut spec = spec();
         inject_into_container_if(
             &mut spec,
-            true,
             true,
             agent.to_str().unwrap(),
             state.to_str().unwrap(),
@@ -666,7 +634,7 @@ mod tests {
             .any(|option| option == "ro"));
         assert!(spec.process.env.contains(&format!(
             "{}={}",
-            smolvm_protocol::guest_env::BRANCHPOINT_ARMING,
+            smolvm_protocol::guest_env::FORKABLE,
             smolvm_protocol::guest_env::VALUE_ON
         )));
         let state_mount = spec
@@ -679,34 +647,8 @@ mod tests {
     }
 
     #[test]
-    fn older_host_does_not_enable_arming_in_a_new_container() {
-        let temp = tempfile::tempdir().unwrap();
-        let agent = temp.path().join("smolvm-agent");
-        let state = temp.path().join("forkpoint");
-        std::fs::write(&agent, b"agent").unwrap();
-        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::create_dir(&state).unwrap();
-        let mut spec = spec();
-
-        inject_into_container_if(
-            &mut spec,
-            true,
-            false,
-            agent.to_str().unwrap(),
-            state.to_str().unwrap(),
-        );
-
-        let prefix = format!("{}=", smolvm_protocol::guest_env::BRANCHPOINT_ARMING);
-        assert!(spec
-            .process
-            .env
-            .iter()
-            .all(|entry| !entry.starts_with(&prefix)));
-    }
-
-    #[test]
-    fn exec_env_matches_the_negotiated_arming_protocol() {
-        let key = smolvm_protocol::guest_env::BRANCHPOINT_ARMING;
+    fn exec_env_carries_the_branchable_flag_exactly_once() {
+        let key = smolvm_protocol::guest_env::FORKABLE;
         let mut env = vec![
             ("USER_VALUE".to_string(), "kept".to_string()),
             (key.to_string(), "stale".to_string()),
@@ -753,7 +695,6 @@ mod tests {
                 },
                 Duration::from_millis(1),
                 false,
-                false,
             )
         });
         wait_for_marker(&ready);
@@ -796,7 +737,6 @@ mod tests {
                 },
                 Duration::from_secs(60),
                 false,
-                false,
             )
         });
         wait_for_marker(&ready);
@@ -836,7 +776,6 @@ mod tests {
                 },
                 Duration::from_millis(1),
                 false,
-                true,
             )
         });
         wait_for_marker(&ready);
@@ -913,14 +852,12 @@ mod tests {
     fn identity_loads_from_dotenv_and_renders_for_eval() {
         let temp = tempfile::tempdir().unwrap();
         let release = temp.path().join("release");
-        let env = temp.path().join("fork-env");
         std::fs::write(
             &release,
             format!("{RELEASE_PREFIX}abc\nSMOLVM_BRANCH_NAME=agent-3\nNOTE=a=b c\nQ=it's\n"),
         )
         .unwrap();
-        std::fs::write(&env, "SMOLVM_BRANCH_NAME=stale\n").unwrap();
-        let identity = load_identity(&release, &env);
+        let identity = load_identity(&release);
         assert_eq!(
             identity,
             vec![
@@ -933,14 +870,10 @@ mod tests {
             render_identity_exports(&identity),
             "export SMOLVM_BRANCH_NAME='agent-3'\nexport NOTE='a=b c'\nexport Q='it'\\''s'\n"
         );
-        // An older host's single-line marker: the file is the source.
-        std::fs::write(&release, format!("{LEGACY_RELEASE_TOKEN}\n")).unwrap();
-        assert_eq!(
-            load_identity(&release, &env),
-            vec![("SMOLVM_BRANCH_NAME".to_string(), "stale".to_string())]
-        );
-        let absent = temp.path().join("absent");
-        assert!(load_identity(&absent, &absent).is_empty());
+        // A marker with only its token line is a clone with no parameters.
+        std::fs::write(&release, format!("{RELEASE_PREFIX}abc\n")).unwrap();
+        assert!(load_identity(&release).is_empty());
+        assert!(load_identity(&temp.path().join("absent")).is_empty());
         assert_eq!(render_identity_exports(&[]), "");
     }
 
@@ -1004,15 +937,12 @@ mod tests {
     }
 
     #[test]
-    fn release_requires_its_generation_or_the_legacy_token() {
+    fn release_requires_its_generation() {
         let temp = tempfile::tempdir().unwrap();
         let release = temp.path().join("release");
         std::fs::write(&release, format!("{RELEASE_PREFIX}old\n")).unwrap();
         assert!(!release_matches(&release, "new"));
         assert!(release_matches(&release, "old"));
-
-        std::fs::write(&release, format!("{LEGACY_RELEASE_TOKEN}\n")).unwrap();
-        assert!(release_matches(&release, "new"));
 
         // Identity lines after the token do not disturb the match.
         std::fs::write(&release, format!("{RELEASE_PREFIX}new\nLR=3e-4\n")).unwrap();
