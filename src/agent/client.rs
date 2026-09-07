@@ -1518,10 +1518,13 @@ impl AgentClient {
         branchpoint_outcome(resp, |_| ())
     }
 
-    /// Release a restored clone and wait for its helper to acknowledge.
-    pub fn branchpoint_release(&mut self) -> Result<BranchpointOutcome<()>> {
+    /// Release a restored clone, handing it `env_dotenv` as its identity, and
+    /// wait for its helper to acknowledge.
+    pub fn branchpoint_release(&mut self, env_dotenv: &str) -> Result<BranchpointOutcome<()>> {
         let _timeout_guard = self.set_exec_timeout(Some(Duration::from_secs(20)))?;
-        let resp = self.request(&AgentRequest::BranchpointRelease)?;
+        let resp = self.request(&AgentRequest::BranchpointRelease {
+            env_dotenv: Some(env_dotenv.to_string()),
+        })?;
         branchpoint_outcome(resp, |_| ())
     }
 

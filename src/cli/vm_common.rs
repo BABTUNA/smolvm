@@ -906,7 +906,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     }
     if options.wait_ready.is_some() && !options.hold {
         if let Err(error) = smolvm::agent::fork::fail_closed_on_rejuvenation(
-            smolvm::agent::fork::release_forkpoint(clone),
+            smolvm::agent::fork::release_forkpoint(clone, options.fork_env),
             || teardown_fork_clone(&db, clone),
         ) {
             return retain_failed_fork(golden, &snapshot_dir, error);
@@ -1073,7 +1073,12 @@ pub fn fork_vm_batch(
 
     if first_error.is_none() && wait_ready.is_some() && !hold {
         if let Err(error) = run_bounded_clone_jobs(&all_names, width, |name| {
-            smolvm::agent::fork::release_forkpoint(name)
+            let env = clones
+                .iter()
+                .find(|(clone, _)| clone == name)
+                .map(|(_, env)| env.as_slice())
+                .unwrap_or(&[]);
+            smolvm::agent::fork::release_forkpoint(name, env)
         }) {
             first_error = Some(error);
         }
@@ -1088,13 +1093,23 @@ pub fn fork_vm_batch(
 
     if hold {
         eprintln!(
-            "Provisioned {} held branch slots from '{golden}' with one snapshot.",
-            all_names.len()
+            "Provisioned {} held branch {} from '{golden}' with one snapshot.",
+            all_names.len(),
+            if all_names.len() == 1 {
+                "slot"
+            } else {
+                "slots"
+            }
         );
     } else {
         eprintln!(
-            "Branched {} children from '{golden}' with one snapshot.",
-            all_names.len()
+            "Branched {} {} from '{golden}' with one snapshot.",
+            all_names.len(),
+            if all_names.len() == 1 {
+                "child"
+            } else {
+                "children"
+            }
         );
     }
     Ok(())

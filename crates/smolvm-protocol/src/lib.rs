@@ -385,8 +385,13 @@ pub enum AgentRequest {
     /// Return a parked source to its ordinary wait after capture.
     BranchpointPark,
     /// Release a restored clone: write the release marker for the generation
-    /// recorded in its ready marker and wait for the helper to acknowledge.
-    BranchpointRelease,
+    /// recorded in its ready marker, carrying the clone's identity, and wait
+    /// for the helper to acknowledge.
+    BranchpointRelease {
+        /// The clone's parameters in dotenv form, appended to the marker.
+        #[serde(default)]
+        env_dotenv: Option<String>,
+    },
     /// Assign and release a held clone in one idempotent step: claim it with
     /// `activation_token` (a retry with the same token completes a partial
     /// commit; a different token is refused), install the per-clone
@@ -733,7 +738,7 @@ impl AgentRequest {
             AgentRequest::BranchpointWait { .. } => "BranchpointWait".into(),
             AgentRequest::BranchpointArm => "BranchpointArm".into(),
             AgentRequest::BranchpointPark => "BranchpointPark".into(),
-            AgentRequest::BranchpointRelease => "BranchpointRelease".into(),
+            AgentRequest::BranchpointRelease { .. } => "BranchpointRelease".into(),
             AgentRequest::BranchpointActivate { .. } => "BranchpointActivate".into(),
             AgentRequest::BranchpointWaitWorkerReady { .. } => "BranchpointWaitWorkerReady".into(),
             AgentRequest::Run { image, .. } => format!("Run {{ image: {image} }}"),

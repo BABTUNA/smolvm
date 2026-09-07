@@ -84,6 +84,7 @@ fn boot_log(level: &str, msg: &str) {
 }
 mod branchpoint;
 mod cuda;
+mod dirwatch;
 mod disk_trim;
 mod dns_proxy;
 mod docker_bridge;
@@ -2366,9 +2367,9 @@ fn handle_request(
         AgentRequest::BranchpointPark => {
             branchpoint_outcome(branchpoint::park(&branchpoint::Markers::standard()))
         }
-        AgentRequest::BranchpointRelease => {
-            branchpoint_outcome(branchpoint::release(&branchpoint::Markers::standard()))
-        }
+        AgentRequest::BranchpointRelease { env_dotenv } => branchpoint_outcome(
+            branchpoint::release(&branchpoint::Markers::standard(), env_dotenv.as_deref()),
+        ),
         AgentRequest::BranchpointActivate {
             env_dotenv,
             env_sourceable,

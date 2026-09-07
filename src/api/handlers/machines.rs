@@ -2278,7 +2278,7 @@ async fn boot_prepared_fork_inner(
         let _ = cuda_worker_ready_timeout;
         if wait_ready && !hold {
             crate::agent::fork::fail_closed_on_rejuvenation(
-                crate::agent::fork::release_forkpoint(&clone_b),
+                crate::agent::fork::release_forkpoint(&clone_b, &fork_env),
                 teardown,
             )
             .map_err(|e| format!("forkpoint release failed: {e}"))?;

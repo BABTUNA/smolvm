@@ -10,7 +10,7 @@
 //! way the scripts were.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use smolvm_protocol::forkpoint::{
     typed_error, ARMED_PREFIX, ARM_PREFIX, GENERATION_PREFIX, LEGACY_RELEASE_TOKEN, RELEASE_PREFIX,
@@ -97,22 +97,16 @@ impl Markers {
     }
 }
 
-/// The scripts' acknowledgement window: 400 polls of 5 ms.
-const ACK_POLLS: u32 = 400;
-const ACK_INTERVAL: Duration = Duration::from_millis(5);
-/// The release script's window: 500 polls of 20 ms.
-const RELEASE_POLLS: u32 = 500;
-const RELEASE_INTERVAL: Duration = Duration::from_millis(20);
+/// How long the helper has to acknowledge an arm or park (the scripts allowed
+/// 400 polls of 5 ms).
+const ACK_WINDOW: Duration = Duration::from_secs(2);
+/// How long a restored clone has to acknowledge its release (500 polls of 20 ms).
+const RELEASE_WINDOW: Duration = Duration::from_secs(10);
 
-/// Poll `condition` up to `polls` times, `interval` apart; true if it held.
-fn poll(polls: u32, interval: Duration, mut condition: impl FnMut() -> bool) -> bool {
-    for _ in 0..polls {
-        if condition() {
-            return true;
-        }
-        std::thread::sleep(interval);
-    }
-    condition()
+/// Re-check `condition` after every change to the state directory until it
+/// holds or `window` elapses; true if it held.
+fn settled(markers: &Markers, window: Duration, condition: impl FnMut() -> bool) -> bool {
+    crate::dirwatch::wait_until(&markers.state_dir, window, condition)
 }
 
 /// The generation recorded in a ready marker: the first `generation=` line.
@@ -175,25 +169,30 @@ fn write_private(path: &Path, contents: &str, mode: u32) -> Result<(), TypedErro
 /// Wait until the workload declares its branchpoint; returns the ready
 /// marker's contents (its profile lines).
 pub fn wait_ready(markers: &Markers, timeout: Duration) -> Result<String, TypedError> {
-    let deadline = Instant::now() + timeout;
-    loop {
+    let mut outcome = None;
+    settled(markers, timeout, || {
         match std::fs::read_to_string(&markers.ready) {
-            Ok(contents) => return Ok(contents),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(TypedError::io("read ready marker", error)),
+            Ok(contents) => {
+                outcome = Some(Ok(contents));
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                outcome = Some(Err(TypedError::io("read ready marker", error)));
+                true
+            }
         }
-        if Instant::now() >= deadline {
-            return Err(TypedError::new(
-                typed_error::NOT_READY,
-                format!(
-                    "the workload did not reach a branchpoint within {:.1}s; it declares one by \
-                     running `smolvm-branch-ready` once its setup is done",
-                    timeout.as_secs_f64()
-                ),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    });
+    outcome.unwrap_or_else(|| {
+        Err(TypedError::new(
+            typed_error::NOT_READY,
+            format!(
+                "the workload did not reach a branchpoint within {:.1}s; it declares one by \
+                 running `smolvm-branch-ready` once its setup is done",
+                timeout.as_secs_f64()
+            ),
+        ))
+    })
 }
 
 /// Put a negotiated helper into its restore-safe loop before capture.
@@ -205,7 +204,7 @@ pub fn arm(markers: &Markers) -> Result<(), TypedError> {
         )
     })?;
     let _ = std::fs::remove_file(&markers.arm);
-    if !poll(ACK_POLLS, ACK_INTERVAL, || !markers.armed.exists()) {
+    if !settled(markers, ACK_WINDOW, || !markers.armed.exists()) {
         return Err(TypedError::new(
             typed_error::NO_ACK,
             "a previous arming was never cleared by the helper",
@@ -213,7 +212,7 @@ pub fn arm(markers: &Markers) -> Result<(), TypedError> {
     }
     write_atomic(&markers.arm, &format!("{ARM_PREFIX}{generation}\n"), 0o644)?;
     let expected = format!("{ARMED_PREFIX}{generation}");
-    let acknowledged = poll(ACK_POLLS, ACK_INTERVAL, || {
+    let acknowledged = settled(markers, ACK_WINDOW, || {
         std::fs::read_to_string(&markers.armed)
             .map(|c| c.lines().any(|line| line == expected))
             .unwrap_or(false)
@@ -230,7 +229,7 @@ pub fn arm(markers: &Markers) -> Result<(), TypedError> {
 /// Return a parked source to its ordinary wait after capture.
 pub fn park(markers: &Markers) -> Result<(), TypedError> {
     let _ = std::fs::remove_file(&markers.arm);
-    if !poll(ACK_POLLS, ACK_INTERVAL, || !markers.armed.exists()) {
+    if !settled(markers, ACK_WINDOW, || !markers.armed.exists()) {
         return Err(TypedError::new(
             typed_error::NO_ACK,
             "the helper did not leave its armed loop within the window",
@@ -243,21 +242,18 @@ pub fn park(markers: &Markers) -> Result<(), TypedError> {
 ///
 /// The state directory is private guest RAM, so this wakes only this clone
 /// even though every clone inherited the same blocked helper.
-pub fn release(markers: &Markers) -> Result<(), TypedError> {
+pub fn release(markers: &Markers, env_dotenv: Option<&str>) -> Result<(), TypedError> {
     std::fs::create_dir_all(&markers.state_dir)
         .map_err(|error| TypedError::io("create state dir", error))?;
     let generation = match std::fs::metadata(&markers.ready) {
         Ok(_) => generation_of(&markers.ready)?,
         Err(_) => None,
     };
-    let marker = match &generation {
-        Some(generation) => format!("{RELEASE_PREFIX}{generation}\n"),
-        None => format!("{LEGACY_RELEASE_TOKEN}\n"),
-    };
+    let marker = release_marker(generation.as_deref(), env_dotenv.unwrap_or(""));
     write_atomic(&markers.release, &marker, 0o600)?;
     // The helper acknowledges by dropping its generation line (or the whole
     // marker, for a legacy helper).
-    let acknowledged = poll(RELEASE_POLLS, RELEASE_INTERVAL, || match &generation {
+    let acknowledged = settled(markers, RELEASE_WINDOW, || match &generation {
         Some(generation) => {
             let line = format!("{GENERATION_PREFIX}{generation}");
             !std::fs::read_to_string(&markers.ready)
@@ -341,12 +337,28 @@ pub fn activate(
         .map_err(|error| TypedError::io("create env directory", error))?;
     write_atomic(env_path, env_dotenv, 0o600)?;
     write_atomic(branch_env_path, env_sourceable, 0o600)?;
-    let marker = match generation {
-        Some(generation) => format!("{RELEASE_PREFIX}{generation}\n"),
-        None => format!("{LEGACY_RELEASE_TOKEN}\n"),
-    };
-    write_atomic(&markers.release, &marker, 0o600)?;
+    write_atomic(
+        &markers.release,
+        &release_marker(generation.as_deref(), env_dotenv),
+        0o600,
+    )?;
     Ok(Activation::Done)
+}
+
+/// The release marker: the token line, then the identity as dotenv lines.
+/// One atomic rename hands the helper both, so it never has to order this
+/// file against the env files in the clone's root.
+fn release_marker(generation: Option<&str>, env_dotenv: &str) -> String {
+    let token = match generation {
+        Some(generation) => format!("{RELEASE_PREFIX}{generation}"),
+        None => LEGACY_RELEASE_TOKEN.to_string(),
+    };
+    let mut marker = format!("{token}\n");
+    for line in env_dotenv.lines().filter(|line| line.contains('=')) {
+        marker.push_str(line);
+        marker.push('\n');
+    }
+    marker
 }
 
 /// Wait until the released workload publishes `token` as worker-ready.
@@ -355,28 +367,24 @@ pub fn wait_worker_ready(
     token: &str,
     timeout: Duration,
 ) -> Result<(), TypedError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(contents) = std::fs::read_to_string(&markers.worker_ready) {
-            return if contents.trim_end_matches('\n') == token {
-                Ok(())
-            } else {
-                Err(TypedError::new(
-                    typed_error::TOKEN_MISMATCH,
-                    "the workload published a different worker-ready token",
-                ))
-            };
-        }
-        if Instant::now() >= deadline {
-            return Err(TypedError::new(
-                typed_error::NO_ACK,
-                format!(
-                    "the workload did not publish worker-ready within {:.1}s",
-                    timeout.as_secs_f64()
-                ),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    let mut published = None;
+    settled(markers, timeout, || {
+        published = std::fs::read_to_string(&markers.worker_ready).ok();
+        published.is_some()
+    });
+    match published {
+        Some(contents) if contents.trim_end_matches('\n') == token => Ok(()),
+        Some(_) => Err(TypedError::new(
+            typed_error::TOKEN_MISMATCH,
+            "the workload published a different worker-ready token",
+        )),
+        None => Err(TypedError::new(
+            typed_error::NO_ACK,
+            format!(
+                "the workload did not publish worker-ready within {:.1}s",
+                timeout.as_secs_f64()
+            ),
+        )),
     }
 }
 
@@ -464,14 +472,21 @@ mod tests {
         let helper = std::thread::spawn(move || {
             for _ in 0..500 {
                 if let Ok(c) = std::fs::read_to_string(&release_path) {
-                    assert_eq!(c, format!("{RELEASE_PREFIX}{GEN}\n"));
+                    assert_eq!(
+                        c,
+                        format!("{RELEASE_PREFIX}{GEN}\nLR=3e-4\nSMOLVM_BRANCH_NAME=w-0\n")
+                    );
                     std::fs::write(&ready, "smolvm-forkpoint-v1\n").unwrap(); // ack: drop the line
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
         });
-        release(&markers).unwrap();
+        release(
+            &markers,
+            Some("LR=3e-4\nnot a pair\nSMOLVM_BRANCH_NAME=w-0\n"),
+        )
+        .unwrap();
         helper.join().unwrap();
         // A legacy helper (no generation) gets the legacy token and acks by removing ready.
         std::fs::write(&markers.ready, "ready\n").unwrap();
@@ -480,7 +495,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(30));
             std::fs::remove_file(&ready).unwrap();
         });
-        release(&markers).unwrap();
+        release(&markers, None).unwrap();
         helper.join().unwrap();
         assert_eq!(
             std::fs::read_to_string(&markers.release).unwrap(),
@@ -516,7 +531,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&markers.release).unwrap(),
-            format!("{RELEASE_PREFIX}{GEN}\n")
+            format!("{RELEASE_PREFIX}{GEN}\nLR=3e-4\n")
         );
         assert!(!markers.worker_ready.exists());
         // Retry with the same token: already done, nothing rewritten.

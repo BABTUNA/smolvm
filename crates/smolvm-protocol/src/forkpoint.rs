@@ -68,6 +68,12 @@ pub const RESTORED_PATH: &str = "/run/smolvm/forkpoint/restored";
 pub const RESTORED_CONTAINER_PATH: &str = "/run/smolvm/forkpoint/restored-container";
 
 /// Marker written by the host after a clone is ready to resume.
+///
+/// Its first line is the release token (see [`RELEASE_PREFIX`]). A typed
+/// agent appends the clone's identity as `KEY=VALUE` lines, so the helper
+/// receives the go-ahead and the identity in one atomic rename and never has
+/// to order this file against [`FORK_ENV_PATH`]; a marker with no such lines
+/// (written by an older host's script) sends the helper to that file instead.
 pub const RELEASE_PATH: &str = "/run/smolvm/forkpoint/release";
 
 /// Release token used before generation-addressed forkpoints. Accepting it in

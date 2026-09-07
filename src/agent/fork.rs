@@ -1511,7 +1511,10 @@ fn build_release_forkpoint_script() -> String {
 /// release marker wakes only this clone even though every clone inherited the
 /// same blocked helper process. Success means the helper also acknowledged the
 /// marker and left the fork boundary; callers may safely vend the clone.
-pub fn release_forkpoint(clone: &str) -> Result<()> {
+/// Release a restored clone's parked helper. `env` is the clone's identity,
+/// the same parameters [`write_fork_env`] installed; a typed agent carries it
+/// inside the release marker so the helper receives both in one atomic step.
+pub fn release_forkpoint(clone: &str, env: &[(String, String)]) -> Result<()> {
     let socket = vm_data_dir(clone).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&socket)
         .map_err(|e| Error::agent("release forkpoint", format!("agent connect: {e}")))?;
@@ -1520,7 +1523,7 @@ pub fn release_forkpoint(clone: &str) -> Result<()> {
         .map_err(|e| Error::agent("release forkpoint", e.to_string()))?
     {
         return match client
-            .branchpoint_release()
+            .branchpoint_release(&render_fork_env(env))
             .map_err(|e| Error::agent("release forkpoint", e.to_string()))?
         {
             Ok(()) => Ok(()),

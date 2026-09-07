@@ -1714,7 +1714,7 @@ pub fn discard_transport_pack(vm_data_dir: &Path) -> Result<()> {
 /// workload instead of silently creating a second container.
 pub fn finalize_live_restore(name: &str, record: &VmRecord) -> Result<()> {
     crate::agent::fork::rejuvenate_clone(name, record)?;
-    crate::agent::fork::release_forkpoint(name)
+    crate::agent::fork::release_forkpoint(name, &record.fork_env)
 }
 
 /// Return the pending one-shot checkpoint directory for a machine, if any.
