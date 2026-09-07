@@ -337,19 +337,19 @@ pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
             "wait for forkpoint",
             format!(
                 "source '{golden}' did not reach a branchpoint within {}s: {f}\n\
-                 A batch branch snapshots the source at a point its workload declares by running \
+                 A batch branch checkpoints the source at a point its workload declares by running \
                  `smolvm-branch-ready` after setup (see README, \"Branch a running machine\"). \
                  If the workload never calls it, either add the call, raise --ready-timeout, or \
-                 take single `--name` branches, which snapshot the source wherever it is.",
+                 take single `--name` branches, which checkpoint the source wherever it is.",
                 timeout.as_secs_f64()
             ),
         )),
     }
 }
 
-/// Put a negotiated workload helper into its restore-safe userspace loop just
-/// before capture. A branchable machine without a helper remains a valid
-/// immediate snapshot source, and an older guest keeps its legacy loop.
+/// Put the workload's helper into its restore-safe wait just before capture.
+/// A branchable machine without a helper remains a valid immediate checkpoint
+/// source, reported as `Ok(false)`.
 fn arm_forkpoint_for_capture(golden: &str) -> Result<bool> {
     use smolvm_protocol::forkpoint::typed_error;
     let mut client = branch_client(golden, "arm branchpoint")?;
