@@ -2518,6 +2518,14 @@ mod tests {
     }
 
     #[test]
+    fn only_a_named_single_child_skips_the_batch_path() {
+        assert!(is_plain_branch(1, false, false));
+        assert!(!is_plain_branch(1, true, false));
+        assert!(!is_plain_branch(1, false, true));
+        assert!(!is_plain_branch(2, true, false));
+    }
+
+    #[test]
     fn indexed_fork_env_renders_each_clone() {
         let specs = vec![
             "TRIAL={index}".to_string(),
@@ -4001,7 +4009,9 @@ pub struct ForkCmd {
     #[arg(long, default_value = "1", value_name = "COUNT")]
     pub count: std::num::NonZeroU32,
 
-    /// Name batch children PREFIX-0 through PREFIX-(COUNT-1).
+    /// Name batch children PREFIX-0 through PREFIX-(COUNT-1). With a prefix (or
+    /// --hold) even a count of one is a batch: it waits for the boundary and
+    /// releases the child with its identity, unlike a plain --name branch.
     #[arg(long, value_name = "PREFIX")]
     pub name_prefix: Option<String>,
 
@@ -4107,7 +4117,7 @@ impl ForkCmd {
             ));
         }
 
-        if count == 1 {
+        if is_plain_branch(count, self.name_prefix.is_some(), self.hold) {
             let clone = match (self.clone, self.name_prefix) {
                 (Some(clone), None) => clone,
                 (None, Some(prefix)) => format!("{prefix}-0"),
@@ -4140,18 +4150,31 @@ impl ForkCmd {
             );
         }
 
-        if self.clone.is_some() {
+        if self.clone.is_some() && count > 1 {
             return Err(smolvm::Error::config(
                 "branch",
                 "--name cannot be used with --count greater than 1; use --name-prefix",
             ));
         }
-        let prefix = self.name_prefix.ok_or_else(|| {
-            smolvm::Error::config(
+        if self.clone.is_some() && self.name_prefix.is_some() {
+            return Err(smolvm::Error::config(
                 "branch",
-                "--name-prefix is required with --count greater than 1",
-            )
-        })?;
+                "use either --name or --name-prefix, not both",
+            ));
+        }
+        let (prefix, names): (String, Vec<String>) = match (self.clone, self.name_prefix) {
+            (Some(name), None) => (name.clone(), vec![name]),
+            (None, Some(prefix)) => {
+                let names = (0..count).map(|i| format!("{prefix}-{i}")).collect();
+                (prefix, names)
+            }
+            _ => {
+                return Err(smolvm::Error::config(
+                    "branch",
+                    "--name-prefix is required with --count greater than 1",
+                ));
+            }
+        };
         if self.forkable {
             return Err(smolvm::Error::config(
                 "branch",
@@ -4169,9 +4192,11 @@ impl ForkCmd {
             id: fork_batch_id(&self.golden, &prefix),
             size: count,
         });
-        let clones: Vec<_> = (0..count)
-            .map(|index| {
-                let name = format!("{prefix}-{index}");
+        let clones: Vec<_> = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let index = index as u32;
                 let env = render_indexed_fork_env(&self.env, index, &name, true, batch.as_ref());
                 (name, env)
             })
@@ -4206,6 +4231,14 @@ impl ForkReleaseCmd {
         let env = smolvm::util::parse_env_list(&self.env);
         vm_common::release_held_fork(&self.name, &env)
     }
+}
+
+/// One child by `--name` is a plain branch: the source is snapshotted wherever
+/// it is and the child keeps the parked helper. Anything with `--name-prefix`
+/// or `--hold` is a batch of that size, even one, so a pool of one slot gets
+/// the same boundary, identity and release as a pool of eight.
+fn is_plain_branch(count: u32, has_prefix: bool, hold: bool) -> bool {
+    count == 1 && !has_prefix && !hold
 }
 
 fn render_indexed_fork_env(
