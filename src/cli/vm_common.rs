@@ -783,7 +783,7 @@ pub(crate) fn print_create_success(params: &CreateVmParams) {
 pub struct ForkLaunch {
     /// Start as a fork base: memfd-back guest RAM and expose `control_socket`.
     pub forkable: bool,
-    /// Boot as a fork clone, restoring from the golden's snapshot at this dir.
+    /// Boot as a fork clone, restoring from the golden's checkpoint at this dir.
     pub snapshot_dir: Option<std::path::PathBuf>,
     /// Clone boot only: share the golden's loaded CUDA weights instead of
     /// copying them (`machine fork --share-weights`).
@@ -820,7 +820,7 @@ pub fn forkable_launch() -> ForkLaunch {
 /// Freezes the golden (it stays paused as the shared copy-on-write base — its
 /// guest RAM is mapped `MAP_PRIVATE` by clones, so it must not run again while
 /// clones exist), copy-on-write clones its disks, and boots the clone from the
-/// golden's in-memory snapshot.
+/// golden's in-memory checkpoint.
 pub struct ForkVmOptions<'a> {
     pub clone_forkable: bool,
     pub pinned_ports: &'a [(u16, u16)],
@@ -928,10 +928,10 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     Ok(())
 }
 
-/// Fork several indexed clones from one snapshot and boot them with bounded
+/// Fork several indexed clones from one checkpoint and boot them with bounded
 /// concurrency. All clone workloads remain at the forkpoint until every clone
 /// has booted, received a fresh identity, and received its per-clone env.
-/// How a batch of children is created from one snapshot.
+/// How a batch of children is created from one checkpoint.
 pub struct ForkBatchOptions<'a> {
     pub share_weights: bool,
     pub fork_secrets: &'a BTreeMap<String, SecretRef>,
@@ -1132,7 +1132,7 @@ pub fn fork_vm_batch(
 
     if hold {
         eprintln!(
-            "Provisioned {} held branch {} from '{golden}' with one snapshot.",
+            "Provisioned {} held branch {} from '{golden}' with one checkpoint.",
             all_names.len(),
             if all_names.len() == 1 {
                 "slot"
@@ -1142,7 +1142,7 @@ pub fn fork_vm_batch(
         );
     } else {
         eprintln!(
-            "Branched {} {} from '{golden}' with one snapshot.",
+            "Branched {} {} from '{golden}' with one checkpoint.",
             all_names.len(),
             if all_names.len() == 1 {
                 "child"
@@ -1240,7 +1240,7 @@ fn boot_prepared_fork(
 ) -> smolvm::Result<()> {
     let preload_modules = prep.clone_record.cuda_preload_modules;
     let clone_forkable = prep.clone_record.forkable;
-    eprintln!("Booting child '{clone}' from snapshot...");
+    eprintln!("Booting child '{clone}' from the checkpoint...");
     let mut start = || {
         start_vm_named_with_db(
             db,
@@ -1821,7 +1821,7 @@ fn start_vm_named_with_db(
             }
         } else {
             tracing::info!(
-                "clone booted from snapshot: workload container inherited from fork, skipping relaunch"
+                "clone booted from checkpoint: workload container inherited from fork, skipping relaunch"
             );
         }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
