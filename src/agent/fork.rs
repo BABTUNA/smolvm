@@ -347,9 +347,9 @@ pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
     }
 }
 
-/// Put a negotiated workload helper into its restore-safe userspace loop just
-/// before capture. A branchable machine without a helper remains a valid
-/// immediate snapshot source, and an older guest keeps its legacy loop.
+/// Put the workload's helper into its restore-safe wait just before capture.
+/// A branchable machine without a helper remains a valid immediate checkpoint
+/// source, reported as `Ok(false)`.
 fn arm_forkpoint_for_capture(golden: &str) -> Result<bool> {
     use smolvm_protocol::forkpoint::typed_error;
     let mut client = branch_client(golden, "arm branchpoint")?;
