@@ -3356,24 +3356,9 @@ impl CreateCmd {
             .name
             .unwrap_or_else(smolvm::util::generate_machine_name);
 
-        // Resolve a local image source (archive/dir) on the host now: stage it
-        // into the content-addressed cache and persist the resulting `local:…`
-        // reference, so `start` re-derives the mount dir without a registry
-        // pull. Registry refs pass through unchanged.
-        let image = match self.image.as_deref() {
-            Some(img) => {
-                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
-                Some(match resolve(classify(img))? {
-                    ResolvedImage::Registry(reference) => reference,
-                    ResolvedImage::Local { reference, .. } => reference,
-                })
-            }
-            None => None,
-        };
-
         let params = crate::cli::smolfile::build_create_params(
             name,
-            image,
+            self.image,
             None,         // entrypoint: from Smolfile only
             self.command, // persistent-workload command (detached container on start)
             self.cpus,
@@ -3395,6 +3380,22 @@ impl CreateCmd {
             smolvm::util::parse_labels(&self.labels)?,
         )?;
         let mut params = params;
+
+        // Resolve the image source on the host now, AFTER the CLI flag and the
+        // Smolfile have been merged, so both take the same path: a registry
+        // reference passes through; a local `docker save` archive or unpacked
+        // rootfs directory is staged into the content-addressed cache and the
+        // resulting `local:…` reference persisted, so `start` re-derives the
+        // mount without a registry pull. Resolving only the flag here left a
+        // Smolfile `image = "./x.tar"` stored verbatim, and `start` then asked
+        // the registry for it.
+        if let Some(img) = params.image.as_deref() {
+            use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+            params.image = Some(match resolve(classify(img))? {
+                ResolvedImage::Registry(reference) => reference,
+                ResolvedImage::Local { reference, .. } => reference,
+            });
+        }
         params.allow_system_mounts = self.allow_system_mounts;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);

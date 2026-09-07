@@ -2406,19 +2406,35 @@ impl AgentManager {
                 smolvm_protocol::guest_env::READY_MARKER,
                 self.ready_marker_name(),
             )
-            .stdin(std::process::Stdio::null())
-            // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
-            // embedded-host launch failures can be diagnosed (normally silenced).
-            .stdout(if std::env::var_os("SMOLVM_BOOT_DEBUG").is_some() {
-                std::process::Stdio::inherit()
+            .stdin(std::process::Stdio::null());
+        // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
+        // embedded-host launch failures can be diagnosed (normally silenced).
+        //
+        // On Windows the child is spawned DETACHED_PROCESS (below), which drops
+        // its console handles, so an inherited stdio pair reaches nothing and the
+        // flag looks like it does nothing at all. Write to `boot-debug.log` beside
+        // the VM's boot config there instead; every other platform still inherits.
+        {
+            let boot_debug = std::env::var_os("SMOLVM_BOOT_DEBUG").is_some();
+            let debug_log = if cfg!(windows) && boot_debug {
+                config_path.parent().map(|dir| dir.join("boot-debug.log"))
             } else {
-                std::process::Stdio::null()
-            })
-            .stderr(if std::env::var_os("SMOLVM_BOOT_DEBUG").is_some() {
-                std::process::Stdio::inherit()
-            } else {
-                std::process::Stdio::null()
-            });
+                None
+            };
+            let sink = |path: &Option<std::path::PathBuf>| -> std::process::Stdio {
+                match path {
+                    Some(path) => std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .map(std::process::Stdio::from)
+                        .unwrap_or_else(|_| std::process::Stdio::null()),
+                    None if boot_debug => std::process::Stdio::inherit(),
+                    None => std::process::Stdio::null(),
+                }
+            };
+            cmd.stdout(sink(&debug_log)).stderr(sink(&debug_log));
+        }
         // Own process group (pgid = child pid) so the VM is immune to SIGHUP from
         // the parent's terminal closing, without making it a session leader.
         // POSIX-only; Windows process groups have different semantics and the
