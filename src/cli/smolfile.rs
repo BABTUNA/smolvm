@@ -1010,3 +1010,80 @@ mod resource_cap_precedence_tests {
         assert_eq!(dev_or_top(vec![3], vec![1, 2]), vec![3]);
     }
 }
+
+#[cfg(test)]
+mod smolfile_local_image_tests {
+    use super::*;
+    use smolvm::data::image_source::{classify, ImageSource};
+
+    /// A Smolfile `image = "./x.tar"` reached `create` verbatim and was stored
+    /// as a registry reference, so `start` asked the registry for
+    /// `./x.tar:latest`. The merged image a Smolfile produces must classify
+    /// as the local archive it is, exactly as the same value on `--image` does.
+    #[test]
+    fn a_smolfile_archive_image_is_a_local_source_like_the_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = dir.path().join("debian-trixie.tar");
+        std::fs::write(&archive, b"not really a tar").expect("write");
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, format!("image = \"{}\"\n", archive.display())).expect("write");
+
+        let params = build_create_params(
+            "m".to_string(),
+            None,
+            None,
+            vec![],
+            None,
+            None,
+            vec![],
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(path),
+            None,
+            None,
+            vec![],
+            Default::default(),
+        )
+        .expect("params");
+
+        let image = params.image.expect("smolfile image is carried");
+        assert!(
+            matches!(classify(&image), ImageSource::Archive(_)),
+            "smolfile image {image} must classify as a local archive"
+        );
+
+        // And the flag, given the same value, agrees — one rule, two routes.
+        let flagged = build_create_params(
+            "m".to_string(),
+            Some(archive.display().to_string()),
+            None,
+            vec![],
+            None,
+            None,
+            vec![],
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            Default::default(),
+        )
+        .expect("params");
+        assert_eq!(flagged.image, Some(image));
+    }
+}
