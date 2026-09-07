@@ -2469,21 +2469,35 @@ mod tests {
         assert_eq!(batch.parallel.get(), 3);
         assert!(!batch.wait_ready);
         assert_eq!(batch.ready_timeout, Duration::from_secs(120));
+        let plain = is_plain_branch(batch.count.get(), batch.name_prefix.is_some(), batch.hold);
+        assert_eq!(
+            forkpoint_timeout(plain, batch.wait_ready, batch.ready_timeout),
+            Some(Duration::from_secs(120))
+        );
+        // A plain branch waits only when asked; every batch shape waits, so a
+        // one-child batch is released at the boundary like any other.
+        assert_eq!(
+            forkpoint_timeout(true, false, Duration::from_secs(120)),
+            None
+        );
+        assert_eq!(
+            forkpoint_timeout(true, true, Duration::from_secs(120)),
+            Some(Duration::from_secs(120))
+        );
         assert_eq!(
             forkpoint_timeout(
-                batch.count.get(),
-                batch.wait_ready,
-                batch.hold,
-                batch.ready_timeout,
+                is_plain_branch(1, true, false),
+                false,
+                Duration::from_secs(120)
             ),
             Some(Duration::from_secs(120))
         );
         assert_eq!(
-            forkpoint_timeout(1, false, false, Duration::from_secs(120)),
-            None
-        );
-        assert_eq!(
-            forkpoint_timeout(1, false, true, Duration::from_secs(120)),
+            forkpoint_timeout(
+                is_plain_branch(1, false, true),
+                false,
+                Duration::from_secs(120)
+            ),
             Some(Duration::from_secs(120))
         );
 
@@ -4119,7 +4133,11 @@ impl ForkCmd {
         // they merge into the clone's secret_refs and resolve fresh per exec.
         let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
         let count = self.count.get();
-        let wait_ready = forkpoint_timeout(count, self.wait_ready, self.hold, self.ready_timeout);
+        let wait_ready = forkpoint_timeout(
+            is_plain_branch(count, self.name_prefix.is_some(), self.hold),
+            self.wait_ready,
+            self.ready_timeout,
+        );
         if count > 1024 {
             return Err(smolvm::Error::config(
                 "branch",
@@ -4352,13 +4370,14 @@ fn fork_batch_id(golden: &str, prefix: &str) -> String {
     hex::encode(digest.finalize())[..32].to_string()
 }
 
+/// A batch always waits for the source's branchpoint and releases each child
+/// there; a plain branch waits only when asked.
 fn forkpoint_timeout(
-    count: u32,
+    plain: bool,
     explicitly_requested: bool,
-    hold: bool,
     timeout: Duration,
 ) -> Option<Duration> {
-    (count > 1 || explicitly_requested || hold).then_some(timeout)
+    (!plain || explicitly_requested).then_some(timeout)
 }
 
 // ============================================================================
