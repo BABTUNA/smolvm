@@ -1,13 +1,9 @@
-//! Native execution of the host-driven side of the branchpoint handshake.
+//! The agent's side of the branchpoint handshake: wait, arm, park, release,
+//! activate, and the worker-ready wait, each a typed request from the host
+//! executed here against the marker files the helper watches. The rules of
+//! the protocol live once, in this module and the helper.
 //!
-//! The host used to drive every step — wait, arm, park, release, activate —
-//! by building a shell script and running it through `VmExec`, with the marker
-//! formats mirrored as `sed` patterns. These functions execute the same steps
-//! against the same marker files, so a helper of either vintage sees an
-//! identical protocol; what changes is that the rules live once, here, typed.
-//!
-//! Every function takes its paths, so each is tested against a temp dir the
-//! way the scripts were.
+//! Every function takes its paths, so each is tested against a temp dir.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -97,10 +93,9 @@ impl Markers {
     }
 }
 
-/// How long the helper has to acknowledge an arm or park (the scripts allowed
-/// 400 polls of 5 ms).
+/// How long the helper has to acknowledge an arm or park.
 const ACK_WINDOW: Duration = Duration::from_secs(2);
-/// How long a restored clone has to acknowledge its release (500 polls of 20 ms).
+/// How long a restored clone has to acknowledge its release.
 const RELEASE_WINDOW: Duration = Duration::from_secs(10);
 
 /// Re-check `condition` after every change to the state directory until it

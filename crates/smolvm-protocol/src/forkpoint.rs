@@ -22,8 +22,8 @@ pub const CUDA_PRELOAD_MODULES_HINT: &str = "cuda-preload-modules";
 /// does not advertise it, rather than degrading to an older mechanism.
 pub const TYPED_BRANCHPOINT_CAPABILITY: &str = "branchpoint-typed-v1";
 
-/// Error codes the agent returns for typed branchpoint requests, mirroring the
-/// exit statuses the shell scripts used so host-side handling stays uniform.
+/// Error codes the agent returns for branchpoint requests, so the host can
+/// act on the cause rather than parse a message.
 pub mod typed_error {
     /// No `ready` marker: the workload has not declared a branchpoint.
     pub const NOT_READY: &str = "branchpoint.not_ready";

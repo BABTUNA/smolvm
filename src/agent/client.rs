@@ -1480,11 +1480,7 @@ impl AgentClient {
         expect_ok(resp, "format storage")
     }
 
-    /// Merge `lowerdirs` (bottom -> top) into a single tar at `output` in the guest.
-    ///
-    /// Missing or empty entries are dropped guest-side, so callers can append a
-    /// Whether this agent executes the branchpoint handshake from typed
-    /// requests, rather than from shell scripts the host builds.
+    /// Whether this agent speaks the branch protocol.
     pub fn supports_typed_branchpoint(&mut self) -> Result<bool> {
         self.supports_capability(smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY)
     }
@@ -1564,6 +1560,9 @@ impl AgentClient {
         branchpoint_outcome(resp, |_| ())
     }
 
+    /// Merge `lowerdirs` (bottom -> top) into a single tar at `output` in the guest.
+    ///
+    /// Missing or empty entries are dropped guest-side, so callers can append a
     /// container overlay's upper dir without probing it first.
     pub fn flatten_layers(&mut self, lowerdirs: &[String], output: &str) -> Result<()> {
         // Merging the lower dirs and tarring the result runs for minutes on a
