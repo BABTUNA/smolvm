@@ -63,6 +63,11 @@ pub struct FromVmAssets {
     /// that path already copied the source manifest's env into the record, so the
     /// machine's own env is the complete set.
     pub image_env: Vec<String>,
+    /// The image's OCI `USER`, for the same reason as `image_env`: a running
+    /// machine takes it from the image config at exec time, and a pack has no
+    /// image config left, so the manifest has to carry who the workload runs
+    /// as when the machine itself named nobody.
+    pub image_user: Option<String>,
     /// Total bytes of the layer tars collected for this pack.
     ///
     /// Recorded as the manifest's `image_size` so the run-time storage
@@ -120,6 +125,7 @@ pub fn collect_from_vm_assets(
     // machine already carries the source manifest's env in its own record, and a
     // bare machine has no image at all.
     let mut image_env: Vec<String> = Vec::new();
+    let mut image_user: Option<String> = None;
 
     if is_artifact_sourced && !opts.rebase_from_image {
         export_flattened_from_artifact_sourced(
@@ -150,7 +156,7 @@ pub fn collect_from_vm_assets(
                 opts.include_workspace,
             )?;
         } else {
-            image_env =
+            (image_env, image_user) =
                 export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
         }
     } else {
@@ -198,6 +204,7 @@ pub fn collect_from_vm_assets(
         },
         image: vm.image.clone(),
         image_env,
+        image_user,
         layer_bytes: collector.staged_layer_bytes(),
     })
 }
@@ -224,7 +231,9 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     manifest.cmd = vm.cmd.clone();
     manifest.env = merge_env(&assets.image_env, &vm.env);
     manifest.workdir = vm.workdir.clone();
-    manifest.user = vm.user.clone();
+    // The account the workload runs as, resolved the way a running machine
+    // resolves it: the machine's own user wins, else the image's USER.
+    manifest.user = vm.user.clone().or_else(|| assets.image_user.clone());
     manifest.secret_refs = vm.secret_refs.clone();
 }
 
@@ -380,7 +389,7 @@ fn export_flattened_from_registry_image(
     vm_dir: &Path,
     image: &str,
     opts: &FromVmExportOptions,
-) -> crate::Result<Vec<String>> {
+) -> crate::Result<(Vec<String>, Option<String>)> {
     let export_vm = ExportVm::start(vm_name, vm_dir, None, true)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
@@ -411,7 +420,7 @@ fn export_flattened_from_registry_image(
         &lowers,
         opts.include_workspace,
     )?;
-    Ok(image_info.env)
+    Ok((image_info.env, image_info.user))
 }
 
 /// Artifact-sourced machine: its extracted layer dirs live in the host-side
@@ -932,10 +941,41 @@ fn read_qcow2_virtual_size(path: &Path) -> crate::Result<u64> {
 
 #[cfg(test)]
 mod env_merge_tests {
-    use super::merge_env;
+    use super::{merge_env, seed_manifest_from_vm, FromVmAssets};
+    use crate::config::VmRecord;
+    use smolvm_pack::format::{PackManifest, PackMode};
 
     /// The image's `PATH` is what makes its binaries resolve, so a machine that
     /// set no env of its own must still carry the image's.
+    #[test]
+    fn packed_user_is_the_machine_user_or_else_the_image_user() {
+        let mut vm = VmRecord::new("m".to_string(), 1, 512, vec![], vec![], false);
+        let mut assets = FromVmAssets {
+            mode: PackMode::Container,
+            image: Some("nginx".to_string()),
+            image_env: vec![],
+            image_user: Some("nginx".to_string()),
+            layer_bytes: 0,
+        };
+        let mut manifest = PackManifest::new(
+            "vm://m".to_string(),
+            "none".to_string(),
+            "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
+        );
+        seed_manifest_from_vm(&mut manifest, &vm, &assets);
+        assert_eq!(manifest.user.as_deref(), Some("nginx"));
+
+        vm.user = Some("501:20".to_string());
+        seed_manifest_from_vm(&mut manifest, &vm, &assets);
+        assert_eq!(manifest.user.as_deref(), Some("501:20"));
+
+        vm.user = None;
+        assets.image_user = None;
+        seed_manifest_from_vm(&mut manifest, &vm, &assets);
+        assert!(manifest.user.is_none());
+    }
+
     #[test]
     fn image_env_survives_when_the_machine_adds_none() {
         let image = vec![
