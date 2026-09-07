@@ -2864,11 +2864,39 @@ pub fn render_branch_env(env: &[(String, String)]) -> String {
 /// delimiter on a line of its own, newline-terminated: a heredoc terminator
 /// must be the whole line, so a caller continues on the next line and must
 /// not append `;` or `&&` to the fragment.
-fn branch_env_install_fragment(path: &str, env: &[(String, String)]) -> String {
+fn branch_env_install_fragment(
+    path: &str,
+    env: &[(String, String)],
+    form: BranchEnvForm,
+) -> String {
+    let content = match form {
+        BranchEnvForm::Sourceable => render_branch_env(env),
+        BranchEnvForm::Dotenv => render_fork_env(env),
+    };
     format!(
-        "cat > '{path}.tmp' <<'SMOLVM_BRANCH_ENV_EOF' && mv '{path}.tmp' '{path}'\n{content}SMOLVM_BRANCH_ENV_EOF\n",
-        content = render_branch_env(env)
+        "cat > '{path}.tmp' <<'SMOLVM_BRANCH_ENV_EOF' && mv '{path}.tmp' '{path}'\n{content}SMOLVM_BRANCH_ENV_EOF\n"
     )
+}
+
+/// The shape of `branch-env`, chosen by the agent that will read it. An agent
+/// with the typed branchpoint protocol reads either form, so it gets the
+/// sourceable one; an older agent's `smolvm-worker-ready` parses only plain
+/// `KEY=VALUE` lines from this file, so it must keep receiving those or a
+/// pool lease that awaits readiness would never see its token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchEnvForm {
+    Sourceable,
+    Dotenv,
+}
+
+impl BranchEnvForm {
+    fn for_agent(client: &mut AgentClient) -> Result<Self> {
+        Ok(if client.supports_typed_branchpoint()? {
+            Self::Sourceable
+        } else {
+            Self::Dotenv
+        })
+    }
 }
 
 /// Merge assignment-time parameters into a held slot's initial fork
@@ -2929,6 +2957,11 @@ pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) 
         record.fork_overlay_owner.as_deref(),
     );
     let merged = format!("/storage/overlays/persistent-{owner}/merged");
+    let sock = vm_data_dir(clone).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&sock)
+        .map_err(|e| Error::agent("fork env: agent connect", e.to_string()))?;
+    let form = BranchEnvForm::for_agent(&mut client)
+        .map_err(|e| Error::agent("fork env", e.to_string()))?;
     // Image machines MUST land the file in the workload container's rootfs
     // (the overlay merged dir): falling through silently would strand it in
     // the agent rootfs where no workload will ever look. Fail with the actual
@@ -2940,17 +2973,14 @@ pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) 
              mkdir -p {merged}/etc/smolvm && umask 077 && \
              cat > {merged}{FORK_ENV_GUEST_PATH} && {branch_env}",
             branch_env =
-                branch_env_install_fragment(&format!("{merged}{BRANCH_ENV_GUEST_PATH}"), env)
+                branch_env_install_fragment(&format!("{merged}{BRANCH_ENV_GUEST_PATH}"), env, form)
         )
     } else {
         format!(
             "mkdir -p /etc/smolvm && umask 077 && cat > {FORK_ENV_GUEST_PATH} && {branch_env}",
-            branch_env = branch_env_install_fragment(BRANCH_ENV_GUEST_PATH, env)
+            branch_env = branch_env_install_fragment(BRANCH_ENV_GUEST_PATH, env, form)
         )
     };
-    let sock = vm_data_dir(clone).join("agent.sock");
-    let mut client = AgentClient::connect_with_retry(&sock)
-        .map_err(|e| Error::agent("fork env: agent connect", e.to_string()))?;
     match client.vm_exec(
         vec!["/bin/sh".into(), "-c".into(), script],
         vec![],
@@ -3406,7 +3436,10 @@ fn build_activation_script(
            printf '%s%s\\n' '{release_prefix}' \"$generation\" > \"$release_tmp\"; \
          else printf '%s\\n' '{legacy_release}' > \"$release_tmp\"; fi; \
          mv \"$release_tmp\" '{release}'",
-        branch_env_install = branch_env_install_fragment(branch_env_path, env),
+        // Only an agent without the typed protocol runs this script, and its
+        // worker-ready helper parses plain lines from this file.
+        branch_env_install =
+            branch_env_install_fragment(branch_env_path, env, BranchEnvForm::Dotenv),
         generation_prefix = smolvm_protocol::forkpoint::GENERATION_PREFIX,
         legacy_release = smolvm_protocol::forkpoint::LEGACY_RELEASE_TOKEN,
         release_prefix = smolvm_protocol::forkpoint::RELEASE_PREFIX,
@@ -4145,7 +4178,13 @@ mod tests {
         );
         assert_eq!(render_branch_env(&[]), "");
         // The install fragment embeds it in a quoted heredoc and moves it into place atomically.
-        let frag = branch_env_install_fragment("/etc/smolvm/branch-env", &env);
+        let frag =
+            branch_env_install_fragment("/etc/smolvm/branch-env", &env, BranchEnvForm::Sourceable);
+        // An older agent's readiness helper reads plain lines, so it gets them.
+        assert!(
+            branch_env_install_fragment("/etc/smolvm/branch-env", &env, BranchEnvForm::Dotenv)
+                .contains("\nNOTE=a=b c\n")
+        );
         // `&& mv` on the heredoc line, body after it, delimiter last: the
         // rename is conditional on the write, and a caller's `&&` chain holds.
         assert!(frag.starts_with(
@@ -4159,7 +4198,11 @@ mod tests {
         let ok = std::process::Command::new("/bin/sh")
             .args([
                 "-c",
-                &branch_env_install_fragment(target.to_str().unwrap(), &env),
+                &branch_env_install_fragment(
+                    target.to_str().unwrap(),
+                    &env,
+                    BranchEnvForm::Sourceable,
+                ),
             ])
             .status()
             .unwrap();
@@ -4263,9 +4306,11 @@ mod tests {
             String::from_utf8_lossy(&first.stderr)
         );
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=1e-4\n");
+        // The script path serves older agents, whose readiness helper reads
+        // plain lines from branch-env.
         assert_eq!(
             std::fs::read_to_string(&branch_env_path).unwrap(),
-            "export LR='1e-4'\n"
+            "LR=1e-4\n"
         );
         #[cfg(unix)]
         {
@@ -4351,11 +4396,9 @@ mod tests {
             String::from_utf8_lossy(&retry.stderr)
         );
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=3e-4\n");
-        // branch-env is no longer an alias of the dotenv file: it is the same
-        // parameters in a form a shell can `.`-source, exported and quoted.
         assert_eq!(
             std::fs::read_to_string(&branch_env_path).unwrap(),
-            "export LR='3e-4'\n"
+            "LR=3e-4\n"
         );
         assert!(release.is_file());
     }
