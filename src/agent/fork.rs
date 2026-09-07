@@ -3191,6 +3191,58 @@ fn worker_ready_command_timeout(timeout: Duration) -> Result<Duration> {
         .ok_or_else(|| Error::config("worker readiness", "timeout is too large"))
 }
 
+/// Guest env key telling a workload how long it has to publish readiness.
+pub const WORKER_READY_TIMEOUT_ENV: &str = "SMOLVM_WORKER_READY_TIMEOUT_SECS";
+
+/// A fresh 64-hex readiness token for a child that has no external
+/// idempotency key to derive one from.
+pub fn random_worker_ready_token() -> Result<String> {
+    use std::io::Read as _;
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut bytes))
+        .map_err(|error| Error::agent("worker readiness", format!("generate token: {error}")))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Put the readiness contract into a child's parameters: the token its
+/// `smolvm-worker-ready` call must echo and the window it has to do so.
+/// Refuses parameters that already use those keys, since a caller-supplied
+/// token could never be verified.
+pub fn add_worker_ready_assignment(
+    env: &mut Vec<(String, String)>,
+    token: &str,
+    timeout: Duration,
+) -> Result<()> {
+    for reserved in [
+        smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV,
+        WORKER_READY_TIMEOUT_ENV,
+    ] {
+        if env.iter().any(|(key, _)| key == reserved) {
+            return Err(Error::config(
+                "worker readiness",
+                format!("{reserved} is reserved for smolvm worker readiness"),
+            ));
+        }
+    }
+    env.push((
+        smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV.to_string(),
+        token.to_string(),
+    ));
+    env.push((
+        WORKER_READY_TIMEOUT_ENV.to_string(),
+        timeout.as_secs().to_string(),
+    ));
+    Ok(())
+}
+
+/// The readiness token a child's parameters carry, if any.
+pub fn worker_ready_token_of(env: &[(String, String)]) -> Option<&str> {
+    env.iter()
+        .find(|(key, _)| key == smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV)
+        .map(|(_, token)| token.as_str())
+}
+
 /// Wait until a released workload proves that clone-local preparation finished.
 pub fn wait_for_worker_ready(clone: &str, token: &str, timeout: Duration) -> Result<()> {
     if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -3422,6 +3474,29 @@ fn host_random_hex(hex_len: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_ready_assignment_carries_a_fresh_token_and_refuses_a_forged_one() {
+        let token = random_worker_ready_token().unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(token, random_worker_ready_token().unwrap());
+
+        let mut env = vec![("LR".to_string(), "3e-4".to_string())];
+        add_worker_ready_assignment(&mut env, &token, Duration::from_secs(90)).unwrap();
+        assert_eq!(worker_ready_token_of(&env), Some(token.as_str()));
+        assert!(env.contains(&(WORKER_READY_TIMEOUT_ENV.to_string(), "90".to_string())));
+
+        let mut forged = vec![(
+            smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV.to_string(),
+            "0".repeat(64),
+        )];
+        let error = add_worker_ready_assignment(&mut forged, &token, Duration::from_secs(1))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved"), "{error}");
+        assert!(worker_ready_token_of(&[]).is_none());
+    }
     use std::cell::Cell;
 
     #[cfg(target_os = "linux")]

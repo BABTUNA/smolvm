@@ -4041,6 +4041,22 @@ pub struct ForkCmd {
     )]
     pub ready_timeout: Duration,
 
+    /// Count a batch child as branched only once its workload has run
+    /// `smolvm-worker-ready`; a child that does not within the window is torn
+    /// down with the rest of the batch. Held slots take this at release.
+    #[arg(long, conflicts_with = "hold")]
+    pub wait_worker_ready: bool,
+
+    /// Window for `--wait-worker-ready`.
+    #[arg(
+        long,
+        default_value = "5m",
+        value_parser = parse_duration,
+        value_name = "DURATION",
+        requires = "wait_worker_ready",
+    )]
+    pub worker_ready_timeout: Duration,
+
     /// Make the child itself branchable (memfd RAM + control socket), so it can
     /// in turn be branched.
     #[arg(
@@ -4192,23 +4208,32 @@ impl ForkCmd {
             id: fork_batch_id(&self.golden, &prefix),
             size: count,
         });
-        let clones: Vec<_> = names
+        let worker_ready = self.wait_worker_ready.then_some(self.worker_ready_timeout);
+        let clones = names
             .into_iter()
             .enumerate()
             .map(|(index, name)| {
                 let index = index as u32;
-                let env = render_indexed_fork_env(&self.env, index, &name, true, batch.as_ref());
-                (name, env)
+                let mut env =
+                    render_indexed_fork_env(&self.env, index, &name, true, batch.as_ref());
+                if let Some(timeout) = worker_ready {
+                    let token = smolvm::agent::fork::random_worker_ready_token()?;
+                    smolvm::agent::fork::add_worker_ready_assignment(&mut env, &token, timeout)?;
+                }
+                Ok((name, env))
             })
-            .collect();
+            .collect::<smolvm::Result<Vec<_>>>()?;
         vm_common::fork_vm_batch(
             &self.golden,
             &clones,
-            self.share_weights,
-            &fork_secrets,
-            wait_ready,
-            self.parallel.get() as usize,
-            self.hold,
+            vm_common::ForkBatchOptions {
+                share_weights: self.share_weights,
+                fork_secrets: &fork_secrets,
+                wait_ready,
+                parallel: self.parallel.get() as usize,
+                hold: self.hold,
+                worker_ready,
+            },
         )
     }
 }
@@ -4224,12 +4249,33 @@ pub struct ForkReleaseCmd {
     /// parameters installed when the slot was provisioned.
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
+
+    /// Report the slot as released only once its workload has run
+    /// `smolvm-worker-ready`; a slot that does not within the window is torn
+    /// down, since a consumed slot cannot be returned to the pool anyway.
+    #[arg(long)]
+    pub wait_worker_ready: bool,
+
+    /// Window for `--wait-worker-ready`.
+    #[arg(
+        long,
+        default_value = "5m",
+        value_parser = parse_duration,
+        value_name = "DURATION",
+        requires = "wait_worker_ready",
+    )]
+    pub worker_ready_timeout: Duration,
 }
 
 impl ForkReleaseCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let env = smolvm::util::parse_env_list(&self.env);
-        vm_common::release_held_fork(&self.name, &env)
+        let mut env = smolvm::util::parse_env_list(&self.env);
+        let worker_ready = self.wait_worker_ready.then_some(self.worker_ready_timeout);
+        if let Some(timeout) = worker_ready {
+            let token = smolvm::agent::fork::random_worker_ready_token()?;
+            smolvm::agent::fork::add_worker_ready_assignment(&mut env, &token, timeout)?;
+        }
+        vm_common::release_held_fork(&self.name, &env, worker_ready)
     }
 }
 
