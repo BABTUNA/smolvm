@@ -394,6 +394,11 @@ fn apply_env_override(env: &mut Vec<(String, String)>, key: String, value: Strin
     env.push((key, value));
 }
 
+/// The account init commands run as: root, named explicitly. A run request
+/// with no user takes the image's `USER`, which is right for a workload but
+/// not for provisioning, so init cannot simply leave the field empty.
+const INIT_USER: &str = "0";
+
 /// Build the `RunConfig` an image-based init command runs under.
 ///
 /// Init is provisioning, so it runs as root, like a Dockerfile `RUN` line or
@@ -419,6 +424,7 @@ fn build_init_run_config(
     smolvm::agent::RunConfig::new(image, init_argv(cmd))
         .with_env(defaults.env.clone())
         .with_workdir(defaults.workdir.clone())
+        .with_user(Some(INIT_USER.to_string()))
         .with_mounts(mounts)
         .with_persistent_overlay(Some(overlay_id.to_string()))
 }
@@ -3552,7 +3558,9 @@ mod init_runner_tests {
         assert_eq!(config.workdir.as_deref(), Some("/work"));
         // Init provisions the machine, so it runs as root even when the image
         // (or the machine's `user`) names another account for the workload.
-        assert!(config.user.is_none());
+        // Root is requested explicitly: an absent user would take the image's
+        // USER on the agent side.
+        assert_eq!(config.user.as_deref(), Some("0"));
         // Command is sh-wrapped; assert the wrapped form arrives.
         assert_eq!(
             config.command,
@@ -3610,7 +3618,7 @@ mod init_runner_tests {
         assert!(config.mounts.is_empty());
         assert!(config.workdir.is_none());
         assert!(config.env.is_empty());
-        assert!(config.user.is_none());
+        assert_eq!(config.user.as_deref(), Some("0"));
         assert_eq!(config.persistent_overlay_id.as_deref(), Some("vm"));
     }
 
@@ -3647,7 +3655,7 @@ mod init_runner_tests {
 
         assert_eq!(config.workdir.as_deref(), Some("/image-workdir"));
         // The image's USER names the workload account; init still runs as root.
-        assert!(config.user.is_none());
+        assert_eq!(config.user.as_deref(), Some("0"));
         assert_eq!(
             config.env,
             vec![("FOO".to_string(), "from-image".to_string())]

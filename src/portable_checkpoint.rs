@@ -427,6 +427,7 @@ pub fn capture_to_path(
         mode: PackMode::Vm,
         image: None,
         image_env: Vec::new(),
+        image_user: None,
         layer_bytes: 0,
     };
     let platform = format!("linux/{}", crate::platform::Arch::current().oci_arch());

@@ -639,6 +639,7 @@ init = ["echo init"]
             mode: PackMode::Container,
             image: params.image.clone(),
             image_env: vec![],
+            image_user: None,
             layer_bytes: 0,
         };
         seed_manifest_from_vm(&mut manifest, &persisted, &assets);
