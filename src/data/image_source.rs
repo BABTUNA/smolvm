@@ -36,7 +36,12 @@ pub enum ImageSource {
     /// A value that is recognisably meant as a local source but in a form
     /// smolvm does not read. Carries the exact syntax to use instead, so the
     /// error names the fix rather than a registry-parser failure.
-    Unsupported { given: String, hint: String },
+    Unsupported {
+        /// The value exactly as the user wrote it.
+        given: String,
+        /// The syntax to use instead.
+        hint: String,
+    },
 }
 
 /// Where an [`ImageSource::Archive`]'s bytes come from.
