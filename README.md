@@ -117,11 +117,26 @@ continue inline instead runs `eval "$(smolvm-branch-ready)"`: the same command,
 whose output is those variables as `export` lines. `machine exec` sessions in a
 child see them in their environment too.
 
+When a child has its own warm-up after the branch (loading a checkpoint,
+binding a port), it can report the moment it is actually usable by running
+`smolvm-worker-ready`, and the branch command can wait for that instead of
+for the release alone:
+
+```bash
+smolvm machine branch --from source --count 8 --name-prefix worker --wait-worker-ready
+```
+
+With `--wait-worker-ready` (window: `--worker-ready-timeout`, default 5m) a
+child that never reports is torn down with its batch rather than handed back
+looking alive. `machine branch-release` takes the same flags for a held pool
+slot.
+
 Container rules apply, as in Docker: the container lives as long as its main
 process. `exec smolvm-branch-ready` with no program simply parks; the child
 keeps running with the helper as its init. A batch branch waits
 (`--ready-timeout`, default 10m) for the source to reach its branchpoint; a
-single `--name` branch never waits.
+single `--name` branch never waits. With `--name-prefix` or `--hold`, even a
+count of one is a batch and gets the same boundary, identity, and release.
 
 Add `--branchable` to a child when it must branch again. `fork`, `--golden`, and
 `--forkable` remain compatibility aliases; `checkpoint` is reserved for a
