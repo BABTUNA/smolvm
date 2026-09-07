@@ -90,10 +90,10 @@ branchable, then branch it:
 
 ```bash
 smolvm machine start --name source --branchable
-smolvm machine branch --from source --name child          # snapshots the source wherever it is
+smolvm machine branch --from source --name child          # checkpoints the source wherever it is
 ```
 
-To fan out many children from one snapshot, the source's workload marks the
+To fan out many children from one checkpoint, the source's workload marks the
 point to take it by running `smolvm-branch-ready` once its setup is done, and
 names the program each child should run after it. The helper blocks in the
 source, which stays parked there; in each child it hands off to that program
@@ -295,7 +295,7 @@ Known Limitations
 * macOS: binary must be signed with Hypervisor.framework entitlements (`com.apple.security.hypervisor`). The shipped release is; a re-signed or freshly built binary silently loses it and every VM start then fails with `krun_start_enter returned: -22 (EINVAL)`. Re-sign it (ad-hoc is fine): `codesign --force --sign - --entitlements hv.entitlements <smolvm-bin>` where `hv.entitlements` is a plist containing `<key>com.apple.security.hypervisor</key><true/>`.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 * GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).
-* Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. Not yet available on Windows: GPU acceleration and `machine branch` / snapshot. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
+* Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. Not yet available on Windows: GPU acceleration and `machine branch` / `machine checkpoint`. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
 
 Kubernetes
 ----------
