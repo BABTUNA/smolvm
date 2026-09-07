@@ -247,7 +247,6 @@ pub(crate) struct InitRunContext<'a> {
     pub(crate) image_info: Option<&'a ImageInfo>,
     pub(crate) env: &'a [(String, String)],
     pub(crate) workdir: Option<&'a str>,
-    pub(crate) user: Option<&'a str>,
     pub(crate) record_mounts: &'a [(String, String, bool)],
     pub(crate) overlay_id: &'a str,
 }
@@ -274,7 +273,7 @@ pub(crate) fn run_init_commands(
                 context.image_info,
                 context.env,
                 context.workdir,
-                context.user,
+                None,
             );
             let config = build_init_run_config(
                 image,
@@ -397,6 +396,12 @@ fn apply_env_override(env: &mut Vec<(String, String)>, key: String, value: Strin
 
 /// Build the `RunConfig` an image-based init command runs under.
 ///
+/// Init is provisioning, so it runs as root, like a Dockerfile `RUN` line or
+/// cloud-init: the image's `USER` and the machine's `user` describe who the
+/// workload runs as, not who sets the machine up. The image's env and
+/// workdir still apply. A step that must run as the workload account says so
+/// itself (`su app -c '…'`), as it would in a Dockerfile.
+///
 /// Pure function so the *shape* of the request (overlay ID, mount tags,
 /// env, workdir, the `sh -c` wrap) can be unit-tested without mocking
 /// `AgentClient`. Any of these silently regressing — e.g. mounts not
@@ -414,7 +419,6 @@ fn build_init_run_config(
     smolvm::agent::RunConfig::new(image, init_argv(cmd))
         .with_env(defaults.env.clone())
         .with_workdir(defaults.workdir.clone())
-        .with_user(defaults.user.clone())
         .with_mounts(mounts)
         .with_persistent_overlay(Some(overlay_id.to_string()))
 }
@@ -1747,7 +1751,6 @@ fn start_vm_named_with_db(
                 image_info: image_info.as_ref(),
                 env: &exec_env,
                 workdir: record.workdir.as_deref(),
-                user: record.user.as_deref(),
                 record_mounts: &record.mounts,
                 overlay_id: name,
             },
@@ -2125,7 +2128,6 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
                     image_info: image_info.as_ref(),
                     env: &exec_env,
                     workdir: record.workdir.as_deref(),
-                    user: record.user.as_deref(),
                     record_mounts: &record.mounts,
                     overlay_id: "default",
                 },
@@ -3540,7 +3542,9 @@ mod init_runner_tests {
         assert_eq!(config.image, "docker.io/library/debian:slim");
         assert_eq!(config.env, env);
         assert_eq!(config.workdir.as_deref(), Some("/work"));
-        assert_eq!(config.user.as_deref(), Some("steam"));
+        // Init provisions the machine, so it runs as root even when the image
+        // (or the machine's `user`) names another account for the workload.
+        assert!(config.user.is_none());
         // Command is sh-wrapped; assert the wrapped form arrives.
         assert_eq!(
             config.command,
@@ -3634,7 +3638,8 @@ mod init_runner_tests {
         let config = build_init_run_config("alpine:latest", "pwd", &defaults, &[], "vm");
 
         assert_eq!(config.workdir.as_deref(), Some("/image-workdir"));
-        assert_eq!(config.user.as_deref(), Some("steam"));
+        // The image's USER names the workload account; init still runs as root.
+        assert!(config.user.is_none());
         assert_eq!(
             config.env,
             vec![("FOO".to_string(), "from-image".to_string())]
