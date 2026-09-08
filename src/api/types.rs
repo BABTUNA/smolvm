@@ -109,6 +109,10 @@ pub struct ResourceSpec {
     #[serde(default)]
     #[schema(example = 10)]
     pub overlay_gb: Option<u64>,
+    /// Host block I/O engine. `sync` is the default; `async` submits queued raw-disk
+    /// reads through a restricted io_uring on Linux hosts.
+    #[serde(default)]
+    pub block_io: Option<crate::data::resources::BlockIoEngine>,
     /// Allowed egress CIDR ranges. When set, only these IP ranges are reachable.
     /// Omit for unrestricted egress. Empty list denies all egress.
     #[serde(default)]
@@ -584,6 +588,9 @@ pub struct CreateMachineRequest {
     /// Overlay disk size in GiB (default: 10).
     #[serde(default)]
     pub overlay_gb: Option<u64>,
+    /// Host block I/O engine. `sync` is the default; `async` is opt-in.
+    #[serde(default)]
+    pub block_io: Option<crate::data::resources::BlockIoEngine>,
     /// Allowed egress CIDR ranges.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
@@ -701,6 +708,8 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
+    /// Host block I/O engine used by this machine.
+    pub block_io: crate::data::resources::BlockIoEngine,
     /// Whether ordinary starts launch this machine as a branch source.
     pub branchable: bool,
     /// Legacy alias for `branchable`.

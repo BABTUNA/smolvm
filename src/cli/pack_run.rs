@@ -15,6 +15,7 @@ use smolvm::agent::launcher_dynamic::{
 };
 use smolvm::agent::{AgentClient, RunConfig, VmResources};
 use smolvm::data::network::{PortMapping, PortMappingSpec};
+use smolvm::data::resources::BlockIoEngine;
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::platform::Platform;
@@ -261,6 +262,11 @@ pub struct PackRunCmd {
     /// Overlay disk size in GiB (for persistent rootfs changes)
     #[arg(long, value_name = "GiB", help_heading = "Resources")]
     pub overlay: Option<u64>,
+
+    /// Block I/O engine. `sync` preserves the default single-request path;
+    /// `async` uses restricted io_uring for raw disks on Linux.
+    #[arg(long = "block-io", value_enum, help_heading = "Resources")]
+    pub block_io: Option<BlockIoEngine>,
 
     /// Re-extract assets even if already cached
     #[arg(long)]
@@ -510,6 +516,7 @@ impl PackRunCmd {
             cuda: cuda_enabled,
             storage_gib,
             overlay_gib: self.overlay,
+            block_io: self.block_io.unwrap_or_default(),
             gpu_vram_mib: None,
             rosetta: false,
             allowed_cidrs: self
@@ -1278,6 +1285,11 @@ struct PackedRunArgs {
     #[arg(long, value_name = "GiB")]
     overlay: Option<u64>,
 
+    /// Block I/O engine. `sync` is the default; `async` adaptively overlaps
+    /// queued raw-disk reads on Linux.
+    #[arg(long = "block-io", value_enum)]
+    block_io: Option<BlockIoEngine>,
+
     /// Enable CUDA-over-vsock (also implied by the packed machine's manifest or
     /// `SMOLVM_CUDA=1`).
     #[arg(long)]
@@ -1302,6 +1314,11 @@ struct PackedStartArgs {
     /// Overlay disk size in GiB
     #[arg(long, value_name = "GiB")]
     overlay: Option<u64>,
+
+    /// Block I/O engine. `sync` is the default; `async` adaptively overlaps
+    /// queued raw-disk reads on Linux.
+    #[arg(long = "block-io", value_enum)]
+    block_io: Option<BlockIoEngine>,
 
     /// Mount a volume (HOST:GUEST[:ro|rw|staged])
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
@@ -1475,6 +1492,7 @@ fn run_ephemeral(
                 mem: args.mem,
                 storage: args.storage,
                 overlay: args.overlay,
+                block_io: args.block_io,
                 egress: None,
                 force_extract,
                 info: false,
@@ -1617,6 +1635,7 @@ fn run_from_cache(
         cuda: manifest.cuda,
         storage_gib,
         overlay_gib: args.overlay,
+        block_io: args.block_io.unwrap_or_default(),
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
@@ -2042,6 +2061,7 @@ fn daemon_start(
         cuda: manifest.cuda,
         storage_gib,
         overlay_gib: args.overlay,
+        block_io: args.block_io.unwrap_or_default(),
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,

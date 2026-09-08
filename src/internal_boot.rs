@@ -450,12 +450,12 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         }
     }
 
-    // Confine this VMM to a syscall allowlist before it loads libkrun and
-    // enters the guest run loop, so a guest→VMM escape can't reach dangerous host
-    // syscalls. Gated by SMOLVM_SECCOMP=audit|enforce (unset = off). Installed
-    // while single-threaded so libkrun's vCPU/worker threads inherit the filter.
-    // Enforce mode fails closed (a filter that won't install must not silently run
-    // unconfined). See docs/runtime-isolation-hardening.md.
+    // Prepare services that need to exec before the VMM is confined.  The
+    // seccomp filter itself is installed by the launcher after libkrun has
+    // configured all devices but immediately before krun_start_enter.  That
+    // ordering lets an explicitly asynchronous block device create and
+    // permanently restrict its io_uring first; TSYNC then confines every
+    // launcher thread while still denying creation of any new ring.
     //
     // The call site is gated for BOTH x86_64 and aarch64 (AWS Graviton / GCP
     // Axion). The allowlist is arch-neutral (`libc::SYS_*` names resolve per
@@ -483,8 +483,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
             {
                 match crate::cuda_daemon::ensure_running() {
                     Ok(sock) => {
-                        // Single-threaded here (the filter install below relies
-                        // on the same invariant), so set_var is race-free.
+                        // Still single-threaded here, so set_var is race-free.
                         std::env::set_var("SMOLVM_CUDA_DAEMON", &sock);
                         tracing::info!(socket = %sock.display(),
                             "CUDA daemon pre-started for the sandboxed boot");
@@ -498,23 +497,16 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
                     }
                 }
             }
-            if let Err(e) = crate::process::install_seccomp_filter(true) {
-                eprintln!("[seccomp] enforce install failed, refusing to boot unconfined: {e}");
-                crate::process::exit_child(1);
-            }
         }
-        Ok("audit") => {
-            if let Err(e) = crate::process::install_seccomp_filter(false) {
-                eprintln!("[seccomp] audit install failed: {e}");
-            }
-        }
+        Ok("audit") => {}
         _ => {}
     }
 
     // The boot subprocess owns the VM for its full lifetime, including
     // persistent machines whose initiating CLI has exited. Keep host→guest
     // filesystem notifications here so the watcher cannot disappear early.
-    // Start after seccomp installation so its thread inherits the VMM policy.
+    // The launcher applies the final filter to this watcher with TSYNC before
+    // entering the guest.
     let _fsnotify_watcher = FsNotifyWatcher::start(config.vsock_socket.clone(), &config.mounts);
 
     // Emit subprocess startup timing to the startup error log (stderr after

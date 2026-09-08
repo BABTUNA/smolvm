@@ -7,7 +7,9 @@
 use crate::cli::parsers::parse_cidr;
 use crate::cli::vm_common::CreateVmParams;
 use smolvm::data::network::PortMappingSpec;
-use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use smolvm::data::resources::{
+    BlockIoEngine, DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB,
+};
 use smolvm::network::NetworkBackend;
 use std::path::PathBuf;
 
@@ -32,6 +34,15 @@ fn parse_net_backend(raw: &str) -> smolvm::Result<NetworkBackend> {
                 "net_backend = \"{raw}\" is not a networking backend; expected \"tsi\" or \
                  \"virtio-net\" (the same values as --net-backend)"
             ),
+        )
+    })
+}
+
+fn parse_block_io(raw: &str) -> smolvm::Result<BlockIoEngine> {
+    <BlockIoEngine as clap::ValueEnum>::from_str(raw, false).map_err(|_| {
+        smolvm::Error::config(
+            "Smolfile",
+            format!("block_io = \"{raw}\" is invalid; expected \"sync\" or \"async\""),
         )
     })
 }
@@ -95,6 +106,7 @@ pub fn build_create_params(
     smolfile_path: Option<PathBuf>,
     cli_storage_gb: Option<u64>,
     cli_overlay_gb: Option<u64>,
+    cli_block_io: Option<BlockIoEngine>,
     cli_allow_cidr: Vec<String>,
     // Labels come only from the CLI today; a Smolfile has no `labels` key yet.
     // Threaded explicitly so `--label` is not silently dropped when a Smolfile
@@ -134,6 +146,7 @@ pub fn build_create_params(
                 user: cli_user,
                 storage_gb: cli_storage_gb,
                 overlay_gb: cli_overlay_gb,
+                block_io: cli_block_io.unwrap_or_default(),
                 allowed_cidrs: cidrs_to_option(cli_allow_cidr),
                 restart_policy: None,
                 restart_max_retries: None,
@@ -264,6 +277,15 @@ pub fn build_create_params(
     // Scalars: CLI overrides Smolfile
     let storage_gb = cli_storage_gb.or(sf.storage);
     let overlay_gb = cli_overlay_gb.or(sf.overlay);
+    let block_io = match cli_block_io {
+        Some(engine) => engine,
+        None => sf
+            .block_io
+            .as_deref()
+            .map(parse_block_io)
+            .transpose()?
+            .unwrap_or_default(),
+    };
 
     // Merge network policy: [network] section, then CLI extends
     let network = sf.network.unwrap_or_default();
@@ -357,6 +379,7 @@ pub fn build_create_params(
         user,
         storage_gb,
         overlay_gb,
+        block_io,
         allowed_cidrs,
         restart_policy,
         restart_max_retries,
@@ -548,6 +571,7 @@ mod tests {
             None,
             None,
             Some(path),
+            None,
             None,
             None,
             vec![],
@@ -746,6 +770,7 @@ init = ["echo init"]
             Some(path),
             None,
             None,
+            None,
             vec![],
             Default::default(),
         )
@@ -813,6 +838,7 @@ init = ["echo init"]
             Some(path),
             None,
             None,
+            None,
             vec![],
             Default::default(),
         )
@@ -827,6 +853,16 @@ init = ["echo init"]
                 "TORCHINDUCTOR_CUDAGRAPHS=1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn block_io_smolfile_selects_async_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, "block_io = \"async\"\n").unwrap();
+
+        let params = build_from_smolfile(path).unwrap();
+        assert_eq!(params.block_io, BlockIoEngine::Async);
     }
 
     #[test]
@@ -909,6 +945,7 @@ mod resource_cap_precedence_tests {
             None,
             None,
             smolfile_path,
+            None,
             None,
             None,
             vec![],
@@ -1049,6 +1086,7 @@ mod smolfile_local_image_tests {
             Some(path),
             None,
             None,
+            None,
             vec![],
             Default::default(),
         )
@@ -1076,6 +1114,7 @@ mod smolfile_local_image_tests {
             None,
             vec![],
             vec![],
+            None,
             None,
             None,
             None,

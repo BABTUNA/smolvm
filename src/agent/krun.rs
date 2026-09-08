@@ -39,6 +39,18 @@ pub struct KrunFunctions {
     pub set_port_map: unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32,
     pub add_disk2:
         unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u32, bool) -> i32,
+    pub add_disk4: Option<
+        unsafe extern "C" fn(
+            u32,
+            *const libc::c_char,
+            *const libc::c_char,
+            u32,
+            bool,
+            bool,
+            u32,
+            u32,
+        ) -> i32,
+    >,
     pub add_vsock_port2: unsafe extern "C" fn(u32, u32, *const libc::c_char, bool) -> i32,
     pub add_virtiofs: unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char) -> i32,
     pub add_virtiofs3: Option<
@@ -176,6 +188,7 @@ impl KrunFunctions {
         let set_exec = load_sym!(krun_set_exec);
         let set_port_map = load_sym!(krun_set_port_map);
         let add_disk2 = load_sym!(krun_add_disk2);
+        let add_disk4 = load_optional_sym!("krun_add_disk4");
         let add_vsock_port2 = load_sym!(krun_add_vsock_port2);
         let add_virtiofs = load_sym!(krun_add_virtiofs);
         let add_virtiofs3 = load_optional_sym!("krun_add_virtiofs3");
@@ -208,6 +221,7 @@ impl KrunFunctions {
             set_exec,
             set_port_map,
             add_disk2,
+            add_disk4,
             add_vsock_port2,
             add_virtiofs,
             add_virtiofs3,

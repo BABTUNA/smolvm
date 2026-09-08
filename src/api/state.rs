@@ -484,6 +484,7 @@ impl ApiState {
                 cuda: Some(record.cuda),
                 storage_gb: record.storage_gb,
                 overlay_gb: record.overlay_gb,
+                block_io: Some(record.block_io),
                 allowed_cidrs: record.allowed_cidrs.clone(),
                 allowed_hosts: record.dns_filter_hosts.clone(),
                 network_backend: record.network_backend,
@@ -962,6 +963,7 @@ impl ApiState {
         record.staged_mounts = staged_mounts;
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
+        record.block_io = reg.resources.block_io.unwrap_or_default();
         // Persist egress policy + backend selection from the request (previously
         // dropped here, so API-created machines silently lost both).
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
@@ -1583,6 +1585,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         rosetta: false,
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,
+        block_io: spec.block_io.unwrap_or_default(),
         allowed_cidrs: spec.allowed_cidrs.clone(),
         // Custom DNS is a local-CLI feature for now; the cloud ResourceSpec
         // does not expose it, so API-launched VMs inherit the backend default.
@@ -1601,6 +1604,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         cuda: Some(res.cuda),
         storage_gb: res.storage_gib,
         overlay_gb: res.overlay_gib,
+        block_io: Some(res.block_io),
         allowed_cidrs: res.allowed_cidrs,
         // VmResources has no hostname allow-list; callers that need it graft it
         // back from the source record (see the MachineEntry reload path).
@@ -1677,6 +1681,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         allowed_hosts: entry.resources.allowed_hosts.clone(),
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
+        block_io: entry.resources.block_io.unwrap_or_default(),
         branchable: entry.forkable,
         forkable: entry.forkable,
         // MachineEntry is an in-memory runtime view and does not retain the
@@ -1779,6 +1784,7 @@ mod tests {
             cuda: None,
             storage_gb: None,
             overlay_gb: None,
+            block_io: None,
             allowed_cidrs: None,
             allowed_hosts: None,
             network_backend: None,
@@ -1844,6 +1850,7 @@ mod tests {
                     cuda: None,
                     storage_gb: None,
                     overlay_gb: None,
+                    block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
                     network_backend: None,
@@ -1911,6 +1918,7 @@ mod tests {
                     cuda: None,
                     storage_gb: None,
                     overlay_gb: None,
+                    block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
                     network_backend: None,

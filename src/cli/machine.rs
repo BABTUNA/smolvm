@@ -636,6 +636,10 @@ pub struct RunCmd {
     #[arg(long, value_name = "GiB", help_heading = "Resources")]
     pub overlay: Option<u64>,
 
+    /// Host block I/O engine. Async uses restricted io_uring for raw disks on Linux.
+    #[arg(long = "block-io", value_enum, help_heading = "Resources")]
+    pub block_io: Option<smolvm::data::resources::BlockIoEngine>,
+
     /// Load VM configuration from a Smolfile (TOML)
     #[arg(
         long = "smolfile",
@@ -1161,6 +1165,7 @@ impl RunCmd {
                 mem: self.mem,
                 storage: self.storage,
                 overlay: self.overlay,
+                block_io: self.block_io,
                 force_extract: false,
                 info: false,
                 debug: false,
@@ -1229,6 +1234,7 @@ impl RunCmd {
             self.smolfile.clone(),
             self.storage,
             self.overlay,
+            self.block_io,
             cli_allow_cidrs,
             // Ephemeral runs are not addressable later, so they carry no labels;
             // `machine create` is the path an orchestrator labels.
@@ -1306,6 +1312,7 @@ impl RunCmd {
                     mem: Some(params.mem),
                     storage: params.storage_gb,
                     overlay: params.overlay_gb,
+                    block_io: Some(params.block_io),
                     force_extract: false,
                     info: false,
                     debug: false,
@@ -1424,6 +1431,7 @@ impl RunCmd {
                 mem: Some(params.mem),
                 storage: params.storage_gb,
                 overlay: params.overlay_gb,
+                block_io: Some(params.block_io),
                 force_extract: false,
                 info: false,
                 debug: false,
@@ -1552,6 +1560,7 @@ impl RunCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            block_io: params.block_io,
         };
         validate_requested_network_backend(
             &resources,
@@ -2617,6 +2626,47 @@ mod tests {
         assert!(cmd.auto_graph);
     }
 
+    #[test]
+    fn block_io_defaults_to_unset_and_accepts_async() {
+        let cli = TestMachineCli::parse_from(["machine", "create", "--name", "default"]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.block_io, None);
+
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "queued",
+            "--block-io",
+            "async",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(
+            cmd.block_io,
+            Some(smolvm::data::resources::BlockIoEngine::Async)
+        );
+
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "update",
+            "--name",
+            "queued",
+            "--block-io",
+            "sync",
+        ]);
+        let MachineCmd::Update(cmd) = cli.command else {
+            panic!("expected machine update command");
+        };
+        assert_eq!(
+            cmd.block_io,
+            Some(smolvm::data::resources::BlockIoEngine::Sync)
+        );
+    }
+
     // Documents the clap parsing behaviour: positionals before "--" land in
     // `command`, not `image`.  is_likely_image_ref() catches the unambiguous
     // cases before a VM is booted.
@@ -3172,6 +3222,10 @@ pub struct CreateCmd {
     #[arg(long, value_name = "GiB")]
     pub overlay: Option<u64>,
 
+    /// Host block I/O engine. Async uses restricted io_uring for raw disks on Linux.
+    #[arg(long = "block-io", value_enum)]
+    pub block_io: Option<smolvm::data::resources::BlockIoEngine>,
+
     /// Mount host directory (can be used multiple times). Also accepts
     /// S3-compatible object storage, mounted inside the guest on every start:
     /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
@@ -3400,6 +3454,7 @@ impl CreateCmd {
             self.smolfile.clone(),
             self.storage,
             self.overlay,
+            self.block_io,
             cli_allow_cidrs,
             smolvm::util::parse_labels(&self.labels)?,
         )?;
@@ -3454,6 +3509,7 @@ impl CreateCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            block_io: params.block_io,
         };
         // Reject zero-valued resources before the machine is persisted.
         // Without this, `machine create` succeeds and the failure only
@@ -3717,6 +3773,7 @@ impl CreateCmd {
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.overlay_gib)
                 .or(self.overlay),
+            block_io: self.block_io.unwrap_or_default(),
             allowed_cidrs,
             restart_policy: checkpoint
                 .as_ref()
@@ -3775,6 +3832,7 @@ impl CreateCmd {
             rosetta: params.rosetta,
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
+            block_io: params.block_io,
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
         resources.validate()?;
@@ -4711,6 +4769,10 @@ pub struct UpdateCmd {
     /// Overlay disk size in GiB (expand only)
     #[arg(long, value_name = "GiB")]
     pub overlay: Option<u64>,
+
+    /// Set the host block I/O engine for the next start.
+    #[arg(long = "block-io", value_enum)]
+    pub block_io: Option<smolvm::data::resources::BlockIoEngine>,
 }
 
 impl UpdateCmd {
@@ -4741,6 +4803,7 @@ impl UpdateCmd {
         let proposed = smolvm::agent::VmResources {
             cpus: self.cpus.unwrap_or(record.cpus),
             memory_mib: self.mem.unwrap_or(record.mem),
+            block_io: self.block_io.unwrap_or(record.block_io),
             ..record.vm_resources()
         };
         proposed.validate()?;
@@ -4895,6 +4958,10 @@ impl UpdateCmd {
             if let Some(mem) = self.mem {
                 changes.push(format!("  memory: {} MiB → {} MiB", r.mem, mem));
                 r.mem = mem;
+            }
+            if let Some(block_io) = self.block_io {
+                changes.push(format!("  block I/O: {:?} → {:?}", r.block_io, block_io));
+                r.block_io = block_io;
             }
 
             // Network
