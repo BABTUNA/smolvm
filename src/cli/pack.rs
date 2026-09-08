@@ -575,6 +575,10 @@ impl PackCreateCmd {
         manifest.cmd = image_info.cmd.clone();
         manifest.env = image_info.env.clone();
         manifest.workdir = image_info.workdir.clone();
+        // The pack has no image config left to consult at run time, so the
+        // user travels in the manifest like the rest: the Smolfile's `user`
+        // when given, else the image's USER.
+        manifest.user = pack_config.user.clone().or_else(|| image_info.user.clone());
 
         // Layer Smolfile top-level env on top of image env
         if !pack_config.env.is_empty() {
