@@ -3038,6 +3038,9 @@ pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) 
     let sock = vm_data_dir(clone).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&sock)
         .map_err(|e| Error::agent("fork env: agent connect", e.to_string()))?;
+    // The workload reads these files, and it may run as any account the
+    // image or the machine names, so they are world-readable inside the VM
+    // (single-tenant), not root-only.
     // Image machines MUST land the file in the workload container's rootfs
     // (the overlay merged dir): falling through silently would strand it in
     // the agent rootfs where no workload will ever look. Fail with the actual
@@ -3046,14 +3049,14 @@ pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) 
         format!(
             "if [ ! -d {merged} ]; then echo \"missing {merged}; overlays:\" >&2; \
              ls /storage/overlays >&2; exit 41; fi; \
-             mkdir -p {merged}/etc/smolvm && umask 077 && \
+             mkdir -p {merged}/etc/smolvm && umask 022 && \
              cat > {merged}{FORK_ENV_GUEST_PATH} && {branch_env}",
             branch_env =
                 branch_env_install_fragment(&format!("{merged}{BRANCH_ENV_GUEST_PATH}"), env)
         )
     } else {
         format!(
-            "mkdir -p /etc/smolvm && umask 077 && cat > {FORK_ENV_GUEST_PATH} && {branch_env}",
+            "mkdir -p /etc/smolvm && umask 022 && cat > {FORK_ENV_GUEST_PATH} && {branch_env}",
             branch_env = branch_env_install_fragment(BRANCH_ENV_GUEST_PATH, env)
         )
     };
