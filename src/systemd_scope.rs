@@ -228,6 +228,49 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
     Ok(())
 }
 
+/// Change the hard memory ceiling of an existing VM scope.
+///
+/// A live branch source retains immutable RAM generations in the same memory
+/// cgroup that originally faulted those pages.  Linux does not migrate those
+/// page charges when a raw-forked guardian moves between cgroups, so the scope
+/// ceiling must grow with the number of retained generations and shrink again
+/// when they are collected.
+pub fn set_scope_memory_max(machine_id: &str, memory_max_bytes: u64) -> Result<()> {
+    let busctl = busctl_path()
+        .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot update scope"))?;
+    let name = scope_name(machine_id);
+
+    // SetUnitProperties(name: s, runtime: b, properties: a(sv)).  Runtime=true
+    // keeps the transient scope transient while making the new limit effective
+    // immediately in memory.max.
+    let args = [
+        "call".to_string(),
+        "org.freedesktop.systemd1".to_string(),
+        "/org/freedesktop/systemd1".to_string(),
+        "org.freedesktop.systemd1.Manager".to_string(),
+        "SetUnitProperties".to_string(),
+        "sba(sv)".to_string(),
+        name.clone(),
+        "true".to_string(),
+        "1".to_string(),
+        "MemoryMax".to_string(),
+        "t".to_string(),
+        memory_max_bytes.to_string(),
+    ];
+    let mut cmd = Command::new(&busctl);
+    cmd.args(args);
+    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(Error::agent(
+            "vm scope",
+            format!("SetUnitProperties {name} failed: {}", stderr.trim()),
+        ));
+    }
+    tracing::debug!(scope = %name, memory_max_bytes, "updated VM scope memory ceiling");
+    Ok(())
+}
+
 /// Force-kill a VM's transient scope: SIGKILL every process in its cgroup.
 ///
 /// This is the AUTHORITATIVE teardown when the pid-based delete can't confirm

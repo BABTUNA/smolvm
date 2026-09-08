@@ -2675,6 +2675,18 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // so a failed delete remains visible and can be retried safely.
     remove_vm_data_and_record(&SmolvmDb::open()?, name, &data_dir)?;
 
+    // Once a child record and its VMM are both gone, its parent may have an old
+    // RAM generation that no remaining clone references. Reap that generation
+    // now instead of retaining its charged pages until the parent's next fork.
+    if let Some(parent) = record.golden.as_deref() {
+        let db = SmolvmDb::open()?;
+        if let Err(error) =
+            smolvm::agent::fork::collect_parent_generations_after_child_delete(&db, parent)
+        {
+            tracing::warn!(%parent, %error, "could not collect unreferenced fork generation");
+        }
+    }
+
     // The VM's readiness marker lives in the *shared* agent rootfs, not its data
     // dir, so the removal above doesn't take it. Sweep it (and any other markers
     // orphaned by a crash/kill) now that this VM's data dir is gone, so the

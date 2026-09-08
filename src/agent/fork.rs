@@ -54,6 +54,25 @@ impl ForkSourceLock {
             .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
         Ok(Self { _file: file })
     }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn try_acquire_at(path: &Path) -> Result<Option<Self>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
+        match try_lock_file_exclusive(&file) {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(Error::agent("fork source lock", error.to_string())),
+        }
+    }
 }
 
 /// Serialize source-state capture for `source` across CLI, SDK, and serve
@@ -64,6 +83,12 @@ impl ForkSourceLock {
 pub fn lock_fork_source(source: &str) -> Result<ForkSourceLock> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
     ForkSourceLock::acquire_at(&fork_source_lock_path(source))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
+    validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
+    ForkSourceLock::try_acquire_at(&fork_source_lock_path(source))
 }
 
 fn fork_source_lock_path(source: &str) -> PathBuf {
@@ -509,6 +534,8 @@ fn atomic_write_snapshot_file(path: &Path, contents: &[u8]) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 const GUARDIAN_MANIFEST_MAGIC: u64 = 0x534d4f4c4752444e;
+#[cfg(target_os = "linux")]
+const GUARDIAN_SOCKET_NAME: &str = "g";
 
 #[cfg(target_os = "linux")]
 fn snapshot_guardian_identity(snapshot_dir: &Path) -> Result<Option<(i32, u64, PathBuf)>> {
@@ -558,7 +585,7 @@ fn snapshot_guardian_identity(snapshot_dir: &Path) -> Result<Option<(i32, u64, P
         use std::os::unix::ffi::OsStringExt;
         PathBuf::from(std::ffi::OsString::from_vec(bytes[72..socket_end].to_vec()))
     };
-    if socket_path != snapshot_dir.join("ram-guardian.sock") {
+    if socket_path != snapshot_dir.join(GUARDIAN_SOCKET_NAME) {
         return Err(Error::agent(
             "read RAM guardian manifest",
             "guardian socket escapes its snapshot directory",
@@ -1222,6 +1249,212 @@ fn gc_unreferenced_fork_generations(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn referenced_fork_generation_count(
+    db: &SmolvmDb,
+    golden: &str,
+    snapshot_root: &Path,
+    retained: Option<&RetainedForkSnapshot>,
+) -> Result<u64> {
+    let mut generations = db
+        .list_vms()?
+        .into_iter()
+        .filter_map(|(_, record)| {
+            (record.golden.as_deref() == Some(golden))
+                .then_some(record.fork_generation)
+                .flatten()
+        })
+        .filter(|generation| {
+            generation.len() == 8
+                && generation.as_bytes().iter().all(u8::is_ascii_hexdigit)
+                && snapshot_root
+                    .join(generation)
+                    .join("source-continues-v1")
+                    .is_file()
+        })
+        .collect::<HashSet<_>>();
+    if let Some(retained) = retained {
+        if reusable_snapshot_path(snapshot_root, &retained.path)
+            && retained_snapshot_source_continues(retained)
+        {
+            if let Some(generation) = snapshot_generation_id(&retained.path) {
+                generations.insert(generation.to_string());
+            }
+        }
+    }
+    u64::try_from(generations.len())
+        .map_err(|_| Error::agent("fork memory accounting", "generation count overflow"))
+}
+
+#[cfg(target_os = "linux")]
+fn fork_lineage_memory_limit_bytes(record: &VmRecord, additional_ram_units: u64) -> Result<u64> {
+    let guest_bytes = u64::from(record.mem)
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| Error::agent("fork memory accounting", "guest memory size overflow"))?;
+    crate::process::vmm_memory_limit_bytes(record.mem, record.cuda)
+        .checked_add(
+            additional_ram_units
+                .checked_mul(guest_bytes)
+                .ok_or_else(|| {
+                    Error::agent("fork memory accounting", "lineage RAM size overflow")
+                })?,
+        )
+        .ok_or_else(|| Error::agent("fork memory accounting", "lineage memory limit overflow"))
+}
+
+#[cfg(target_os = "linux")]
+fn source_has_private_ram_backing(record: &VmRecord) -> bool {
+    record.pid_start_time.is_some() && record.fork_lineage_pid_start_time == record.pid_start_time
+}
+
+#[cfg(target_os = "linux")]
+fn set_fork_lineage_memory_limit(
+    golden: &str,
+    record: &VmRecord,
+    generations: u64,
+) -> Result<bool> {
+    let Some(pid) = record.pid else {
+        return Ok(false);
+    };
+    if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
+        return Ok(false);
+    }
+    let limit = fork_lineage_memory_limit_bytes(record, generations)?;
+    let updated = crate::process::set_managed_vmm_memory_limit(golden, pid, limit)?;
+    if updated {
+        tracing::debug!(%golden, generations, memory_max_bytes = limit, "sized live-branch lineage cgroup");
+    }
+    Ok(updated)
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_fork_lineage_memory_limit(
+    db: &SmolvmDb,
+    golden: &str,
+    record: &VmRecord,
+    snapshot_root: &Path,
+    retained: Option<&RetainedForkSnapshot>,
+) -> Result<()> {
+    let generations = referenced_fork_generation_count(db, golden, snapshot_root, retained)?;
+    let additional_ram_units = generations + u64::from(source_has_private_ram_backing(record));
+    set_fork_lineage_memory_limit(golden, record, additional_ram_units).map(|_| ())
+}
+
+/// Reserve one generation's worst-case resident RAM before the source resumes.
+///
+/// All immutable generation pages stay charged to the cgroup that originally
+/// faulted the source RAM. A raw-forked guardian cannot fix that by moving to a
+/// different cgroup because cgroup v2 does not migrate existing page charges.
+/// Size the owned VM scope for the source, every referenced generation, and
+/// the source's persistent private-over-memfd backing, then reconcile it on
+/// drop after success or rollback.
+#[cfg(target_os = "linux")]
+struct ForkLineageMemoryReservation {
+    golden: String,
+    record: VmRecord,
+    snapshot_dir: PathBuf,
+    previous_ram_units: u64,
+    source_rebased: bool,
+    managed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl ForkLineageMemoryReservation {
+    fn reserve(
+        golden: &str,
+        record: &VmRecord,
+        snapshot_dir: &Path,
+        previous_generations: u64,
+    ) -> Result<Self> {
+        let already_rebased = source_has_private_ram_backing(record);
+        let previous_ram_units = previous_generations
+            .checked_add(u64::from(already_rebased))
+            .ok_or_else(|| Error::agent("fork memory accounting", "RAM unit count overflow"))?;
+        // Reserve the new immutable generation plus the source's persistent
+        // private-over-memfd backing on its first continue capture. The first
+        // generation overlaps that backing, so this is conservatively one
+        // guest above physical use until the original generation is collected.
+        let reserved = previous_ram_units
+            .checked_add(1)
+            .and_then(|units| units.checked_add(u64::from(!already_rebased)))
+            .ok_or_else(|| Error::agent("fork memory accounting", "RAM unit count overflow"))?;
+        let managed = set_fork_lineage_memory_limit(golden, record, reserved)?;
+        Ok(Self {
+            golden: golden.to_string(),
+            record: record.clone(),
+            snapshot_dir: snapshot_dir.to_path_buf(),
+            previous_ram_units,
+            source_rebased: false,
+            managed,
+        })
+    }
+
+    fn mark_source_rebased(&mut self) {
+        self.source_rebased = true;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ForkLineageMemoryReservation {
+    fn drop(&mut self) {
+        if !self.managed {
+            return;
+        }
+        // A published commit marker means the new generation really can retain
+        // one guest's worth of charged pages. Keep its bounded reservation;
+        // DB-backed reconciliation after publication and GC makes it exact.
+        if self.snapshot_dir.join("source-continues-v1").is_file() {
+            return;
+        }
+        let rollback_units = self.previous_ram_units.saturating_add(u64::from(
+            self.source_rebased && !source_has_private_ram_backing(&self.record),
+        ));
+        let result =
+            set_fork_lineage_memory_limit(&self.golden, &self.record, rollback_units).map(|_| ());
+        if let Err(error) = result {
+            // A stale high ceiling is safer than lowering below live charged
+            // memory. The next branch or child-GC pass reconciles it again.
+            tracing::warn!(golden = %self.golden, %error, "could not reconcile live-branch lineage cgroup");
+        }
+    }
+}
+
+/// Collect generations made unreachable by deleting a child. Non-blocking lock
+/// acquisition avoids deadlocking a cascading parent delete that already owns
+/// the same cross-process source lock; that path removes the whole snapshot
+/// tree moments later.
+#[doc(hidden)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn collect_parent_generations_after_child_delete(db: &SmolvmDb, parent: &str) -> Result<()> {
+    let Some(_lock) = try_lock_fork_source(parent)? else {
+        tracing::debug!(%parent, "deferred fork-generation GC while source transaction is active");
+        return Ok(());
+    };
+    let record = db.get_vm(parent)?;
+    if record.is_none() {
+        return Ok(());
+    }
+    let snapshot_root = vm_data_dir(parent).join("s");
+    let retained = db.retained_fork_snapshot(parent)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    gc_unreferenced_fork_generations(db, parent, &snapshot_root, retained.as_ref())?;
+    #[cfg(target_os = "linux")]
+    reconcile_fork_lineage_memory_limit(
+        db,
+        parent,
+        record.as_ref().unwrap(),
+        &snapshot_root,
+        retained.as_ref(),
+    )?;
+    Ok(())
+}
+
+#[doc(hidden)]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn collect_parent_generations_after_child_delete(_db: &SmolvmDb, _parent: &str) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rollback_prepared_disk_generation(
     overlays: &[(PathBuf, PathBuf, crate::data::disk::DiskFormat)],
@@ -1619,6 +1852,8 @@ pub(crate) fn prepare_forks_reusing(
     let golden_rec = db
         .get_vm(golden)?
         .ok_or_else(|| Error::vm_not_found(golden))?;
+    #[cfg(target_os = "linux")]
+    let mut golden_rec = golden_rec;
     if !golden_rec.staged_mounts.is_empty() {
         return Err(Error::config(
             "fork",
@@ -1767,6 +2002,35 @@ pub(crate) fn prepare_forks_reusing(
             }
         }
 
+        #[cfg(target_os = "linux")]
+        let mut lineage_memory_reservation = if fork_continue {
+            let reservation =
+                gc_unreferenced_fork_generations(db, golden, &snapshot_root, retained)
+                    .and_then(|()| {
+                        referenced_fork_generation_count(db, golden, &snapshot_root, retained)
+                    })
+                    .and_then(|generations| {
+                        ForkLineageMemoryReservation::reserve(
+                            golden,
+                            &golden_rec,
+                            &snapshot_dir,
+                            generations,
+                        )
+                    });
+            match reservation {
+                Ok(reservation) => Some(reservation),
+                Err(error) => {
+                    if forkpoint_armed {
+                        let _ = park_forkpoint_after_capture(golden);
+                    }
+                    let _ = std::fs::remove_dir_all(&snapshot_dir);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
         let t_snap = std::time::Instant::now();
         // Prefer demand paging when host policy allows kernel-originated
         // userfaultfd events; otherwise preserve the same semantics with an
@@ -1786,6 +2050,29 @@ pub(crate) fn prepare_forks_reusing(
             if let Err(error) = park_forkpoint_after_capture(golden) {
                 tracing::warn!(%golden, %error, "continued source did not park after capture");
             }
+        }
+        #[cfg(target_os = "linux")]
+        if fork_continue && fork_continue_snapshot(&snapshot_dir) {
+            if let Some(reservation) = lineage_memory_reservation.as_mut() {
+                reservation.mark_source_rebased();
+            }
+            let pid_start_time = golden_rec.pid_start_time;
+            let persisted = db
+                .update_vm(golden, |record| {
+                    record.fork_lineage_pid_start_time = pid_start_time;
+                })
+                .map_err(|error| Error::agent("persist fork RAM lineage", error.to_string()))
+                .and_then(|record| record.ok_or_else(|| Error::vm_not_found(golden)));
+            if let Err(error) = persisted {
+                return Err(rollback_new_snapshot(
+                    db,
+                    golden,
+                    &snapshot_dir,
+                    false,
+                    error,
+                ));
+            }
+            golden_rec.fork_lineage_pid_start_time = pid_start_time;
         }
         let reply = match reply {
             Ok(reply) if reply.starts_with("OK") => reply,
@@ -1852,6 +2139,18 @@ pub(crate) fn prepare_forks_reusing(
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         gc_unreferenced_fork_generations(db, golden, &snapshot_root, retained_snapshot.as_ref())?;
+        #[cfg(target_os = "linux")]
+        if let Err(error) = reconcile_fork_lineage_memory_limit(
+            db,
+            golden,
+            &golden_rec,
+            &snapshot_root,
+            retained_snapshot.as_ref(),
+        ) {
+            // The reservation already raised the cap before capture. Failing to
+            // shrink a stale allowance must not roll back a valid live branch.
+            tracing::warn!(%golden, %error, "could not shrink live-branch lineage cgroup after GC");
+        }
     }
 
     let mut prepared = Vec::with_capacity(specs.len());
@@ -2123,6 +2422,7 @@ fn prepare_clone_from_snapshot(
         );
         clone_rec.golden = Some(golden.to_string());
         clone_rec.fork_generation = snapshot_generation_id(snapshot_dir).map(str::to_string);
+        clone_rec.fork_lineage_pid_start_time = None;
         // Forkability is explicit per clone. A normal clone remains a cheap
         // leaf; a forkable clone materializes its restored RAM into fresh
         // backing files at boot so it can later checkpoint its own state.
@@ -3163,7 +3463,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn write_test_guardian_manifest(snapshot_dir: &Path, pid: i32, start_time: u64) {
-        let socket = snapshot_dir.join("ram-guardian.sock");
+        let socket = snapshot_dir.join(GUARDIAN_SOCKET_NAME);
         let socket = std::os::unix::ffi::OsStrExt::as_bytes(socket.as_os_str());
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&GUARDIAN_MANIFEST_MAGIC.to_le_bytes());
@@ -3588,6 +3888,81 @@ mod tests {
         assert!(retained_path.exists());
         assert!(live_path.exists());
         assert!(!stale_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lineage_accounting_counts_only_referenced_committed_generations() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&temp.path().join("test.db")).unwrap();
+        let root = temp.path().join("s");
+        for generation in ["11111111", "22222222"] {
+            let path = root.join(generation);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("source-continues-v1"), b"source-continues-v1\n").unwrap();
+        }
+        std::fs::create_dir_all(root.join("33333333")).unwrap();
+        let malformed = root.join("not-a-generation");
+        std::fs::create_dir_all(&malformed).unwrap();
+        std::fs::write(
+            malformed.join("source-continues-v1"),
+            b"source-continues-v1\n",
+        )
+        .unwrap();
+
+        let mut child = VmRecord::new("child".into(), 1, 128, vec![], vec![], false);
+        child.golden = Some("golden".into());
+        child.fork_generation = Some("11111111".into());
+        db.insert_vm("child", &child).unwrap();
+        let retained = RetainedForkSnapshot {
+            path: root.join("22222222"),
+            golden_pid: 1,
+            golden_pid_start_time: 1,
+        };
+
+        assert_eq!(
+            referenced_fork_generation_count(&db, "golden", &root, Some(&retained)).unwrap(),
+            2
+        );
+        db.remove_vm("child").unwrap();
+        assert_eq!(
+            referenced_fork_generation_count(&db, "golden", &root, Some(&retained)).unwrap(),
+            1,
+            "unreferenced committed directories must not expand a VM's cgroup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lineage_memory_ceiling_includes_each_retained_guest_generation() {
+        let mut record = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
+        assert_eq!(
+            fork_lineage_memory_limit_bytes(&record, 2).unwrap(),
+            3840 * 1024 * 1024
+        );
+
+        record.cuda = true;
+        assert_eq!(
+            fork_lineage_memory_limit_bytes(&record, 2).unwrap(),
+            4864 * 1024 * 1024
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_ram_backing_belongs_only_to_the_recorded_vmm_process() {
+        let mut record = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
+        assert!(!source_has_private_ram_backing(&record));
+
+        record.pid_start_time = Some(123);
+        record.fork_lineage_pid_start_time = Some(123);
+        assert!(source_has_private_ram_backing(&record));
+
+        record.pid_start_time = Some(124);
+        assert!(
+            !source_has_private_ram_backing(&record),
+            "a restarted VMM must not inherit the previous process's RAM allowance"
+        );
     }
 
     #[test]
