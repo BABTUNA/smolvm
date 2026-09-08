@@ -28,6 +28,17 @@ pub(crate) fn rootfs_dax_window() -> u64 {
     }
 }
 
+/// DAX window for immutable packed image layers. These layers are the main
+/// cross-VM filesystem-sharing surface, but must follow the same architecture
+/// gate as the root filesystem because the arm64 guest kernel has no FUSE DAX.
+pub(crate) fn packed_layers_dax_window() -> u64 {
+    if VIRTIOFS_DAX_SUPPORTED {
+        DATA_DAX_WINDOW
+    } else {
+        0
+    }
+}
+
 /// DAX window for one user mount. Normal mounts are explicit opt-in; on a
 /// supported architecture the CUDA ring is always DAX because it cannot
 /// function as a plain virtiofs mount.
@@ -61,12 +72,14 @@ mod tests {
     #[test]
     fn dax_windows_follow_architecture_support() {
         if cfg!(target_arch = "x86_64") {
+            assert_eq!(packed_layers_dax_window(), DATA_DAX_WINDOW);
             assert_eq!(
                 user_mount_dax_window(Path::new("/opt/smolvm-ring")),
                 CUDA_RING_DAX_WINDOW
             );
         } else {
             assert_eq!(rootfs_dax_window(), 0);
+            assert_eq!(packed_layers_dax_window(), 0);
             assert_eq!(user_mount_dax_window(Path::new("/opt/smolvm-ring")), 0);
         }
     }

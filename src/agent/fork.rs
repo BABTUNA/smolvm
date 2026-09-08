@@ -430,19 +430,134 @@ pub fn fork_continue_enabled() -> bool {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn kernel_fault_userfaultfd_available() -> bool {
-    let fd = unsafe {
-        libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) as libc::c_int
-    };
-    if fd < 0 {
-        return false;
-    }
-    unsafe { libc::close(fd) };
-    true
+    crate::process::open_kernel_userfaultfd().is_ok()
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn kernel_fault_userfaultfd_available() -> bool {
     false
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveBranchRamMode {
+    /// Map every clone from one materialized memfd generation. Clean pages stay
+    /// physically shared across active siblings and only writes allocate RAM.
+    Shared,
+    /// Leave clone RAM empty and fetch pages from the generation guardian as
+    /// they are first touched. Best for one sparse/idle child, but every child
+    /// that reads a page materializes its own copy.
+    Paged,
+}
+
+fn select_live_branch_ram_mode(
+    clone_count: usize,
+    userfaultfd_available: bool,
+    requested: Option<&str>,
+) -> Result<LiveBranchRamMode> {
+    match requested.unwrap_or("auto") {
+        "auto" if clone_count > 1 => Ok(LiveBranchRamMode::Shared),
+        "auto" if userfaultfd_available => Ok(LiveBranchRamMode::Paged),
+        "auto" => Ok(LiveBranchRamMode::Shared),
+        "shared" => Ok(LiveBranchRamMode::Shared),
+        "paged" if userfaultfd_available => Ok(LiveBranchRamMode::Paged),
+        "paged" => Err(Error::agent(
+            "fork",
+            "SMOLVM_BRANCH_RAM_MODE=paged requires kernel-fault userfaultfd; run a privileged SmolVM service or grant it read/write access to /dev/userfaultfd",
+        )),
+        value => Err(Error::config(
+            "fork",
+            format!("SMOLVM_BRANCH_RAM_MODE must be auto, shared, or paged (got '{value}')"),
+        )),
+    }
+}
+
+fn branch_admission_value(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => value.parse::<u64>().map_err(|_| {
+            Error::config(
+                "fork memory admission",
+                format!("{name} must be a non-negative integer MiB value"),
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(Error::config(
+            "fork memory admission",
+            format!("read {name}: {error}"),
+        )),
+    }
+}
+
+fn branch_admission_required_mib(
+    children: usize,
+    child_overhead_mib: u64,
+    reserve_mib: u64,
+    materialized_generation_mib: u64,
+) -> Option<u64> {
+    u64::try_from(children)
+        .ok()?
+        .checked_mul(child_overhead_mib)?
+        .checked_add(reserve_mib)?
+        .checked_add(materialized_generation_mib)
+}
+
+/// Refuse a fan-out before capture if it would consume the host/cgroup's safe
+/// boot headroom. This intentionally reserves only measured VMM boot overhead
+/// plus a fresh shared generation—not every child's configured guest ceiling,
+/// which would erase COW density. Managed per-VM cgroups remain the hard bound
+/// for later workload writes where the service enables them.
+fn admit_branch_memory(
+    record: &VmRecord,
+    children: usize,
+    materializes_shared_generation: bool,
+) -> Result<()> {
+    if std::env::var("SMOLVM_BRANCH_MEMORY_ADMISSION").as_deref() == Ok("0") {
+        return Ok(());
+    }
+    let Some(memory) = crate::process::host_memory_stats() else {
+        return Ok(());
+    };
+    const MIB: u64 = 1024 * 1024;
+    let total_mib = memory.total_bytes / MIB;
+    let available_mib = memory.available_bytes / MIB;
+    let default_reserve_mib = (total_mib / 20).clamp(512, 4096).min(total_mib / 2);
+    let reserve_mib =
+        branch_admission_value("SMOLVM_HOST_MEMORY_RESERVE_MIB", default_reserve_mib)?;
+    // H100 and ordinary Linux QA put a booted, idle VMM at roughly 39–42 MiB.
+    // Reserve 64 MiB to include thread stacks and transient launch state.
+    let child_overhead_mib = branch_admission_value("SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD", 64)?;
+    let materialized_generation_mib = if materializes_shared_generation {
+        record
+            .pid
+            .and_then(crate::process::process_memory_stats)
+            .and_then(|stats| stats.pss_bytes)
+            .map(|bytes| (bytes.saturating_add(MIB - 1)) / MIB)
+            .unwrap_or(u64::from(record.mem))
+            .min(u64::from(record.mem))
+    } else {
+        0
+    };
+    let required_mib = branch_admission_required_mib(
+        children,
+        child_overhead_mib,
+        reserve_mib,
+        materialized_generation_mib,
+    )
+    .ok_or_else(|| Error::agent("fork memory admission", "memory estimate overflow"))?;
+    if available_mib < required_mib {
+        return Err(Error::vm_creation(format!(
+            "branch needs at least {required_mib} MiB of effective host headroom for {children} children, but only {available_mib} MiB is available; reduce the batch, free memory, or tune SMOLVM_HOST_MEMORY_RESERVE_MIB/SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD"
+        )));
+    }
+    tracing::debug!(
+        children,
+        available_mib,
+        required_mib,
+        reserve_mib,
+        child_overhead_mib,
+        materialized_generation_mib,
+        "branch memory admission passed"
+    );
+    Ok(())
 }
 
 pub(crate) fn retained_snapshot_source_continues(snapshot: &RetainedForkSnapshot) -> bool {
@@ -1898,6 +2013,18 @@ pub(crate) fn prepare_forks_reusing(
         ));
     }
     let golden_was_paused = fork_base_already_paused(&status);
+    let fork_continue = fork_continue_enabled();
+    let userfaultfd_available = kernel_fault_userfaultfd_available();
+    let requested_ram_mode = std::env::var("SMOLVM_BRANCH_RAM_MODE").ok();
+    let live_ram_mode = fork_continue
+        .then(|| {
+            select_live_branch_ram_mode(
+                specs.len(),
+                userfaultfd_available,
+                requested_ram_mode.as_deref(),
+            )
+        })
+        .transpose()?;
 
     let gdir = vm_data_dir(golden);
     // Keep this path short and independent of clone names. libkrun and its
@@ -1909,7 +2036,7 @@ pub(crate) fn prepare_forks_reusing(
     // be using an older snapshot.
     let snapshot_root = gdir.join("s");
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if fork_continue_enabled() && !golden_was_paused {
+    if fork_continue && !golden_was_paused {
         recover_uncommitted_generations(db, golden, &gdir, &snapshot_root)?;
     }
     let reusable = retained.filter(|snapshot| {
@@ -1921,12 +2048,38 @@ pub(crate) fn prepare_forks_reusing(
                 snapshot,
             )
     });
+    #[cfg(target_os = "linux")]
+    let reusable = match (reusable, live_ram_mode) {
+        (Some(snapshot), Some(wanted)) if !golden_was_paused => {
+            let retained_mode = if snapshot_guardian_identity(&snapshot.path)?.is_some() {
+                LiveBranchRamMode::Paged
+            } else {
+                LiveBranchRamMode::Shared
+            };
+            if retained_mode == wanted {
+                Some(snapshot)
+            } else {
+                tracing::debug!(
+                    ?wanted,
+                    ?retained_mode,
+                    "fork: refreshing retained RAM generation for requested sharing policy"
+                );
+                None
+            }
+        }
+        (snapshot, _) => snapshot,
+    };
     if golden_was_paused && reusable.is_none() {
         return Err(Error::agent(
             "fork",
             format!("golden '{golden}' is already paused; a valid retained checkpoint is required"),
         ));
     }
+    admit_branch_memory(
+        &golden_rec,
+        specs.len(),
+        reusable.is_none() && live_ram_mode == Some(LiveBranchRamMode::Shared),
+    )?;
     let (snapshot_dir, snapshot_reused) = if let Some(snapshot) = reusable {
         tracing::info!(
             golden,
@@ -1990,7 +2143,6 @@ pub(crate) fn prepare_forks_reusing(
             }
         };
 
-        let fork_continue = fork_continue_enabled();
         if fork_continue {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Err(error) = prepare_running_disk_generation(&gdir, &snapshot_dir, vm_ids) {
@@ -2032,16 +2184,24 @@ pub(crate) fn prepare_forks_reusing(
         };
 
         let t_snap = std::time::Instant::now();
-        // Prefer demand paging when host policy allows kernel-originated
-        // userfaultfd events; otherwise preserve the same semantics with an
-        // eagerly materialized RAM generation.
-        let fork_verb = if fork_continue && kernel_fault_userfaultfd_available() {
-            "FORK_CONTINUE_PAGED"
-        } else if fork_continue {
-            tracing::debug!(
-                "fork: kernel-fault userfaultfd unavailable; using materialized RAM generation"
-            );
-            "FORK_CONTINUE"
+        // A batch maps one materialized memfd generation so siblings share
+        // every clean physical page. For a single sparse child, demand paging
+        // avoids materializing untouched source RAM when userfaultfd is usable.
+        // The environment override is an operator/debugging escape hatch; auto
+        // is the user-facing behavior.
+        let fork_verb = if fork_continue {
+            match live_ram_mode.expect("fork-continue mode selected before capture") {
+                LiveBranchRamMode::Shared => {
+                    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                    if specs.len() == 1 && !userfaultfd_available {
+                        tracing::warn!(
+                            "kernel-fault userfaultfd unavailable; using a shared materialized RAM generation (grant the service read/write access to /dev/userfaultfd to make sparse single-child branches lazy)"
+                        );
+                    }
+                    "FORK_CONTINUE"
+                }
+                LiveBranchRamMode::Paged => "FORK_CONTINUE_PAGED",
+            }
         } else {
             "FORK"
         };
@@ -3360,6 +3520,50 @@ fn host_random_hex(hex_len: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_branch_ram_auto_shares_active_sibling_pages() {
+        assert_eq!(
+            select_live_branch_ram_mode(2, true, None).unwrap(),
+            LiveBranchRamMode::Shared
+        );
+        assert_eq!(
+            select_live_branch_ram_mode(100, false, Some("auto")).unwrap(),
+            LiveBranchRamMode::Shared
+        );
+    }
+
+    #[test]
+    fn live_branch_ram_auto_pages_only_one_sparse_child() {
+        assert_eq!(
+            select_live_branch_ram_mode(1, true, None).unwrap(),
+            LiveBranchRamMode::Paged
+        );
+        assert_eq!(
+            select_live_branch_ram_mode(1, false, None).unwrap(),
+            LiveBranchRamMode::Shared
+        );
+    }
+
+    #[test]
+    fn live_branch_ram_override_is_validated() {
+        assert_eq!(
+            select_live_branch_ram_mode(8, true, Some("paged")).unwrap(),
+            LiveBranchRamMode::Paged
+        );
+        assert!(select_live_branch_ram_mode(8, false, Some("paged")).is_err());
+        assert!(select_live_branch_ram_mode(8, true, Some("copy-everything")).is_err());
+    }
+
+    #[test]
+    fn branch_memory_admission_scales_with_children_and_new_generation() {
+        assert_eq!(branch_admission_required_mib(8, 64, 1024, 512), Some(2048));
+        assert_eq!(branch_admission_required_mib(8, 64, 1024, 0), Some(1536));
+        assert_eq!(
+            branch_admission_required_mib(usize::MAX, u64::MAX, 1, 1),
+            None
+        );
+    }
 
     #[test]
     fn worker_ready_assignment_carries_a_fresh_token_and_refuses_a_forged_one() {

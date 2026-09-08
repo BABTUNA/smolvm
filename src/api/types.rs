@@ -479,6 +479,25 @@ pub struct CapacityResponse {
     pub used_cpus: f64,
     /// Real resident memory (MB) across VM processes.
     pub used_memory_mb: u64,
+    /// Proportional resident memory (MB) across VM processes. Unlike summed
+    /// RSS, this counts clean pages shared by branch siblings only once in the
+    /// aggregate. Omitted where the host cannot provide process PSS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_memory_pss_mb: Option<u64>,
+    /// Private resident memory (MB) across VM processes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_memory_private_mb: Option<u64>,
+    /// Sum of shared bytes mapped by VM processes (MB). This is a mapping gauge,
+    /// not a unique physical-memory total; use `used_memory_pss_mb` for that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_memory_shared_mapped_mb: Option<u64>,
+    /// Effective memory ceiling (MB) available to this runtime, constrained by
+    /// finite cgroup-v2 ancestors where applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_memory_total_mb: Option<u64>,
+    /// Effective memory currently available (MB) to this runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_memory_available_mb: Option<u64>,
     /// Real disk (GB) consumed by VM storage + overlay files.
     pub used_disk_gb: u64,
     /// Opaque id minted once per serve process. It changes iff the serve restarts
@@ -759,6 +778,20 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 128)]
     pub rss_mb: Option<u64>,
+    /// Proportional resident memory (PSS) in MiB. Summing this across branch
+    /// siblings accounts shared clean pages once instead of once per sibling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 72)]
+    pub pss_mb: Option<u64>,
+    /// Private resident memory in MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 48)]
+    pub private_memory_mb: Option<u64>,
+    /// Shared memory mapped by this VMM in MiB. This is not a unique physical
+    /// total when summed; use PSS for physical accounting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 384)]
+    pub shared_memory_mapped_mb: Option<u64>,
     /// Actual host disk consumed by this machine's data dir, in MiB (real blocks of
     /// the sparse disk images, not provisioned capacity). An instantaneous gauge the
     /// control integrates over time for active-disk billing. Omitted when the data

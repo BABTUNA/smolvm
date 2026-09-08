@@ -1818,7 +1818,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     ctx,
                     tag.as_ptr(),
                     host_path.as_ptr(),
-                    super::virtiofs::DATA_DAX_WINDOW,
+                    super::virtiofs::packed_layers_dax_window(),
                     false,
                 ) < 0
                 {
