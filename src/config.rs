@@ -600,6 +600,14 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_generation: Option<String>,
 
+    /// Process identity of a live branch source whose RAM has been rebased onto
+    /// private mappings. Such a source can retain its original memfd backing in
+    /// addition to its current private pages even after every older child is
+    /// deleted, so Linux cgroup accounting must keep one structural RAM unit
+    /// until this exact VMM process exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_lineage_pid_start_time: Option<u64>,
+
     /// Persistent container-overlay owner inherited from the root of a fork
     /// lineage. A clone's live overlay keeps its original on-disk name across
     /// every generation; descendants must continue addressing that root name.
@@ -730,6 +738,7 @@ impl VmRecord {
             source_smolmachine: None,
             golden: None,
             fork_generation: None,
+            fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),
@@ -800,6 +809,7 @@ impl VmRecord {
             source_smolmachine: None,
             golden: None,
             fork_generation: None,
+            fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),

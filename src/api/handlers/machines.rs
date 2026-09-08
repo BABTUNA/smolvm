@@ -2954,6 +2954,24 @@ pub(crate) async fn delete_one(
         }
     }
 
+    if let Some(parent) = record.golden.clone() {
+        let db = state.db().clone();
+        let parent_for_log = parent.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            crate::agent::fork::collect_parent_generations_after_child_delete(&db, &parent)
+        })
+        .await;
+        match cleanup {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(parent = %parent_for_log, %error, "could not collect unreferenced fork generation")
+            }
+            Err(error) => {
+                tracing::warn!(parent = %parent_for_log, %error, "fork-generation cleanup task failed")
+            }
+        }
+    }
+
     Ok(DeleteResponse { deleted: name })
 }
 

@@ -523,6 +523,73 @@ pub fn vmm_memory_limit_bytes(guest_memory_mib: u32, cuda: bool) -> u64 {
     limit_mib.saturating_mul(1024 * 1024)
 }
 
+#[cfg(target_os = "linux")]
+fn cgroup_v2_process_dir(pid: Pid) -> Option<std::path::PathBuf> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let rel = content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim();
+    let rel = std::path::Path::new(rel.trim_start_matches('/'));
+    if rel
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(std::path::Path::new("/sys/fs/cgroup").join(rel))
+}
+
+/// Update `memory.max` only when `pid` is already inside a cgroup owned by
+/// SmolVM. Returns `false` for ordinary CLI-launched/externally-capped
+/// processes, whose enclosing cgroup must never be modified by a guest action.
+///
+/// Live branch generations retain page charges in the source VMM's cgroup even
+/// after a guardian moves: cgroup v2 does not migrate existing charges with a
+/// process. The branch lifecycle therefore uses this hook to size that owned
+/// cgroup for the source plus its retained immutable generations.
+#[cfg(target_os = "linux")]
+pub fn set_managed_vmm_memory_limit(
+    machine: &str,
+    pid: Pid,
+    memory_max_bytes: u64,
+) -> Result<bool> {
+    let Some(dir) = cgroup_v2_process_dir(pid) else {
+        return Ok(false);
+    };
+    let Some(leaf) = dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    let scope = crate::systemd_scope::scope_name(machine);
+    if leaf == scope {
+        crate::systemd_scope::set_scope_memory_max(machine, memory_max_bytes)?;
+        return Ok(true);
+    }
+    if leaf == format!("vm-{pid}") {
+        write_cgroup(&dir, "memory.max", &memory_max_bytes.to_string()).map_err(|error| {
+            Error::agent(
+                "VM cgroup",
+                format!(
+                    "update {} memory.max to {memory_max_bytes}: {error}",
+                    dir.display()
+                ),
+            )
+        })?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+/// Leave the VMM memory limit unchanged on hosts without Linux cgroup v2.
+pub fn set_managed_vmm_memory_limit(
+    _machine: &str,
+    _pid: Pid,
+    _memory_max_bytes: u64,
+) -> Result<bool> {
+    Ok(false)
+}
+
 /// Bound each CUDA fork-pool VM to its configured CPU count or an even share
 /// of the host, whichever is smaller. Preserve two vCPUs when the configured
 /// VM and host permit it because single-vCPU CUDA forkable guests do not reach
