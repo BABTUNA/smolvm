@@ -54,6 +54,22 @@ pub fn get_vm_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
     }
 }
 
+/// Open a machine for launch: its disks are created if missing, at the sizes
+/// its record carries (or the defaults when it has no record). Every path
+/// that may boot a machine goes through this; [`get_vm_manager`] is for
+/// looking at one.
+pub fn get_vm_manager_for_launch(name: &Option<String>) -> smolvm::Result<AgentManager> {
+    let name = name.as_deref().unwrap_or("default");
+    let record = SmolvmDb::open()
+        .ok()
+        .and_then(|db| db.get_vm(name).ok().flatten());
+    AgentManager::for_vm_with_sizes(
+        name,
+        record.as_ref().and_then(|r| r.storage_gb),
+        record.as_ref().and_then(|r| r.overlay_gb),
+    )
+}
+
 /// Return the display label for an optional VM name.
 pub fn vm_label(name: &Option<String>) -> String {
     name.as_deref().unwrap_or("default").to_string()
@@ -2075,7 +2091,7 @@ fn check_port_conflicts(
 
 /// Start the default machine.
 pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::Result<()> {
-    let manager = AgentManager::new_default()?;
+    let manager = get_vm_manager_for_launch(&None)?;
 
     if manager.try_connect_existing().is_some() {
         let pid_suffix = format_pid_suffix(manager.child_pid());

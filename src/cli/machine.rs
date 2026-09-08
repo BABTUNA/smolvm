@@ -5022,7 +5022,8 @@ pub struct NetworkTestCmd {
 
 impl NetworkTestCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = vm_common::get_vm_manager(&self.name)?;
+        // May start the machine below, so open it for launch.
+        let manager = vm_common::get_vm_manager_for_launch(&self.name)?;
         let label = vm_common::vm_label(&self.name);
 
         // Ensure machine is running
