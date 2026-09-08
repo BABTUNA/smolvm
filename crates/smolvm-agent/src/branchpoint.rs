@@ -93,6 +93,13 @@ impl Markers {
     }
 }
 
+/// Mode for files the workload's helper must read: the release marker and
+/// the identity files. A workload may run as any account the image or the
+/// machine names, and the VM is single-tenant, so "readable by all" inside
+/// it means "readable by the workload". The agent's own activation receipt
+/// stays private.
+const WORKLOAD_READABLE: u32 = 0o644;
+
 /// How long the helper has to acknowledge an arm or park.
 const ACK_WINDOW: Duration = Duration::from_secs(2);
 /// How long a restored clone has to acknowledge its release.
@@ -293,7 +300,10 @@ pub fn release(markers: &Markers, env_dotenv: Option<&str>) -> Result<(), TypedE
     }
     let generation = generation_of(&markers.ready)?;
     let marker = release_marker(&generation, env_dotenv.unwrap_or(""));
-    write_atomic(&markers.release, &marker, 0o600)?;
+    // The workload reads this, and it may run as any account the image or
+    // the machine names; the VM is single-tenant, so within it the marker is
+    // readable by all.
+    write_atomic(&markers.release, &marker, WORKLOAD_READABLE)?;
     // The helper acknowledges by dropping its generation line.
     let line = format!("{GENERATION_PREFIX}{generation}");
     let acknowledged = settled(markers, RELEASE_WINDOW, || {
@@ -374,12 +384,12 @@ pub fn activate(
     }
     std::fs::create_dir_all(env_dir)
         .map_err(|error| TypedError::io("create env directory", error))?;
-    write_atomic(env_path, env_dotenv, 0o600)?;
-    write_atomic(branch_env_path, env_sourceable, 0o600)?;
+    write_atomic(env_path, env_dotenv, WORKLOAD_READABLE)?;
+    write_atomic(branch_env_path, env_sourceable, WORKLOAD_READABLE)?;
     write_atomic(
         &markers.release,
         &release_marker(&generation, env_dotenv),
-        0o600,
+        WORKLOAD_READABLE,
     )?;
     Ok(Activation::Done)
 }
@@ -611,6 +621,35 @@ mod tests {
         // A different token is refused.
         let other = activate(&markers, "LR=x\n", "", &env, &benv, None, &ws, "tok-b").unwrap_err();
         assert_eq!(other.code, typed_error::TOKEN_MISMATCH);
+    }
+
+    /// A workload may run as a non-root account, so everything its helper
+    /// must read is world-readable inside the VM; the agent's receipt is not.
+    #[cfg(unix)]
+    #[test]
+    fn workload_facing_files_are_readable_by_any_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let markers = Markers::under(&temp.path().join("state"));
+        ready_with(&markers, GEN);
+        let ws = temp.path().join("ws");
+        let (env, benv) = (ws.join("fork-env"), ws.join("branch-env"));
+        activate(
+            &markers,
+            "LR=1\n",
+            "export LR='1'\n",
+            &env,
+            &benv,
+            None,
+            &ws,
+            "tok",
+        )
+        .unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&markers.release), 0o644);
+        assert_eq!(mode(&env), 0o644);
+        assert_eq!(mode(&benv), 0o644);
+        assert_eq!(mode(&markers.receipt), 0o600);
     }
 
     #[test]
