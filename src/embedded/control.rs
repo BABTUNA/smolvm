@@ -74,6 +74,7 @@ impl MachineSpec {
         record.staged_mounts = staged_mounts;
         record.storage_gb = self.resources.storage_gib;
         record.overlay_gb = self.resources.overlay_gib;
+        record.block_io = self.resources.block_io;
         record.allowed_cidrs = self.resources.allowed_cidrs.clone();
         record.dns_filter_hosts = if self.allowed_hosts.is_empty() {
             None

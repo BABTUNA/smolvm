@@ -112,6 +112,10 @@ pub fn launch_agent_vm_dynamic(
     krun: &KrunFunctions,
     config: &PackedLaunchConfig,
 ) -> Result<(), String> {
+    config
+        .resources
+        .validate()
+        .map_err(|error| error.to_string())?;
     crate::network::validate_requested_network_backend(
         &config.resources,
         config.dns_filter_hosts.as_deref(),
@@ -604,18 +608,20 @@ pub fn launch_agent_vm_dynamic(
         "storage path contains null byte"
     );
     let storage_format = krun_disk_format(config.storage_path);
-    // SAFETY: ctx is valid, block_id and disk_path are valid C strings
-    if unsafe {
-        (krun.add_disk2)(
-            ctx,
-            block_id.as_ptr(),
-            disk_path.as_ptr(),
-            storage_format,
-            false,
-        )
-    } < 0
-    {
-        free_ctx_on_err!("krun_add_disk2 failed");
+    let storage_result = add_dynamic_block_disk(
+        krun,
+        ctx,
+        block_id.as_ptr(),
+        disk_path.as_ptr(),
+        storage_format,
+        config.resources.block_io,
+    );
+    if storage_result < 0 {
+        free_ctx_on_err!(dynamic_block_error(
+            "storage",
+            config.resources.block_io,
+            storage_result
+        ));
     }
 
     // Add overlay disk as 2nd disk (/dev/vdb) for VM mode
@@ -624,18 +630,20 @@ pub fn launch_agent_vm_dynamic(
         let overlay_disk =
             try_or_free_ctx!(path_to_cstring(overlay), "overlay path contains null byte");
         let overlay_format = krun_disk_format(overlay);
-        // SAFETY: ctx is valid, overlay_id and overlay_disk are valid C strings
-        if unsafe {
-            (krun.add_disk2)(
-                ctx,
-                overlay_id.as_ptr(),
-                overlay_disk.as_ptr(),
-                overlay_format,
-                false,
-            )
-        } < 0
-        {
-            free_ctx_on_err!("krun_add_disk2 failed for overlay disk");
+        let overlay_result = add_dynamic_block_disk(
+            krun,
+            ctx,
+            overlay_id.as_ptr(),
+            overlay_disk.as_ptr(),
+            overlay_format,
+            config.resources.block_io,
+        );
+        if overlay_result < 0 {
+            free_ctx_on_err!(dynamic_block_error(
+                "overlay",
+                config.resources.block_io,
+                overlay_result
+            ));
         }
     }
 
@@ -878,6 +886,14 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    if let Err(error) = crate::process::install_configured_seccomp_filter(
+        config.resources.block_io == crate::data::resources::BlockIoEngine::Async,
+    ) {
+        free_ctx_on_err!(format!(
+            "seccomp filter failed; refusing to boot unconfined: {error}"
+        ));
+    }
+
     // Start VM (never returns on success)
     // SAFETY: ctx is valid, all configuration has been set
     let ret = unsafe { (krun.start_enter)(ctx) };
@@ -891,6 +907,60 @@ pub fn launch_agent_vm_dynamic(
         ret,
         start_error_detail.as_deref(),
     ))
+}
+
+fn add_dynamic_block_disk(
+    krun: &KrunFunctions,
+    ctx: u32,
+    block_id: *const libc::c_char,
+    disk_path: *const libc::c_char,
+    disk_format: u32,
+    engine: crate::data::resources::BlockIoEngine,
+) -> i32 {
+    const KRUN_SYNC_FULL: u32 = 2;
+    const KRUN_BLOCK_IO_ASYNC: u32 = 1;
+    const KRUN_ADD_DISK4_MISSING: i32 = i32::MIN + 4;
+
+    if engine == crate::data::resources::BlockIoEngine::Async {
+        let Some(add_disk4) = krun.add_disk4 else {
+            return KRUN_ADD_DISK4_MISSING;
+        };
+        // Buffered disk, full guest flush semantics, restricted io_uring engine.
+        return unsafe {
+            add_disk4(
+                ctx,
+                block_id,
+                disk_path,
+                disk_format,
+                false,
+                false,
+                KRUN_SYNC_FULL,
+                KRUN_BLOCK_IO_ASYNC,
+            )
+        };
+    }
+    unsafe { (krun.add_disk2)(ctx, block_id, disk_path, disk_format, false) }
+}
+
+fn dynamic_block_error(
+    disk: &str,
+    engine: crate::data::resources::BlockIoEngine,
+    result: i32,
+) -> String {
+    const KRUN_ADD_DISK4_MISSING: i32 = i32::MIN + 4;
+    if engine == crate::data::resources::BlockIoEngine::Async && result == KRUN_ADD_DISK4_MISSING {
+        return format!(
+            "async block I/O for {disk} requires a newer bundled libkrun (krun_add_disk4 missing)"
+        );
+    }
+    if engine == crate::data::resources::BlockIoEngine::Async
+        && matches!(result, r if r == -libc::ENOSYS || r == -libc::EPERM || r == -libc::EACCES || r == -libc::ENOTSUP)
+    {
+        return format!(
+            "async block I/O is unavailable for {disk} on this host (io_uring error {result}); use --block-io sync"
+        );
+    }
+    format!("failed to add {disk} disk with {engine:?} block I/O (error {result})")
 }
 
 /// Create a CString from a static string that is known not to contain NUL bytes.
@@ -1086,6 +1156,20 @@ fn raise_fd_limits() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_block_errors_distinguish_old_library_from_host_support() {
+        use crate::data::resources::BlockIoEngine;
+
+        assert!(
+            dynamic_block_error("storage", BlockIoEngine::Async, i32::MIN + 4)
+                .contains("newer bundled libkrun")
+        );
+        assert!(
+            dynamic_block_error("storage", BlockIoEngine::Async, -libc::EPERM)
+                .contains("use --block-io sync")
+        );
+    }
 
     #[test]
     fn describe_krun_start_error_decodes_common_codes() {

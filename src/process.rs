@@ -556,9 +556,9 @@ pub fn cuda_fork_pool_vcpus(configured: u8, pool_size: u32, host_cpus: usize) ->
 // Gated by SMOLVM_SECCOMP=audit|enforce so rollout is opt-in.
 // ============================================================================
 
-/// Install the seccomp allowlist on the calling thread (and, by inheritance, on
-/// every thread it later spawns — the vCPU/worker threads libkrun creates). Must
-/// be called while still single-threaded, before `krun_start_enter`.
+/// Install the seccomp allowlist on every current thread with TSYNC.  Device
+/// setup may create a permanently restricted io_uring first; this function is
+/// still called before `krun_start_enter` creates the vCPU and device workers.
 ///
 /// `enforce = true`  → a non-allowlisted syscall kills the process (KillProcess).
 /// `enforce = false` → audit mode: non-allowlisted syscalls are logged but allowed
@@ -567,13 +567,28 @@ pub fn cuda_fork_pool_vcpus(configured: u8, pool_size: u32, host_cpus: usize) ->
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub fn install_seccomp_filter(enforce: bool) -> std::result::Result<(), String> {
+pub fn install_seccomp_filter(
+    enforce: bool,
+    allow_restricted_io_uring: bool,
+) -> std::result::Result<(), String> {
     // Build the BPF program (allocates) and apply it (a single seccomp syscall,
     // allocation-free). Split out so tests can build in the parent and apply in a
     // forked child without allocating post-fork.
-    let program = build_seccomp_program(enforce)?;
-    seccompiler::apply_filter(&program).map_err(|e| e.to_string())?;
+    let program = build_seccomp_program(enforce, allow_restricted_io_uring)?;
+    seccompiler::apply_filter_all_threads(&program).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Apply the configured VMM filter after device setup and before entering the
+/// guest.  Enforce mode fails closed; audit mode logs denied syscalls.
+pub fn install_configured_seccomp_filter(
+    allow_restricted_io_uring: bool,
+) -> std::result::Result<(), String> {
+    match std::env::var("SMOLVM_SECCOMP").as_deref() {
+        Ok("enforce") => install_seccomp_filter(true, allow_restricted_io_uring),
+        Ok("audit") => install_seccomp_filter(false, allow_restricted_io_uring),
+        _ => Ok(()),
+    }
 }
 
 /// Compile the syscall allowlist into a seccomp BPF program. See
@@ -582,7 +597,10 @@ pub fn install_seccomp_filter(enforce: bool) -> std::result::Result<(), String> 
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfProgram, String> {
+fn build_seccomp_program(
+    enforce: bool,
+    allow_restricted_io_uring: bool,
+) -> std::result::Result<seccompiler::BpfProgram, String> {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
     use std::collections::BTreeMap;
 
@@ -685,6 +703,14 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_setresuid, libc::SYS_setresgid,
     ];
 
+    // An async block ring is created with R_DISABLED, fixed-file-only and
+    // readv/writev-only restrictions before this filter is installed.  The
+    // running VMM may enter that ring, but cannot create or reconfigure one:
+    // io_uring_setup and io_uring_register remain outside this allowlist.
+    if allow_restricted_io_uring {
+        allowed.push(libc::SYS_io_uring_enter);
+    }
+
     // Legacy syscalls present only on x86_64; aarch64 exposes only the *at/p
     // variants (already in the common list above) plus a few of its own. These
     // libc::SYS_* constants don't exist on the other arch, so they must be
@@ -743,7 +769,10 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
-pub fn install_seccomp_filter(_enforce: bool) -> std::result::Result<(), String> {
+pub fn install_seccomp_filter(
+    _enforce: bool,
+    _allow_restricted_io_uring: bool,
+) -> std::result::Result<(), String> {
     Ok(())
 }
 
@@ -2777,7 +2806,7 @@ mod tests {
     fn seccomp_denies_forbidden_syscall() {
         // Build the filter in the parent (allocating), then fork a child that
         // applies it (allocation-free) and attempts the forbidden syscall.
-        let program = build_seccomp_program(true).expect("build seccomp program");
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
         unsafe {
             let pid = libc::fork();
             assert!(pid >= 0, "fork failed");
@@ -2798,6 +2827,51 @@ mod tests {
         }
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn async_block_seccomp_allows_enter_but_denies_new_rings() {
+        let program = build_seccomp_program(true, true).expect("build seccomp program");
+        unsafe {
+            let enter_pid = libc::fork();
+            assert!(enter_pid >= 0, "fork failed");
+            if enter_pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                let result = libc::syscall(libc::SYS_io_uring_enter, -1, 0, 0, 0, 0, 0);
+                libc::_exit(if result == -1 { 0 } else { 3 });
+            }
+            let mut status = 0;
+            libc::waitpid(enter_pid, &mut status, 0);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "io_uring_enter should remain available to the prepared ring, status={status:#x}"
+            );
+
+            let setup_pid = libc::fork();
+            assert!(setup_pid >= 0, "fork failed");
+            if setup_pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                libc::syscall(
+                    libc::SYS_io_uring_setup,
+                    1,
+                    std::ptr::null_mut::<libc::c_void>(),
+                );
+                libc::_exit(0);
+            }
+            libc::waitpid(setup_pid, &mut status, 0);
+            assert!(
+                libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+                "io_uring_setup must remain blocked, status={status:#x}"
+            );
+        }
+    }
+
     /// A second live fork must be able to protect the previous generation's
     /// RAM-guardian socket while the VMM is confined. This is deliberately a
     /// direct syscall check so a future stdlib implementation change cannot
@@ -2811,7 +2885,7 @@ mod tests {
         let path = temp.path().join("guardian.sock");
         std::fs::write(&path, b"").expect("create guardian stand-in");
         let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("cstring");
-        let program = build_seccomp_program(true).expect("build seccomp program");
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
 
         unsafe {
             let pid = libc::fork();

@@ -744,6 +744,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_set_workdir = krun.set_workdir;
         let krun_set_exec = krun.set_exec;
         let krun_add_disk2 = krun.add_disk2;
+        let krun_add_disk4 = krun.add_disk4;
         let krun_add_vsock_port2 = krun.add_vsock_port2;
         let krun_set_port_map = krun.set_port_map;
         let krun_add_virtiofs = krun.add_virtiofs;
@@ -1407,18 +1408,23 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             "path contains null byte"
         );
         let storage_format = disks.storage.format().to_krun_u32();
-        if krun_add_disk2(
-            ctx,
-            block_id.as_ptr(),
-            disk_path.as_ptr(),
-            storage_format,
-            false,
-        ) < 0
-        {
+        let storage_result = add_block_disk(
+            BlockDisk {
+                ctx,
+                block_id: block_id.as_ptr(),
+                disk_path: disk_path.as_ptr(),
+                disk_format: storage_format,
+                read_only: false,
+            },
+            resources.block_io,
+            krun_add_disk2,
+            krun_add_disk4,
+        );
+        if storage_result < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent(
                 "add storage disk",
-                "krun_add_disk2 failed - VM cannot function without storage",
+                block_io_error("storage", resources.block_io, storage_result),
             ));
         }
 
@@ -1432,18 +1438,23 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "path contains null byte"
             );
             let overlay_format = overlay.format().to_krun_u32();
-            if krun_add_disk2(
-                ctx,
-                overlay_id.as_ptr(),
-                overlay_path.as_ptr(),
-                overlay_format,
-                false,
-            ) < 0
-            {
+            let overlay_result = add_block_disk(
+                BlockDisk {
+                    ctx,
+                    block_id: overlay_id.as_ptr(),
+                    disk_path: overlay_path.as_ptr(),
+                    disk_format: overlay_format,
+                    read_only: false,
+                },
+                resources.block_io,
+                krun_add_disk2,
+                krun_add_disk4,
+            );
+            if overlay_result < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "add overlay disk",
-                    "krun_add_disk2 failed for rootfs overlay",
+                    block_io_error("overlay", resources.block_io, overlay_result),
                 ));
             }
         }
@@ -2133,6 +2144,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Async disks create a permanently restricted, fixed-file io_uring
+        // during the configuration calls above.  Apply seccomp only now, with
+        // TSYNC, so ring creation remains denied to a compromised running VMM.
+        if let Err(error) = crate::process::install_configured_seccomp_filter(
+            resources.block_io == crate::data::resources::BlockIoEngine::Async,
+        ) {
+            krun_free_ctx(ctx);
+            return Err(Error::agent(
+                "install seccomp filter",
+                format!("refusing to boot unconfined: {error}"),
+            ));
+        }
+
         // Start VM (this replaces the process on success)
         boot_timing!("entering vm");
         let ret = krun_start_enter(ctx);
@@ -2302,8 +2326,91 @@ pub(crate) fn idle_reclaim_minutes() -> Option<u64> {
     }
 }
 
+use std::time::Duration;
+
+type AddDisk2 =
+    unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u32, bool) -> i32;
+type AddDisk4 = unsafe extern "C" fn(
+    u32,
+    *const libc::c_char,
+    *const libc::c_char,
+    u32,
+    bool,
+    bool,
+    u32,
+    u32,
+) -> i32;
+
+const KRUN_SYNC_FULL: u32 = 2;
+const KRUN_BLOCK_IO_ASYNC: u32 = 1;
+const KRUN_ADD_DISK4_MISSING: i32 = i32::MIN + 4;
+
+struct BlockDisk {
+    ctx: u32,
+    block_id: *const libc::c_char,
+    disk_path: *const libc::c_char,
+    disk_format: u32,
+    read_only: bool,
+}
+
+/// Add a writable block disk with the requested host engine.
+unsafe fn add_block_disk(
+    disk: BlockDisk,
+    engine: crate::data::resources::BlockIoEngine,
+    add_disk2: AddDisk2,
+    add_disk4: Option<AddDisk4>,
+) -> i32 {
+    use crate::data::resources::BlockIoEngine;
+    if engine == BlockIoEngine::Async {
+        let Some(add_disk4) = add_disk4 else {
+            return KRUN_ADD_DISK4_MISSING;
+        };
+        // Buffered disk, full guest flush semantics, restricted io_uring engine.
+        return unsafe {
+            add_disk4(
+                disk.ctx,
+                disk.block_id,
+                disk.disk_path,
+                disk.disk_format,
+                disk.read_only,
+                false,
+                KRUN_SYNC_FULL,
+                KRUN_BLOCK_IO_ASYNC,
+            )
+        };
+    }
+    unsafe {
+        add_disk2(
+            disk.ctx,
+            disk.block_id,
+            disk.disk_path,
+            disk.disk_format,
+            disk.read_only,
+        )
+    }
+}
+
+fn block_io_error(
+    disk: &str,
+    engine: crate::data::resources::BlockIoEngine,
+    result: i32,
+) -> String {
+    if engine == crate::data::resources::BlockIoEngine::Async && result == KRUN_ADD_DISK4_MISSING {
+        return format!(
+            "async block I/O for {disk} requires a newer bundled libkrun (krun_add_disk4 missing)"
+        );
+    }
+    if engine == crate::data::resources::BlockIoEngine::Async
+        && matches!(result, r if r == -libc::ENOSYS || r == -libc::EPERM || r == -libc::EACCES || r == -libc::ENOTSUP)
+    {
+        return format!(
+            "async block I/O is unavailable for {disk} on this host (io_uring error {result}); use --block-io sync"
+        );
+    }
+    format!("failed to add {disk} disk with {engine:?} block I/O (error {result})")
+}
+
 fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
-    use std::time::Duration;
     const TICK: Duration = Duration::from_secs(30);
     const IDLE_FRACTION: f64 = 0.01;
     const ACTIVE_FRACTION: f64 = 0.05;
@@ -2382,6 +2489,20 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn async_block_errors_distinguish_old_library_from_host_support() {
+        use crate::data::resources::BlockIoEngine;
+
+        assert!(
+            block_io_error("storage", BlockIoEngine::Async, KRUN_ADD_DISK4_MISSING)
+                .contains("newer bundled libkrun")
+        );
+        assert!(
+            block_io_error("storage", BlockIoEngine::Async, -libc::EPERM)
+                .contains("use --block-io sync")
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

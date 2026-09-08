@@ -390,6 +390,10 @@ pub struct VmRecord {
     #[serde(default = "default_mem")]
     pub mem: u32,
 
+    /// Host engine used for writable virtio block disks.
+    #[serde(default)]
+    pub block_io: crate::data::resources::BlockIoEngine,
+
     /// Volume mounts (host_path, guest_path, read_only).
     #[serde(default)]
     pub mounts: Vec<(String, String, bool)>,
@@ -681,6 +685,7 @@ impl VmRecord {
             pid_start_time: None,
             cpus,
             mem,
+            block_io: Default::default(),
             mounts,
             staged_mounts: Vec::new(),
             ports,
@@ -750,6 +755,7 @@ impl VmRecord {
             pid_start_time: None,
             cpus,
             mem,
+            block_io: Default::default(),
             mounts,
             staged_mounts: Vec::new(),
             ports,
@@ -981,6 +987,7 @@ impl VmRecord {
             rosetta: self.rosetta.unwrap_or(false),
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
+            block_io: self.block_io,
             allowed_cidrs: self.allowed_cidrs.clone(),
             dns: self.dns,
             network_name: self.network_name.clone(),
@@ -1442,6 +1449,20 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.storage_gb, Some(50));
         assert_eq!(deserialized.overlay_gb, Some(20));
+    }
+
+    #[test]
+    fn block_io_defaults_to_sync_and_round_trips_async() {
+        let legacy = r#"{"name":"legacy"}"#;
+        let record: VmRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(record.block_io, crate::data::resources::BlockIoEngine::Sync);
+
+        let mut record = VmRecord::new("queued".to_string(), 2, 512, vec![], vec![], false);
+        record.block_io = crate::data::resources::BlockIoEngine::Async;
+        let decoded: VmRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_eq!(decoded.block_io, record.block_io);
+        assert_eq!(decoded.vm_resources().block_io, record.block_io);
     }
 
     #[test]

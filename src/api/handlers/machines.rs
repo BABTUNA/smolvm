@@ -115,6 +115,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // when unset.
         storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
+        block_io: record.block_io,
         branchable: record.forkable_on_start(),
         forkable: record.forkable_on_start(),
         parent_machine: record.golden.clone(),
@@ -1087,6 +1088,7 @@ pub async fn create_machine(
         cuda: Some(req.cuda || req.auto_graph),
         storage_gb: restored_storage_gb,
         overlay_gb: restored_overlay_gb,
+        block_io: req.block_io,
         allowed_cidrs: normalized_cidrs,
         allowed_hosts: restored_allowed_hosts,
         network_backend: restored_network_backend,
@@ -3849,6 +3851,7 @@ mod tests {
             docker_socket: false,
             storage_gb: None,
             overlay_gb: None,
+            block_io: None,
             allowed_cidrs: None,
             allowed_hosts: None,
             network_backend: None,

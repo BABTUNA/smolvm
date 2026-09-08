@@ -25,6 +25,7 @@
 //! | `net` | bool | No | Enable outbound networking via NAT. |
 //! | `cuda` | bool | No | Enable CUDA-over-vsock (host NVIDIA GPU). |
 //! | `auto_graph` | bool | No | Best-effort framework CUDA graphs; implies `cuda`. |
+//! | `block_io` | `"sync"` or `"async"` | No | Host block I/O engine; defaults to `sync`. |
 //! | `storage` | int | No | Storage disk size in GiB. |
 //! | `overlay` | int | No | Overlay disk size in GiB. |
 //! | `ports` | string[] | No | Port mappings (`"host:guest"` or equal-length `"host-start-host-end:guest-start-guest-end"` ranges). Prefer `[dev] ports`. |
@@ -289,6 +290,8 @@ pub struct Smolfile {
     pub storage: Option<u64>,
     /// Overlay disk size in GiB.
     pub overlay: Option<u64>,
+    /// Host block I/O engine: `sync` (default) or Linux raw-disk `async`.
+    pub block_io: Option<String>,
 
     // Legacy top-level fields (prefer [dev] section)
     /// Port mappings (e.g., `["8080:8080"]`).
@@ -661,6 +664,15 @@ protocol = "http"
 
         let sf = parse("").unwrap();
         assert_eq!(sf.auto_graph, None);
+    }
+
+    #[test]
+    fn parse_block_io_field() {
+        let sf = parse("block_io = \"async\"").unwrap();
+        assert_eq!(sf.block_io.as_deref(), Some("async"));
+
+        let sf = parse("").unwrap();
+        assert_eq!(sf.block_io, None);
     }
 
     #[test]

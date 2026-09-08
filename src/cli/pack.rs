@@ -410,6 +410,7 @@ impl PackCreateCmd {
                 cuda: false,
                 storage_gib: None,
                 overlay_gib: None,
+                block_io: Default::default(),
                 gpu_vram_mib: None,
                 rosetta: false,
                 allowed_cidrs: None,
