@@ -426,6 +426,9 @@ pub struct PackConfig {
     pub env: Vec<String>,
     /// Resolved working directory.
     pub workdir: Option<String>,
+    /// User the packed workload runs as, from the Smolfile; `None` leaves the
+    /// image's `USER` in force.
+    pub user: Option<String>,
     /// Whether outbound networking is enabled.
     /// `None` = unspecified (caller decides default), `Some(true)` = explicitly
     /// enabled, `Some(false)` = explicitly disabled. This tri-state is needed
@@ -475,6 +478,7 @@ pub fn resolve_pack_config(
                 oci_platform: cli_oci_platform,
                 env: vec![],
                 workdir: None,
+                user: None,
                 net: None,
                 gpu: cli_gpu,
                 secret_refs: Default::default(),
@@ -527,6 +531,7 @@ pub fn resolve_pack_config(
         oci_platform,
         env: sf.env.into_iter().map(|e| e.trim().to_string()).collect(),
         workdir: sf.workdir,
+        user: sf.user,
         // [network].allow_hosts / allow_cidrs implies net = true,
         // matching the same logic in build_create_params().
         // Preserve the tri-state: None = unspecified, Some = explicit.
@@ -1202,6 +1207,30 @@ mod cli_entrypoint_tests {
         .expect("resolves");
 
         assert_eq!(cfg.entrypoint, vec!["/from/smolfile"]);
+    }
+
+    /// A Smolfile `user` reaches an image pack's config; without one the
+    /// field stays empty so the image's USER applies at pack time.
+    #[test]
+    fn a_smolfile_user_reaches_the_pack_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, "image = \"alpine\"\nuser = \"501:20\"\n").expect("write");
+        let cfg =
+            resolve_pack_config(None, None, None, None, None, false, Some(path)).expect("resolves");
+        assert_eq!(cfg.user.as_deref(), Some("501:20"));
+
+        let cfg = resolve_pack_config(
+            Some("alpine".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("resolves");
+        assert!(cfg.user.is_none());
     }
 
     #[test]
