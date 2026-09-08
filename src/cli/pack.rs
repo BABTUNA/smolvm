@@ -396,7 +396,7 @@ impl PackCreateCmd {
         }
 
         println!("Starting agent VM...");
-        let manager = AgentManager::for_vm(&pack_vm_name)?;
+        let manager = AgentManager::for_vm_with_sizes(&pack_vm_name, None, None)?;
         manager.start_with_config(
             Vec::new(),
             VmResources {
