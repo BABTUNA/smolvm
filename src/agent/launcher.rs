@@ -1673,17 +1673,20 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // process-level CPU idleness the balloon is pulsed so an idle guest's
         // page cache is evicted and handed back to the host.
         // SMOLVM_IDLE_RECLAIM=<minutes> tunes the window; `0` or `off`
-        // disables. Fork roles are excluded for now: a golden's RAM file is
-        // the shared CoW image (releasing its pages needs hole-punch
-        // semantics, and a frozen golden cannot answer balloon requests), and
-        // a clone's private mapping reverts to golden bytes on discard —
-        // spec-legal for reported-free pages but unvalidated, so clones wait
-        // until that path is exercised.
-        let fork_role = std::env::var_os("SMOLVM_FORKABLE").is_some_and(|v| v == "1")
-            || std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some();
-        if let (Some(ctl), Some(idle_min), false) =
-            (ctl_path.clone(), idle_reclaim_minutes(), fork_role)
-        {
+        // disables. A branch source is excluded because its RAM is the stable
+        // image for later descendants (and it may be frozen at a branchpoint).
+        // A non-branchable leaf is safe: its MAP_PRIVATE pages are disposable
+        // once the guest balloon surrenders them, while the shared generation
+        // remains unchanged for its source and siblings.
+        let reclaim_role = idle_reclaim_role(
+            std::env::var_os("SMOLVM_FORKABLE").is_some_and(|v| v == "1"),
+            std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some(),
+        );
+        if let (Some(ctl), Some(idle_min), true) = (
+            ctl_path.clone(),
+            idle_reclaim_minutes(),
+            reclaim_role.can_reclaim(),
+        ) {
             spawn_idle_reclaim(ctl, resources.memory_mib, idle_min);
         }
 
@@ -2305,6 +2308,36 @@ fn raise_fd_limits() {
 /// pulsed once, not continuously. Host-side release additionally needs
 /// SMOLVM_BALLOON_RECLAIM=1 (macOS stage-2 unmap reclaim).
 pub(crate) const IDLE_RECLAIM_DEFAULT_MINUTES: u64 = 10;
+const IDLE_RECLAIM_RSS_REARM_GROWTH: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleReclaimRole {
+    Ordinary,
+    BranchLeaf,
+    BranchSource,
+}
+
+impl IdleReclaimRole {
+    fn can_reclaim(self) -> bool {
+        matches!(self, Self::Ordinary | Self::BranchLeaf)
+    }
+}
+
+fn idle_reclaim_role(branchable: bool, restored_branch: bool) -> IdleReclaimRole {
+    if branchable {
+        IdleReclaimRole::BranchSource
+    } else if restored_branch {
+        IdleReclaimRole::BranchLeaf
+    } else {
+        IdleReclaimRole::Ordinary
+    }
+}
+
+fn idle_reclaim_rss_refilled(baseline: Option<u64>, current: Option<u64>) -> bool {
+    baseline.zip(current).is_some_and(|(baseline, current)| {
+        current.saturating_sub(baseline) >= IDLE_RECLAIM_RSS_REARM_GROWTH
+    })
+}
 
 /// The effective idle-reclaim window: `None` = disabled (`SMOLVM_IDLE_RECLAIM`
 /// set to `0`/`off`), otherwise the configured or default minutes.
@@ -2446,6 +2479,7 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
             let cmd = |c: &str| crate::agent::fork::control_socket_cmd(&ctl, c);
             let mut idle_ticks = 0u32;
             let mut armed = true;
+            let mut reclaimed_rss = None;
             loop {
                 std::thread::sleep(TICK);
                 let Some(now) = process_cpu() else {
@@ -2453,7 +2487,10 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
                 };
                 let busy = now.saturating_sub(last).as_secs_f64() / TICK.as_secs_f64();
                 last = now;
-                if busy > ACTIVE_FRACTION {
+                let rss = crate::process::process_stats(std::process::id() as crate::process::Pid)
+                    .map(|stats| stats.rss_bytes);
+                let refilled = idle_reclaim_rss_refilled(reclaimed_rss, rss);
+                if busy > ACTIVE_FRACTION || refilled {
                     armed = true;
                 }
                 if busy > IDLE_FRACTION {
@@ -2464,12 +2501,14 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
                 if !armed || idle_ticks < ticks_needed {
                     continue;
                 }
-                armed = false;
-                idle_ticks = 0;
                 tracing::info!(target_mib, "idle reclaim: balloon pulse");
-                if cmd(&format!("BALLOON {target_mib}")).is_err() {
+                let inflate = cmd(&format!("BALLOON {target_mib}"));
+                if !inflate.as_ref().is_ok_and(|reply| reply.starts_with("OK")) {
+                    tracing::warn!(reply = ?inflate, "idle reclaim: balloon inflate refused");
                     continue;
                 }
+                armed = false;
+                idle_ticks = 0;
                 // Wait for the guest to reach the target (or give up), then
                 // deflate; the durable effect is the cache eviction.
                 for _ in 0..30 {
@@ -2480,7 +2519,33 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
                         Err(_) => break,
                     }
                 }
-                let _ = cmd("BALLOON 0");
+                let mut deflated = false;
+                for _ in 0..3 {
+                    match cmd("BALLOON 0") {
+                        Ok(reply) if reply.starts_with("OK") => {
+                            deflated = true;
+                            break;
+                        }
+                        reply => {
+                            tracing::warn!(reply = ?reply, "idle reclaim: balloon deflate refused");
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                }
+                if !deflated {
+                    // The negotiated DEFLATE_ON_OOM feature keeps the guest
+                    // usable, but retain the warning so a broken control path
+                    // is observable instead of silently reducing its ceiling.
+                    tracing::error!("idle reclaim: could not restore balloon target to zero");
+                }
+                // Do not mistake the balloon worker's own CPU time for guest
+                // activity and immediately re-arm an otherwise idle machine.
+                if let Some(after) = process_cpu() {
+                    last = after;
+                }
+                reclaimed_rss =
+                    crate::process::process_stats(std::process::id() as crate::process::Pid)
+                        .map(|stats| stats.rss_bytes);
             }
         });
 }
@@ -2502,6 +2567,28 @@ mod tests {
             block_io_error("storage", BlockIoEngine::Async, -libc::EPERM)
                 .contains("use --block-io sync")
         );
+    }
+
+    #[test]
+    fn idle_reclaim_includes_leaf_branches_but_not_future_sources() {
+        assert!(idle_reclaim_role(false, false).can_reclaim());
+        assert!(idle_reclaim_role(false, true).can_reclaim());
+        assert!(!idle_reclaim_role(true, false).can_reclaim());
+        assert!(!idle_reclaim_role(true, true).can_reclaim());
+    }
+
+    #[test]
+    fn idle_reclaim_rss_growth_rearms_after_a_low_cpu_refill() {
+        let baseline = 200 * 1024 * 1024;
+        assert!(idle_reclaim_rss_refilled(
+            Some(baseline),
+            Some(baseline + IDLE_RECLAIM_RSS_REARM_GROWTH)
+        ));
+        assert!(!idle_reclaim_rss_refilled(
+            Some(baseline),
+            Some(baseline + IDLE_RECLAIM_RSS_REARM_GROWTH - 1)
+        ));
+        assert!(!idle_reclaim_rss_refilled(None, Some(u64::MAX)));
     }
 
     #[cfg(target_os = "linux")]
