@@ -13,6 +13,11 @@ pub const READY_VERSION: &str = "smolvm-forkpoint-v1";
 /// releaser distinguish a new forkpoint from the previous helper's marker.
 pub const GENERATION_PREFIX: &str = "generation=";
 
+/// Readiness-marker capability indicating that the helper holds an advisory
+/// lock on the marker for its entire parked lifetime. The agent uses the lock
+/// to distinguish a live helper from a marker left behind by a killed process.
+pub const READY_LEASE_HINT: &str = "ready-lease=flock-v1";
+
 /// Optional readiness-marker capability requesting eager clone module loading.
 pub const CUDA_PRELOAD_MODULES_HINT: &str = "cuda-preload-modules";
 

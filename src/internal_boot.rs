@@ -33,28 +33,28 @@ fn preopen_guardian_userfaultfd() -> crate::Result<()> {
         return Ok(());
     }
 
-    let fd = unsafe {
-        libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) as libc::c_int
-    };
-    if fd < 0 {
-        return Err(crate::Error::agent(
+    use std::os::fd::{AsRawFd, IntoRawFd};
+
+    let fd = crate::process::open_kernel_userfaultfd().map_err(|error| {
+        crate::Error::agent(
             "prepare demand-paged clone RAM",
             format!(
-                "kernel-fault-capable userfaultfd is unavailable: {}; run the privileged SmolVM service so it can open userfaultfd before the per-VM uid drop",
-                std::io::Error::last_os_error()
+                "kernel-fault-capable userfaultfd is unavailable: {error}; run a privileged SmolVM service or grant it read/write access to /dev/userfaultfd"
             ),
-        ));
-    }
-    if fd != PREOPENED_USERFAULTFD_FD {
-        if unsafe { libc::dup3(fd, PREOPENED_USERFAULTFD_FD, libc::O_CLOEXEC) } < 0 {
+        )
+    })?;
+    if fd.as_raw_fd() != PREOPENED_USERFAULTFD_FD {
+        if unsafe { libc::dup3(fd.as_raw_fd(), PREOPENED_USERFAULTFD_FD, libc::O_CLOEXEC) } < 0 {
             let error = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
             return Err(crate::Error::agent(
                 "prepare demand-paged clone RAM",
                 format!("reserve userfaultfd descriptor: {error}"),
             ));
         }
-        unsafe { libc::close(fd) };
+    } else {
+        // Inherited descriptors were closed immediately before this call, so
+        // this is unlikely; transfer ownership if the kernel reused slot 198.
+        let _ = fd.into_raw_fd();
     }
     Ok(())
 }

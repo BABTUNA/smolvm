@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use smolvm_protocol::forkpoint::{
-    typed_error, ARMED_PREFIX, ARM_PREFIX, GENERATION_PREFIX, RELEASE_PREFIX,
+    typed_error, ARMED_PREFIX, ARM_PREFIX, GENERATION_PREFIX, READY_LEASE_HINT, RELEASE_PREFIX,
 };
 
 /// A failed step, carrying the protocol error code the host handles on.
@@ -107,8 +107,14 @@ fn settled(markers: &Markers, window: Duration, condition: impl FnMut() -> bool)
 /// The generation recorded in a ready marker: its `generation=` line, 32 hex
 /// digits. A marker without one is not a branchpoint this protocol can drive.
 fn generation_of(ready: &Path) -> Result<String, TypedError> {
-    let contents = match std::fs::read_to_string(ready) {
-        Ok(contents) => contents,
+    let contents = match live_ready_contents(ready) {
+        Ok(Some(contents)) => contents,
+        Ok(None) => {
+            return Err(TypedError::new(
+                typed_error::NOT_READY,
+                "the branchpoint marker has no live helper; run `smolvm-branch-ready` again",
+            ));
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(TypedError::new(
                 typed_error::NOT_READY,
@@ -130,6 +136,35 @@ fn generation_of(ready: &Path) -> Result<String, TypedError> {
         ));
     }
     Ok(generation.to_string())
+}
+
+/// Read a readiness marker and, when it advertises the lease protocol, prove
+/// that its helper still owns the file lock. Older markers remain accepted so
+/// live branches made by the previous agent continue to work.
+fn live_ready_contents(ready: &Path) -> std::io::Result<Option<String>> {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(ready)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    if !contents.lines().any(|line| line == READY_LEASE_HINT) {
+        return Ok(Some(contents));
+    }
+
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        return Ok(None);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(Some(contents))
+    } else {
+        Err(error)
+    }
 }
 
 fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<(), TypedError> {
@@ -169,11 +204,15 @@ fn write_private(path: &Path, contents: &str, mode: u32) -> Result<(), TypedErro
 pub fn wait_ready(markers: &Markers, timeout: Duration) -> Result<String, TypedError> {
     let mut outcome = None;
     settled(markers, timeout, || {
-        match std::fs::read_to_string(&markers.ready) {
-            Ok(contents) => {
+        match live_ready_contents(&markers.ready) {
+            Ok(Some(contents)) => {
                 outcome = Some(Ok(contents));
                 true
             }
+            // An unlocked lease is stale. Leave the pathname in place so a
+            // concurrently published replacement can never be unlinked; its
+            // atomic rename wakes this wait through the directory watcher.
+            Ok(None) => false,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => {
                 outcome = Some(Err(TypedError::io("read ready marker", error)));
@@ -239,8 +278,17 @@ pub fn release(markers: &Markers, env_dotenv: Option<&str>) -> Result<(), TypedE
     std::fs::create_dir_all(&markers.state_dir)
         .map_err(|error| TypedError::io("create state dir", error))?;
     // No ready marker means no parked helper: a checkpoint taken away from
-    // any branchpoint has nothing to release, and that is not an error.
+    // any branchpoint has nothing to release. Clear the restore marker that
+    // rejuvenation installs unconditionally; otherwise a helper started later
+    // mistakes itself for an inherited clone helper and never acknowledges a
+    // future capture arm.
     if !markers.ready.exists() {
+        let restored = markers.state_dir.join("restored");
+        match std::fs::remove_file(&restored) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(TypedError::io("remove stale restored marker", error)),
+        }
         return Ok(());
     }
     let generation = generation_of(&markers.ready)?;
@@ -404,6 +452,29 @@ mod tests {
     }
 
     #[test]
+    fn leased_ready_marker_requires_a_live_lock_holder() {
+        use std::os::fd::AsRawFd as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("ready");
+        std::fs::write(
+            &ready,
+            format!("smolvm-forkpoint-v1\n{GENERATION_PREFIX}{GEN}\n{READY_LEASE_HINT}\n"),
+        )
+        .unwrap();
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&ready)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX) }, 0);
+        assert!(live_ready_contents(&ready).unwrap().is_some());
+
+        drop(lease);
+        assert_eq!(live_ready_contents(&ready).unwrap(), None);
+    }
+
+    #[test]
     fn arm_requires_a_generation_and_waits_for_the_ack() {
         let temp = tempfile::tempdir().unwrap();
         let markers = Markers::under(&temp.path().join("state"));
@@ -485,8 +556,11 @@ mod tests {
         // No ready marker at all: nothing is parked, so there is nothing to do.
         std::fs::remove_file(&markers.ready).unwrap();
         let _ = std::fs::remove_file(&markers.release);
+        let restored = markers.state_dir.join("restored");
+        std::fs::write(&restored, "smolvm-forkpoint-restored-v1\n").unwrap();
         release(&markers, None).unwrap();
         assert!(!markers.release.exists());
+        assert!(!restored.exists());
     }
 
     #[test]

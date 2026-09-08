@@ -14,9 +14,9 @@ const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
 use smolvm_protocol::forkpoint::{
     ARMED_PATH, ARMED_PREFIX, ARM_PATH, ARM_PREFIX, BRANCH_ENV_PATH, BRANCH_HELPER_PATH,
     CONTAINER_INIT_ARG, CONTAINER_INIT_NAME, CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH,
-    GENERATION_PREFIX, HELPER_PATH, READY_PATH, READY_VERSION, RELEASE_PATH, RELEASE_PREFIX,
-    RESTORED_CONTAINER_PATH, RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH, WORKER_READY_PATH,
-    WORKER_READY_TOKEN_ENV,
+    GENERATION_PREFIX, HELPER_PATH, READY_LEASE_HINT, READY_PATH, READY_VERSION, RELEASE_PATH,
+    RELEASE_PREFIX, RESTORED_CONTAINER_PATH, RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH,
+    WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
 };
 
 fn enabled() -> bool {
@@ -321,6 +321,14 @@ fn run_helper_at(
     ready
         .sync_all()
         .map_err(|error| format!("sync {}: {error}", ready_temp.display()))?;
+    // The ready marker is a lease, not merely a file. Keeping this lock for
+    // the entire parked lifetime lets the agent reject a stale marker after a
+    // helper is killed, including after restoring a portable checkpoint.
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&ready), libc::LOCK_EX) } != 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = std::fs::remove_file(&ready_temp);
+        return Err(format!("lock {}: {error}", ready_temp.display()));
+    }
     std::fs::rename(&ready_temp, ready_path).map_err(|error| {
         let _ = std::fs::remove_file(&ready_temp);
         format!(
@@ -346,7 +354,7 @@ fn run_helper_at(
         // never baked into a clone as a zombie.
         reap_children_if_init();
         if release_matches(release_path, &generation) {
-            acknowledge_generation(ready_path, &generation);
+            acknowledge_release(ready_path, restored_path, &generation);
             return Ok(());
         }
         if arm_matches(arm_path, &generation) {
@@ -354,7 +362,7 @@ fn run_helper_at(
             while !restored_path.is_file() && arm_matches(arm_path, &generation) {
                 if release_matches(release_path, &generation) {
                     let _ = std::fs::remove_file(armed_path);
-                    acknowledge_generation(ready_path, &generation);
+                    acknowledge_release(ready_path, restored_path, &generation);
                     return Ok(());
                 }
                 match watcher.as_ref().map(|w| w.wait(None)) {
@@ -375,7 +383,7 @@ fn run_helper_at(
     // long time, so this is the bounded event wait again, not a poll.
     loop {
         if release_matches(release_path, &generation) {
-            acknowledge_generation(ready_path, &generation);
+            acknowledge_release(ready_path, restored_path, &generation);
             return Ok(());
         }
         reap_children_if_init();
@@ -490,9 +498,12 @@ fn forkpoint_generation() -> Result<String, String> {
 
 fn ready_content(preload_modules: bool, generation: &str) -> String {
     if preload_modules {
-        format!("{READY_VERSION}\n{GENERATION_PREFIX}{generation}\n{CUDA_PRELOAD_MODULES_HINT}\n")
+        format!(
+            "{READY_VERSION}\n{GENERATION_PREFIX}{generation}\n{READY_LEASE_HINT}\n\
+             {CUDA_PRELOAD_MODULES_HINT}\n"
+        )
     } else {
-        format!("{READY_VERSION}\n{GENERATION_PREFIX}{generation}\n")
+        format!("{READY_VERSION}\n{GENERATION_PREFIX}{generation}\n{READY_LEASE_HINT}\n")
     }
 }
 
@@ -542,6 +553,15 @@ fn acknowledge_generation(ready_path: &Path, generation: &str) {
     if is_current {
         let _ = std::fs::remove_file(ready_path);
     }
+}
+
+fn acknowledge_release(ready_path: &Path, restored_path: &Path, generation: &str) {
+    acknowledge_generation(ready_path, generation);
+    // `restored` describes only the inherited helper's first wait. Once that
+    // helper is released, leaving the marker behind would make every future
+    // branchpoint helper ignore capture-arm requests, preventing a restored
+    // machine from becoming a branch source itself.
+    let _ = std::fs::remove_file(restored_path);
 }
 
 #[cfg(test)]
@@ -708,6 +728,7 @@ mod tests {
         std::fs::write(&release, format!("{RELEASE_PREFIX}{generation}\n")).unwrap();
         helper.join().unwrap().unwrap();
         assert!(!ready.exists());
+        assert!(!restored.exists());
         assert!(!arm.exists());
         assert!(!armed.exists());
     }
@@ -799,6 +820,7 @@ mod tests {
         std::fs::write(&release, format!("{RELEASE_PREFIX}{generation}\n")).unwrap();
         helper.join().unwrap().unwrap();
         assert!(!ready.exists());
+        assert!(!restored.exists());
         assert!(!armed.exists());
     }
 
@@ -928,11 +950,12 @@ mod tests {
     fn helper_records_cuda_module_preload_hint() {
         assert_eq!(
             ready_content(true, "0123"),
-            "smolvm-forkpoint-v1\ngeneration=0123\ncuda-preload-modules\n"
+            "smolvm-forkpoint-v1\ngeneration=0123\nready-lease=flock-v1\n\
+             cuda-preload-modules\n"
         );
         assert_eq!(
             ready_content(false, "0123"),
-            "smolvm-forkpoint-v1\ngeneration=0123\n"
+            "smolvm-forkpoint-v1\ngeneration=0123\nready-lease=flock-v1\n"
         );
     }
 

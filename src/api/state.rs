@@ -20,6 +20,23 @@ struct CpuSample {
     cpu_time_ns: u64,
 }
 
+/// Aggregate live host utilization for SmolVM processes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NodeUtilization {
+    /// Fractional CPUs consumed across running VMMs.
+    pub used_cpus: f64,
+    /// Summed resident memory in MiB.
+    pub rss_mb: u64,
+    /// Summed proportional resident memory in MiB.
+    pub pss_mb: Option<u64>,
+    /// Summed private resident memory in MiB.
+    pub private_memory_mb: Option<u64>,
+    /// Summed shared mappings in MiB (not unique physical memory).
+    pub shared_memory_mapped_mb: Option<u64>,
+    /// Physical disk blocks consumed by machine disks in GiB.
+    pub disk_gb: u64,
+}
+
 /// Records whose disk state must survive startup reconciliation. A stopped or
 /// live clone keeps every ancestor in its qcow2 lineage alive even when an
 /// ancestor VMM process died; deleting that ancestor's data directory would
@@ -773,16 +790,22 @@ impl ApiState {
 
     /// Sample real CPU + memory + disk utilization across all running VM processes.
     ///
-    /// Returns `(used_cpus, used_memory_mb, used_disk_gb)`:
+    /// Returns CPU, RSS/PSS/private/shared memory, and used disk:
     /// - CPU is fractional CPUs (e.g., 2.5 = 2.5 CPUs of load), computed as
     ///   `Δcpu_time / Δwall_time` since the previous sample per PID. First sample
     ///   for a new PID returns 0 CPU; subsequent samples return the real rate.
     /// - Memory is the sum of resident set sizes across VM processes.
     /// - Disk is the sum of VM storage + overlay disk file sizes on disk.
-    pub fn real_utilization(&self) -> (f64, u64, u64) {
+    pub fn real_utilization(&self) -> NodeUtilization {
         let now = std::time::Instant::now();
         let mut total_cpus: f64 = 0.0;
         let mut total_rss_bytes: u64 = 0;
+        let mut total_pss_bytes: u64 = 0;
+        let mut total_private_bytes: u64 = 0;
+        let mut total_shared_mapped_bytes: u64 = 0;
+        let mut complete_pss = true;
+        let mut complete_private = true;
+        let mut complete_shared = true;
         let mut total_disk_bytes: u64 = 0;
 
         let pid_and_paths: Vec<(Option<i32>, std::path::PathBuf, std::path::PathBuf)> = {
@@ -823,6 +846,30 @@ impl ApiState {
                 continue;
             };
             total_rss_bytes = total_rss_bytes.saturating_add(stats.rss_bytes);
+            match crate::process::process_memory_stats(pid) {
+                Some(memory) => {
+                    if let Some(value) = memory.pss_bytes {
+                        total_pss_bytes = total_pss_bytes.saturating_add(value);
+                    } else {
+                        complete_pss = false;
+                    }
+                    if let Some(value) = memory.private_bytes {
+                        total_private_bytes = total_private_bytes.saturating_add(value);
+                    } else {
+                        complete_private = false;
+                    }
+                    if let Some(value) = memory.shared_mapped_bytes {
+                        total_shared_mapped_bytes = total_shared_mapped_bytes.saturating_add(value);
+                    } else {
+                        complete_shared = false;
+                    }
+                }
+                None => {
+                    complete_pss = false;
+                    complete_private = false;
+                    complete_shared = false;
+                }
+            }
 
             if let Some(prev) = samples.get(&pid).copied() {
                 let dt_ns = now.duration_since(prev.at).as_nanos() as u64;
@@ -844,11 +891,15 @@ impl ApiState {
         // as VMs come and go over the lifetime of the smolvm serve process).
         samples.retain(|pid, _| still_alive.contains(pid));
 
-        (
-            total_cpus,
-            total_rss_bytes / (1024 * 1024),
-            total_disk_bytes / (1024 * 1024 * 1024),
-        )
+        NodeUtilization {
+            used_cpus: total_cpus,
+            rss_mb: total_rss_bytes / (1024 * 1024),
+            pss_mb: complete_pss.then_some(total_pss_bytes / (1024 * 1024)),
+            private_memory_mb: complete_private.then_some(total_private_bytes / (1024 * 1024)),
+            shared_memory_mapped_mb: complete_shared
+                .then_some(total_shared_mapped_bytes / (1024 * 1024)),
+            disk_gb: total_disk_bytes / (1024 * 1024 * 1024),
+        }
     }
 
     // ========================================================================
@@ -1650,6 +1701,10 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
     let cpu_seconds = stats.map(|s| s.cpu_time_ns / 1_000_000_000);
     let cpu_millis = stats.map(|s| s.cpu_time_ns / 1_000_000);
     let rss_mb = stats.map(|s| s.rss_bytes / (1024 * 1024));
+    let memory_stats = entry
+        .manager
+        .child_pid()
+        .and_then(crate::process::process_memory_stats);
     // Actual used disk (sparse-image blocks) — a gauge the control integrates for
     // active-disk billing. Independent of whether there's a live VMM process.
     let disk_used_mb = crate::agent::disk_used_mb(&name);
@@ -1696,6 +1751,15 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         cpu_seconds,
         cpu_millis,
         rss_mb,
+        pss_mb: memory_stats
+            .and_then(|s| s.pss_bytes)
+            .map(|v| v / (1024 * 1024)),
+        private_memory_mb: memory_stats
+            .and_then(|s| s.private_bytes)
+            .map(|v| v / (1024 * 1024)),
+        shared_memory_mapped_mb: memory_stats
+            .and_then(|s| s.shared_mapped_bytes)
+            .map(|v| v / (1024 * 1024)),
         disk_used_mb,
         created_at: 0,
     }

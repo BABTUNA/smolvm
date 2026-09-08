@@ -75,6 +75,8 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     } else {
         record.pid
     };
+    let stats = pid.and_then(crate::process::process_stats);
+    let memory_stats = pid.and_then(crate::process::process_memory_stats);
     MachineInfo {
         name: name.to_string(),
         state: actual_state.to_string(),
@@ -132,19 +134,22 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // (user+system CPU time). Resets on restart — the control plane treats it
         // as a monotonic-with-resets counter and accumulates the durable total.
         // `None` when stopped (pid cleared) or the process vanished mid-sample.
-        cpu_seconds: pid
-            .and_then(crate::process::process_stats)
-            .map(|s| s.cpu_time_ns / 1_000_000_000),
+        cpu_seconds: stats.map(|s| s.cpu_time_ns / 1_000_000_000),
         // Same consumed CPU in milliseconds — sub-second precision so consumers
         // don't quantize a barely-busy process up to a whole second.
-        cpu_millis: pid
-            .and_then(crate::process::process_stats)
-            .map(|s| s.cpu_time_ns / 1_000_000),
+        cpu_millis: stats.map(|s| s.cpu_time_ns / 1_000_000),
         // Current RSS (MiB) of the VMM process — an instantaneous gauge the
         // control plane integrates over time for active-memory billing.
-        rss_mb: pid
-            .and_then(crate::process::process_stats)
-            .map(|s| s.rss_bytes / (1024 * 1024)),
+        rss_mb: stats.map(|s| s.rss_bytes / (1024 * 1024)),
+        pss_mb: memory_stats
+            .and_then(|s| s.pss_bytes)
+            .map(|v| v / (1024 * 1024)),
+        private_memory_mb: memory_stats
+            .and_then(|s| s.private_bytes)
+            .map(|v| v / (1024 * 1024)),
+        shared_memory_mapped_mb: memory_stats
+            .and_then(|s| s.shared_mapped_bytes)
+            .map(|v| v / (1024 * 1024)),
         // Actual used disk (sparse-image blocks) — a gauge for active-disk billing,
         // measured from the data dir regardless of whether the VMM is running.
         disk_used_mb: crate::agent::disk_used_mb(name),
@@ -1758,7 +1763,9 @@ pub async fn start_machine(
 fn classify_fork_error(e: SmolvmError) -> ApiError {
     let msg = e.to_string();
     let lc = msg.to_ascii_lowercase();
-    if lc.contains("cuda fork descendants") || lc.contains("fork lineage would exceed") {
+    if lc.contains("branch needs at least") && lc.contains("effective host headroom") {
+        ApiError::Unavailable(msg)
+    } else if lc.contains("cuda fork descendants") || lc.contains("fork lineage would exceed") {
         ApiError::BadRequest(msg)
     } else if lc.contains("already exists")
         || lc.contains("not running forkable")
@@ -3674,6 +3681,10 @@ mod tests {
         // An unrelated fork failure stays a 500.
         let e = SmolvmError::agent("fork", "disk write failed");
         assert!(matches!(classify_fork_error(e), ApiError::Internal(_)));
+        let e = SmolvmError::vm_creation(
+            "branch needs at least 2048 MiB of effective host headroom for 8 children, but only 1024 MiB is available",
+        );
+        assert!(matches!(classify_fork_error(e), ApiError::Unavailable(_)));
     }
 
     #[test]
