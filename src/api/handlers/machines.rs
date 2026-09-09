@@ -111,6 +111,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         network_backend: record.network_backend,
         allowed_cidrs: record.allowed_cidrs.clone(),
         allowed_hosts: record.dns_filter_hosts.clone(),
+        denied_cidrs: record.denied_cidrs.clone(),
         // Report the RESOLVED provisioned disk sizes, not the request echo: a
         // machine created without an explicit size still gets a real disk at the
         // node default, and billing/telemetry need the actual allocated GiB, not
@@ -2074,6 +2075,19 @@ async fn create_machine_inner(
         ),
         None => None,
     };
+    // Deny CIDRs get the same normalization; a malformed DENY entry would
+    // otherwise fail the boot (the launcher hard-errors rather than widen the
+    // policy by skipping it), so reject it at create time instead.
+    let mut normalized_denied_cidrs = match &req.denied_cidrs {
+        Some(cidrs) => Some(
+            cidrs
+                .iter()
+                .map(|c| crate::smolfile::parse_cidr(c))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ApiError::BadRequest)?,
+        ),
+        None => None,
+    };
 
     // If --from is set, read manifest and extract sidecar
     let (
@@ -2276,6 +2290,7 @@ async fn create_machine_inner(
         .or_else(|| req.allowed_hosts.clone());
     if let Some(network) = checkpoint_network {
         normalized_cidrs = network.allowed_cidrs.clone();
+        normalized_denied_cidrs = network.denied_cidrs.clone();
     }
 
     // Use explicit API resources when provided. Otherwise, preserve packed
@@ -2574,6 +2589,7 @@ async fn create_machine_inner(
         block_io: req.block_io,
         allowed_cidrs: normalized_cidrs,
         allowed_hosts: restored_allowed_hosts,
+        denied_cidrs: normalized_denied_cidrs,
         // A restored checkpoint keeps the bindings its workload was captured
         // with unless the request names its own.
         credentials: req
@@ -6191,6 +6207,7 @@ mod tests {
             block_io: None,
             allowed_cidrs: None,
             allowed_hosts: None,
+            denied_cidrs: None,
             network_backend: None,
             guest_subnet: None,
             restart: None,
