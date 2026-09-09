@@ -389,12 +389,29 @@ impl EgressPolicy {
         }
     }
 
+    /// Whether `ip` falls in the deny list, including via its IPv4-mapped
+    /// IPv6 form so `::ffff:10.0.0.4` cannot slip past a `10.0.0.0/8` rule —
+    /// the same normalization the floor applies. Public so the TCP relay can
+    /// also hold the deny list against the host-side address it actually
+    /// dials when it redirects a gateway-addressed flow to loopback.
+    pub fn denies(&self, ip: IpAddr) -> bool {
+        if self.denied.iter().any(|cidr| cidr.contains(ip)) {
+            return true;
+        }
+        if let IpAddr::V6(v6) = ip {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return self.denied.iter().any(|cidr| cidr.contains(IpAddr::V4(v4)));
+            }
+        }
+        false
+    }
+
     /// Whether an outbound connection to `ip` (v4 or v6) is permitted.
     pub fn allows(&self, ip: IpAddr) -> bool {
         // The deny list is absolute and checked first: nothing below — not an
         // explicit allow-list CIDR, a learned DNS IP, or the local floor's
         // loopback re-open — can override a denied destination.
-        if self.denied.iter().any(|cidr| cidr.contains(ip)) {
+        if self.denies(ip) {
             return false;
         }
         // Platform hard-floor: deny per the resolved FloorMode (metadata + host
@@ -676,10 +693,22 @@ mod tests {
     }
 
     #[test]
+    fn deny_matches_ipv4_mapped_ipv6() {
+        // A v4 deny rule must hold against the mapped-v6 spelling of the same
+        // address, exactly as the floor normalizes — otherwise ::ffff:10.0.0.4
+        // slips past a 10.0.0.0/8 deny.
+        let policy = EgressPolicy::unrestricted()
+            .with_denied_cidrs(Some(&["10.0.0.0/8".into()]))
+            .unwrap();
+        assert!(!policy.allows_v6("::ffff:10.0.0.4".parse().unwrap()));
+        assert!(policy.allows_v6("::ffff:1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
     fn unparseable_deny_cidr_is_a_hard_error() {
-        // Skipping a bad DENY entry would silently widen the policy, so it
-        // errors instead (the allow side skips-with-a-warning, which only
-        // narrows).
+        // Every user-facing surface validates CIDRs before they get here, so
+        // an unparseable entry reaching the engine is a bug upstream; erroring
+        // beats skipping it, which would silently widen the policy.
         assert!(EgressPolicy::unrestricted()
             .with_denied_cidrs(Some(&["nonsense".into()]))
             .is_err());

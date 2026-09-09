@@ -954,8 +954,8 @@ impl VmRecord {
             format!(
                 "image '{image}' must be pulled from a registry, but this machine has no \
                  network, so the pull can never succeed. Add --net (or publish a port with \
-                 -p, or set an egress policy with --allow-cidr/--allow-host). To keep the \
-                 machine network-isolated, supply the image locally instead: \
+                 -p, or set an egress policy with --allow-cidr/--deny-cidr/--allow-host). \
+                 To keep the machine network-isolated, supply the image locally instead: \
                  `docker save {image} | smolvm machine create --image - ...`"
             ),
         ))
