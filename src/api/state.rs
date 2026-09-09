@@ -2112,6 +2112,7 @@ mod tests {
                     block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
+                    denied_cidrs: None,
                     credentials: None,
                     network_backend: None,
                     guest_subnet: None,
