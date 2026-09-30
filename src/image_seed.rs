@@ -71,6 +71,40 @@ pub fn seed_first_start(
     }
 }
 
+/// [`seed_first_start`] for the ephemeral `machine run` path, which boots
+/// before any record exists. The record-level gates cannot apply to a machine
+/// this very run is creating: it has completed no init, was not created from a
+/// pack (the `--from` and cached-artifact paths branch off earlier), and has
+/// no branch golden or foreign uid owner. Gating on the image and storage size
+/// is therefore the whole check, exactly [`seedable_image`]. Best-effort like
+/// every seed: without one the guest pulls as before.
+pub fn seed_ephemeral_run(
+    name: &str,
+    image: Option<&str>,
+    storage_gb: Option<u64>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+) {
+    let Some(image) = seedable_image(name, image, storage_gb) else {
+        return;
+    };
+    let seeded = builder_exe()
+        .map_err(|e| crate::Error::config("image seed", e.to_string()))
+        .and_then(|exe| {
+            seed_storage(
+                &exe,
+                name,
+                &image,
+                &crate::registry::PullAuth::FromConfig,
+                proxy,
+                no_proxy,
+            )
+        });
+    if let Err(error) = seeded {
+        tracing::warn!(machine = name, %error, "no image seed; pulling in the guest");
+    }
+}
+
 /// Seeds need a Unix host; elsewhere nothing seeds.
 #[cfg(not(unix))]
 pub fn wants_seed(_: &str, _: &crate::config::VmRecord, _: bool) -> Option<String> {

@@ -1749,6 +1749,17 @@ impl RunCmd {
             params.port.len(),
         )?;
 
+        // A fresh registry-image run starts on a shared seed of its image, so
+        // the guest finds the image already pulled, exactly as `machine start`
+        // does. Best-effort: without a seed the guest pulls as before.
+        smolvm::image_seed::seed_ephemeral_run(
+            &vm_name,
+            params.image.as_deref(),
+            params.storage_gb,
+            self.proxy_opts.resolved_proxy()?.as_deref(),
+            self.proxy_opts.no_proxy().as_deref(),
+        );
+
         let manager =
             AgentManager::for_vm_with_sizes(&vm_name, params.storage_gb, params.overlay_gb)
                 .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
