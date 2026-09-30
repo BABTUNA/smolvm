@@ -2347,10 +2347,23 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    /// Serialize tests whose asserts depend on SMOLVM_MACHINE_NAME, and shield
+    /// them from an ambient value: clap reads real process env at parse time,
+    /// so a value set by a concurrently running test (or exported in the
+    /// developer's shell) flips any name-is-required assertion. Acquiring the
+    /// guard also clears the variable, so each holder starts from unset.
+    fn machine_name_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME);
+        guard
+    }
+
     /// One test covers every SMOLVM_MACHINE_NAME behavior, because it mutates
     /// process env: parallel test functions sharing the variable would race.
     #[test]
     fn machine_name_reads_the_environment_with_the_flag_winning() {
+        let _env = machine_name_env_lock();
         use clap::Parser;
         #[derive(Parser)]
         struct Harness {
@@ -3000,6 +3013,10 @@ mod tests {
 
     #[test]
     fn external_interceptor_requires_a_named_start() {
+        // The named-start assertion below fails if SMOLVM_MACHINE_NAME fills
+        // --name, whether set by the env test running in parallel or by the
+        // developer's own shell.
+        let _env = machine_name_env_lock();
         let cli = TestMachineCli::parse_from([
             "machine",
             "start",
