@@ -3099,6 +3099,71 @@ mod tests {
     }
 
     #[test]
+    fn update_outbound_localhost_only_adds_the_loopback_cidrs() {
+        use smolvm::config::VmRecord;
+
+        let parse_update = |argv: &[&str]| {
+            let cli = TestMachineCli::parse_from(argv);
+            let MachineCmd::Update(cmd) = cli.command else {
+                panic!("expected machine update command");
+            };
+            cmd
+        };
+
+        // The flag is sugar for the same two entries create's flag adds, and
+        // repeating it never duplicates them.
+        let mut record = VmRecord::new("lo".to_string(), 1, 512, vec![], vec![], true);
+        record.allowed_cidrs = Some(vec!["127.0.0.0/8".to_string()]);
+        let cmd = parse_update(&[
+            "machine",
+            "update",
+            "--name",
+            "lo",
+            "--outbound-localhost-only",
+        ]);
+        let next = cmd
+            .next_egress(&record)
+            .expect("applies")
+            .expect("egress changed");
+        assert_eq!(
+            next.allowed_cidrs.as_deref(),
+            Some(["127.0.0.0/8".to_string(), "::1/128".to_string()].as_slice())
+        );
+
+        // Entry-by-entry removal undoes it, like any other allowed CIDR.
+        let cmd = parse_update(&[
+            "machine",
+            "update",
+            "--name",
+            "lo",
+            "--net",
+            "--remove-allow-cidr",
+            "127.0.0.0/8",
+            "--remove-allow-cidr",
+            "::1/128",
+        ]);
+        let next = cmd
+            .next_egress(&next)
+            .expect("applies")
+            .expect("egress changed");
+        assert_eq!(
+            next.allowed_cidrs.as_deref().unwrap_or_default(),
+            &[] as &[String]
+        );
+
+        // --no-net still conflicts, exactly as it does for --allow-cidr.
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "update",
+            "--name",
+            "lo",
+            "--no-net",
+            "--outbound-localhost-only",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn external_interceptor_requires_a_named_start() {
         // The named-start assertion below fails if SMOLVM_MACHINE_NAME fills
         // --name, whether set by the env test running in parallel or by the
@@ -5611,6 +5676,12 @@ pub struct UpdateCmd {
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", conflicts_with = "no_net")]
     pub allow_cidr: Vec<String>,
 
+    /// Restrict outbound to localhost, as `machine create
+    /// --outbound-localhost-only` does: adds 127.0.0.0/8 and ::1/128 to the
+    /// allowed CIDRs. Undo entry by entry with --remove-allow-cidr.
+    #[arg(long, conflicts_with = "no_net")]
+    pub outbound_localhost_only: bool,
+
     /// Remove an allowed hostname or pattern, written as it was added.
     #[arg(long = "remove-allow-host", value_name = "HOSTNAME|PATTERN")]
     pub remove_allow_host: Vec<String>,
@@ -5674,6 +5745,7 @@ impl UpdateCmd {
         if self.allow_host.is_empty()
             && self.allow_host_pattern.is_empty()
             && self.allow_cidr.is_empty()
+            && !self.outbound_localhost_only
             && self.remove_allow_host.is_empty()
             && self.remove_allow_cidr.is_empty()
         {
@@ -5723,6 +5795,15 @@ impl UpdateCmd {
         for cidr in &self.allow_cidr {
             if !cidrs.contains(cidr) {
                 cidrs.push(cidr.clone());
+            }
+        }
+        // `machine create --outbound-localhost-only` is sugar for these two
+        // entries (see `resolve_egress_flags`); update spells it the same way.
+        if self.outbound_localhost_only {
+            for cidr in ["127.0.0.0/8", "::1/128"] {
+                if !cidrs.iter().any(|stored| stored == cidr) {
+                    cidrs.push(cidr.to_string());
+                }
             }
         }
 
