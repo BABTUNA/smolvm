@@ -2356,6 +2356,7 @@ async fn create_machine_inner(
                             &crate::registry::PullAuth::FromConfig,
                             None,
                             None,
+                            None,
                         )
                     });
                 if let Err(error) = seeded {
@@ -3170,7 +3171,15 @@ pub async fn start_machine(
             let seeded = crate::image_seed::builder_exe()
                 .map_err(|e| crate::Error::config("image seed", e.to_string()))
                 .and_then(|exe| {
-                    crate::image_seed::seed_storage(&exe, &name_clone, &image, &seed_auth, None, None)
+                    crate::image_seed::seed_storage(
+                        &exe,
+                        &name_clone,
+                        &image,
+                        &seed_auth,
+                        None,
+                        None,
+                        None,
+                    )
                 });
             if let Err(error) = seeded {
                 tracing::warn!(machine = %name_clone, %error, "no image seed; pulling in the guest");

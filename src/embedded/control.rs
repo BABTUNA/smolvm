@@ -189,7 +189,7 @@ pub(crate) fn start_vm_with_interceptor(
     let record = get_record(db, name)?;
     // A fresh registry-image machine starts on a shared seed of its image, as
     // the CLI and API do, so an SDK create skips the in-guest pull.
-    crate::image_seed::seed_first_start(name, &record, false, None, None);
+    crate::image_seed::seed_first_start(name, &record, false, None, None, None);
     let started = launch_from_record(
         &record,
         LaunchFeatures {
@@ -349,7 +349,7 @@ pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> 
     db.update_vm(name, |record| record.forkable = true)?
         .ok_or_else(|| Error::vm_not_found(name))?;
     let record = get_record(db, name)?;
-    crate::image_seed::seed_first_start(name, &record, false, None, None);
+    crate::image_seed::seed_first_start(name, &record, false, None, None, None);
     let features = LaunchFeatures {
         forkable: true,
         ..LaunchFeatures::default()

@@ -1571,6 +1571,9 @@ pub(crate) fn default_workload_to_image(
 pub struct StartOptions {
     pub no_workload: bool,
     pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    /// Reuse an image digest resolved at most this many seconds ago when
+    /// seeding, instead of resolving at the registry on every first start.
+    pub seed_digest_ttl: Option<u64>,
 }
 
 /// Start a named machine that has a config record.
@@ -1603,6 +1606,7 @@ fn start_vm_named_with_db(
     let StartOptions {
         no_workload,
         external_interceptor,
+        seed_digest_ttl,
     } = options;
 
     // Direct DB lookup — 1 read cycle instead of loading everything
@@ -1756,7 +1760,14 @@ fn start_vm_named_with_db(
     // A fresh registry-image machine starts on a shared seed of its image, so
     // the guest finds the image already pulled. Best-effort: without a seed the
     // guest pulls as before.
-    smolvm::image_seed::seed_first_start(name, &record, from_snapshot, proxy, no_proxy);
+    smolvm::image_seed::seed_first_start(
+        name,
+        &record,
+        from_snapshot,
+        seed_digest_ttl,
+        proxy,
+        no_proxy,
+    );
 
     // Start agent VM
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
