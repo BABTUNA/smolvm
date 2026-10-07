@@ -2567,6 +2567,7 @@ fn crane_pull_layout(
             let _temp_dir = setup_docker_auth(image, auth)?;
             cmd.env("DOCKER_CONFIG", _temp_dir.path());
             apply_proxy_env(&mut cmd, proxy, no_proxy);
+            apply_registry_trust(&mut cmd);
             let output = cmd.output()?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2582,6 +2583,28 @@ fn crane_pull_layout(
             is_transient_network_error(&error_msg)
         },
     )
+}
+
+// Keep the temporary OCI layout on the fast path small and leave ample room
+// for the unpacked layers. Large images use the existing streaming path, which
+// never needs a second copy of the compressed image on disk.
+const MAX_COLD_LAYOUT_BYTES: u64 = 128 * 1024 * 1024;
+const COLD_LAYOUT_FREE_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn cold_layout_fits(manifest: &serde_json::Value, available_bytes: u64) -> bool {
+    let Some(layers) = manifest["layers"].as_array() else {
+        return false;
+    };
+    let Some(config_size) = manifest["config"]["size"].as_u64() else {
+        return false;
+    };
+    let total = layers.iter().try_fold(config_size, |sum, layer| {
+        sum.checked_add(layer["size"].as_u64()?)
+    });
+    total.is_some_and(|bytes| {
+        bytes <= MAX_COLD_LAYOUT_BYTES
+            && available_bytes >= bytes.saturating_add(COLD_LAYOUT_FREE_RESERVE_BYTES)
+    })
 }
 
 /// Remove pull layouts left behind by a crashed agent (their [`LayoutGuard`]
@@ -2674,8 +2697,7 @@ fn oci_layout_manifest(layout: &Path, oci_platform: Option<&str>) -> Result<Stri
 
 /// [`fetch_and_extract_layer`] for a blob that is already on disk in an OCI
 /// layout. Identical cleanup and marker handling, no crane process. The blob
-/// file is removed after a successful extraction so the layout's transient
-/// disk overhead stays at one compressed blob beyond the layer being written.
+/// file is removed after a successful extraction to release temporary space.
 fn extract_layer_from_file(
     layer_digest: &str,
     layer_id: &str,
@@ -2895,13 +2917,16 @@ where
         pending.push((i, layer_digest.clone(), layer_id, layer_dir));
     }
 
-    // A fully cold pull takes everything through ONE crane process: manifest,
-    // config and every layer blob land in an OCI layout in a single
-    // invocation with a single registry token exchange, instead of one
-    // process and one anonymous auth round trip per request. A pull that can
-    // reuse cached layers keeps the per-blob path, which never downloads what
-    // is already on disk.
-    let layout_guard: Option<LayoutGuard> = if !pending.is_empty() && !any_cached {
+    // For small, fully cold images with enough free space, crane pulls the
+    // blobs together into a temporary OCI layout. Larger images, tight disks,
+    // and warm pulls retain the streaming per-blob path and its retries.
+    let available_bytes = get_disk_usage(root)
+        .ok()
+        .map(|(total, used)| total.saturating_sub(used))
+        .unwrap_or(0);
+    let use_layout =
+        !pending.is_empty() && !any_cached && cold_layout_fits(&manifest_json, available_bytes);
+    let layout_guard: Option<LayoutGuard> = if use_layout {
         sweep_stale_pull_layouts(root);
         // Unique per pull: two concurrent pulls of the same image must not
         // share a directory, and a crashed pull's leftover (its guard never
@@ -2915,9 +2940,10 @@ where
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
+        let guard = LayoutGuard(layout_dir);
         progress(0, 0, "downloading image");
-        crane_pull_layout(image, oci_platform, auth, proxy, no_proxy, &layout_dir)?;
-        Some(LayoutGuard(layout_dir))
+        crane_pull_layout(image, oci_platform, auth, proxy, no_proxy, &guard.0)?;
+        Some(guard)
     } else {
         None
     };
@@ -3018,7 +3044,7 @@ where
                         ),
                         None => fetch_and_extract_layer_with_retry(
                             image,
-                            layer_digest,
+                            &layer_digest,
                             &layer_id,
                             &layer_dir,
                             oci_platform,
@@ -5746,6 +5772,49 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cold_layout_is_bounded_by_manifest_and_available_disk() {
+        use super::{cold_layout_fits, COLD_LAYOUT_FREE_RESERVE_BYTES, MAX_COLD_LAYOUT_BYTES};
+        let mib = 1024 * 1024;
+        let manifest = serde_json::json!({
+            "config": { "size": mib },
+            "layers": [{ "size": 8 * mib }, { "size": 16 * mib }]
+        });
+        assert!(cold_layout_fits(
+            &manifest,
+            COLD_LAYOUT_FREE_RESERVE_BYTES + 25 * mib
+        ));
+        assert!(!cold_layout_fits(
+            &manifest,
+            COLD_LAYOUT_FREE_RESERVE_BYTES + 25 * mib - 1
+        ));
+        assert!(!cold_layout_fits(
+            &serde_json::json!({ "config": { "size": mib }, "layers": [{ "size": MAX_COLD_LAYOUT_BYTES }] }),
+            u64::MAX
+        ));
+        assert!(!cold_layout_fits(
+            &serde_json::json!({ "config": { "size": mib }, "layers": [{ "digest": "sha256:abc" }] }),
+            u64::MAX
+        ));
+        assert!(!cold_layout_fits(
+            &serde_json::json!({ "config": { "size": u64::MAX }, "layers": [{ "size": 1 }] }),
+            u64::MAX
+        ));
+    }
+
+    #[test]
+    fn failed_pull_guard_cleans_partial_layout() {
+        fn failed_pull(layout: &std::path::Path) -> std::io::Result<()> {
+            let _guard = super::LayoutGuard(layout.to_path_buf());
+            std::fs::create_dir_all(layout)?;
+            std::fs::write(layout.join("partial-blob"), "partial")?;
+            Err(std::io::Error::other("fetch failed"))
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let layout = temp.path().join(".pull-layout-test");
+        assert!(failed_pull(&layout).is_err());
+        assert!(!layout.exists());
+    }
 
     #[test]
     fn cache_disk_env_names_a_virtio_disk_and_an_absolute_path() {
