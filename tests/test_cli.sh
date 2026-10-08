@@ -70,6 +70,15 @@ test_pack_help() {
     [[ "$output" == *"--output"* ]]
 }
 
+test_completion() {
+    local bash fish
+    bash=$($SMOLVM completion bash 2>/dev/null) || return 1
+    fish=$($SMOLVM completion fish 2>/dev/null) || return 1
+    [[ "$bash" == *"machine"* && "$bash" == *"complete"* && "$bash" != *"_boot-vm"* ]] && \
+    [[ "$fish" == *"machine"* && "$fish" != *"_boot-vm"* ]] && \
+    ! $SMOLVM completion not-a-shell >/dev/null 2>&1
+}
+
 # =============================================================================
 # Removed Commands
 # =============================================================================
@@ -210,6 +219,7 @@ run_test "Machine help" test_machine_help || true
 run_test "Machine run help" test_machine_run_help || true
 run_test "No container command" test_no_container_command || true
 run_test "Pack help" test_pack_help || true
+run_test "Completion scripts" test_completion || true
 run_test "vm alias works" test_vm_alias || true
 run_test "Invalid subcommand fails" test_invalid_subcommand || true
 run_test "Machine create flags" test_machine_create_flags || true

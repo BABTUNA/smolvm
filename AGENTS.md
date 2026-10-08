@@ -121,6 +121,7 @@ smolvm pack run [--sidecar PATH] [-- CMD]         # run .smolmachine
 
 smolvm serve start [--listen ADDR:PORT|PATH]      # HTTP API
 smolvm config registries edit                     # registry auth
+smolvm completion bash|zsh|fish|powershell|elvish # print a shell completion script
 
 # Secrets are references to host env vars / files, resolved at launch — no
 # built-in store. Attach them on the command line or in a Smolfile [secrets].

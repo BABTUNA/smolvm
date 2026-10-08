@@ -49,7 +49,10 @@ smolvm-pack = { path = "crates/smolvm-pack", version = "1.25.1" }
 smolvm-registry = { path = "crates/smolvm-registry", version = "1.25.1" }
 smolfile = { path = "crates/smolvm-smolfile", version = "1.25.1" }
 thiserror = "1"
-clap = { version = "4", features = ["derive", "env"] }
+# `string` lets `smolvm completion` rebuild the command tree from owned
+# names so hidden internal commands can be left out of the script.
+clap = { version = "4", features = ["derive", "env", "string"] }
+clap_complete = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

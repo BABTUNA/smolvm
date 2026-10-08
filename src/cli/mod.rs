@@ -1,6 +1,7 @@
 //! CLI command implementations.
 
 pub mod cleanup_ephemeral;
+pub mod completion;
 pub mod config;
 pub mod host_network;
 pub mod machine;

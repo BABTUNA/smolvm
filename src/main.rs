@@ -1,6 +1,6 @@
 //! smolvm CLI entry point.
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod cli;
@@ -39,6 +39,13 @@ enum Commands {
     /// Manage smolvm configuration (registries, defaults)
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
+
+    /// Print a shell completion script to stdout
+    #[command(after_help = cli::completion::AFTER_HELP)]
+    Completion {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 
     /// Internal: boot a VM subprocess (not for direct use)
     #[command(name = "_boot-vm", hide = true)]
@@ -185,12 +192,16 @@ fn main() {
     tracing::debug!(version = smolvm::VERSION, "starting smolvm");
 
     // Execute command
-    // Note: orphan cleanup is handled per-command (skipped for ephemeral `machine run`).
+    // Note: orphan cleanup is handled per-command (skipped for ephemeral `machnie run`).
     let result = match cli.command {
         Commands::Machine(cmd) => (*cmd).run(),
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => (*cmd).run(),
         Commands::Config(cmd) => cmd.run(),
+        Commands::Completion { shell } => {
+            let mut cmd = cli::completion::without_hidden(&Cli::command());
+            cli::completion::print(shell, &mut cmd).map_err(smolvm::Error::Io)
+        }
         Commands::BootVm { config } => smolvm::internal_boot::run(config),
         #[cfg(unix)]
         Commands::CudaDaemon { socket } => {
@@ -293,6 +304,75 @@ mod tests {
     #[test]
     fn the_launcher_name_is_not_flagged() {
         assert_eq!(stray_stub_note("smolvm"), None);
+    }
+
+    #[test]
+    fn completion_parses_a_known_shell_and_rejects_an_unknown_one() {
+        assert!(Cli::try_parse_from(["smolvm", "completion", "bash"]).is_ok());
+        let err = Cli::try_parse_from(["smolvm", "completion", "nushell"]).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("nushell") || rendered.contains("possible value"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn completion_scripts_offer_public_commands_only() {
+        use clap_complete::Shell;
+
+        for shell in [
+            Shell::Bash,
+            Shell::Elvish,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Zsh,
+        ] {
+            let mut buf = Vec::new();
+            let mut cmd = cli::completion::without_hidden(&Cli::command());
+            cli::completion::write(shell, &mut cmd, &mut buf).unwrap();
+            let script = String::from_utf8(buf).expect("completion script is utf-8");
+            assert!(
+                !script.contains('\u{1b}'),
+                "{shell:?} script contains ANSI styling"
+            );
+            assert!(
+                script.contains("machine") && script.contains("completion"),
+                "{shell:?} script is missing public commands"
+            );
+            assert!(
+                script.contains("--net") || script.contains("-l net"),
+                "{shell:?} script is missing flags"
+            );
+            assert!(
+                script_offers_vm_alias(shell, &script),
+                "{shell:?} script dropped the vm alias:\n{script}"
+            );
+            for hidden in [
+                "_boot-vm",
+                "_cuda-daemon",
+                "_cuda-clone-worker",
+                "_cuda-mps-supervisor",
+                "_video-encoder",
+                "_cleanup-ephemeral",
+            ] {
+                assert!(
+                    !script.contains(hidden),
+                    "{shell:?} script offers hidden command {hidden}"
+                );
+            }
+        }
+    }
+
+    fn script_offers_vm_alias(shell: clap_complete::Shell, script: &str) -> bool {
+        match shell {
+            clap_complete::Shell::Bash => script.contains("smolvm,vm)"),
+            clap_complete::Shell::Fish => script.contains("-a \"vm\""),
+            clap_complete::Shell::Zsh => script.contains("'vm:"),
+            clap_complete::Shell::PowerShell => script.contains("'vm', 'vm'"),
+            clap_complete::Shell::Elvish => script.contains("vm '"),
+            _ => false,
+        }
     }
 
     #[test]
