@@ -14,10 +14,14 @@
 //!
 //! Disallowed destinations are dropped before any host socket is created. DNS
 //! forwarding (gateway-internal) is never gated by this filter.
+//!
+//! A restricted policy's allow list can be replaced while the machine runs
+//! ([`EgressPolicy::replace_allow_list`]), by the host over a socket only it can
+//! reach. A replacement can never lift the policy: an empty list admits nothing.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::dns;
@@ -85,12 +89,117 @@ impl Cidr {
     }
 }
 
-struct AllowList {
+/// The destinations an allow list admits.
+struct Rules {
     cidrs: Vec<Cidr>,
     /// Normalized allow-host names. `None` = no DNS hostname filtering.
     allowed_hosts: Option<Vec<String>>,
-    /// IPs learned from allowed DNS answers → expiry instant.
-    learned: Mutex<HashMap<IpAddr, Instant>>,
+}
+
+impl Rules {
+    fn build(allowed_cidrs: Option<&[String]>, allowed_hosts: Option<&[String]>) -> Self {
+        let cidrs = allowed_cidrs
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|spec| {
+                let parsed = Cidr::parse(spec);
+                if parsed.is_none() {
+                    tracing::warn!(cidr = %spec, "ignoring unparseable egress CIDR");
+                }
+                parsed
+            })
+            .collect();
+        let allowed_hosts = allowed_hosts.map(|hosts| {
+            hosts
+                .iter()
+                .filter_map(|h| dns::normalize_hostname(h))
+                .collect()
+        });
+        Self {
+            cidrs,
+            allowed_hosts,
+        }
+    }
+
+    fn hostname_allowed(&self, hostname: &str) -> bool {
+        match &self.allowed_hosts {
+            None => true,
+            Some(hosts) => dns::hostname_allowed(hostname, hosts),
+        }
+    }
+}
+
+/// An IP learned from an allowed DNS answer.
+struct Learned {
+    expires_at: Instant,
+    /// The name whose answer admitted it, so revoking the name revokes it.
+    name: Option<String>,
+}
+
+struct AllowList {
+    rules: RwLock<Arc<Rules>>,
+    /// IPs learned from allowed DNS answers.
+    learned: Mutex<HashMap<IpAddr, Learned>>,
+}
+
+impl AllowList {
+    /// The rules in force.
+    fn rules(&self) -> Arc<Rules> {
+        Arc::clone(&self.rules.read().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// Render an allow list for [`EgressPolicy::replace_allow_list`]: one
+/// `cidr <range>` or `host <name-or-pattern>` per line, hosts as `machine
+/// create` stores them.
+pub fn render_live_policy(cidrs: &[String], hosts: &[String]) -> String {
+    let mut out = String::from("# smolvm egress allow list\n");
+    for cidr in cidrs {
+        out.push_str("cidr ");
+        out.push_str(cidr.trim());
+        out.push('\n');
+    }
+    for host in hosts {
+        out.push_str("host ");
+        out.push_str(host.trim());
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse a rendered allow list. An absent kind of entry means none of it, and a
+/// list with no entries at all admits nothing.
+fn parse_live_policy(bytes: &[u8]) -> Result<Rules, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
+    let mut cidrs = Vec::new();
+    let mut hosts = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match line.split_once(char::is_whitespace) {
+            Some(("cidr", value)) if Cidr::parse(value.trim()).is_some() => {
+                cidrs.push(value.trim().to_string())
+            }
+            Some(("host", value)) if !value.trim().is_empty() => {
+                hosts.push(value.trim().to_string())
+            }
+            _ => {
+                return Err(format!(
+                    "line {}: expected `cidr <range>` or `host <name>`",
+                    index + 1
+                ))
+            }
+        }
+    }
+    if cidrs.is_empty() && hosts.is_empty() {
+        return Ok(Rules::build(Some(&[]), Some(&[])));
+    }
+    Ok(Rules::build(
+        (!cidrs.is_empty()).then_some(cidrs.as_slice()),
+        (!hosts.is_empty()).then_some(hosts.as_slice()),
+    ))
 }
 
 /// How much of the platform hard-floor applies, chosen once per policy from the
@@ -295,27 +404,9 @@ impl EgressPolicy {
         if allowed_cidrs.is_none() && allowed_hosts.is_none() {
             return Self::unrestricted();
         }
-        let cidrs = allowed_cidrs
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|spec| {
-                let parsed = Cidr::parse(spec);
-                if parsed.is_none() {
-                    tracing::warn!(cidr = %spec, "ignoring unparseable egress CIDR");
-                }
-                parsed
-            })
-            .collect();
-        let allowed_hosts = allowed_hosts.map(|hosts| {
-            hosts
-                .iter()
-                .filter_map(|h| dns::normalize_hostname(h))
-                .collect()
-        });
         Self {
             inner: Some(Arc::new(AllowList {
-                cidrs,
-                allowed_hosts,
+                rules: RwLock::new(Arc::new(Rules::build(allowed_cidrs, allowed_hosts))),
                 learned: Mutex::new(HashMap::new()),
             })),
             floor: floor_mode(),
@@ -323,6 +414,27 @@ impl EgressPolicy {
             watchlist: None,
             signal_log: None,
         }
+    }
+
+    /// Replace the allow list of a restricted policy with a rendered one (see
+    /// [`render_live_policy`]), for every clone of this policy at once. Learned
+    /// addresses of names the new list no longer allows are forgotten. An
+    /// unrestricted policy has no list to replace.
+    pub fn replace_allow_list(&self, rendered: &str) -> Result<(), String> {
+        let Some(list) = &self.inner else {
+            return Err("this machine has no allow list to replace".to_string());
+        };
+        let next = Arc::new(parse_live_policy(rendered.as_bytes())?);
+        if let Ok(mut learned) = list.learned.lock() {
+            learned.retain(|_, entry| {
+                entry
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| next.hostname_allowed(name))
+            });
+        }
+        *list.rules.write().unwrap_or_else(|e| e.into_inner()) = next;
+        Ok(())
     }
 
     /// Convenience for the CIDR-only case.
@@ -422,7 +534,7 @@ impl EgressPolicy {
     pub fn dns_filter_active(&self) -> bool {
         self.inner
             .as_ref()
-            .is_some_and(|list| list.allowed_hosts.is_some())
+            .is_some_and(|list| list.rules().allowed_hosts.is_some())
     }
 
     /// Whether a DNS query for `hostname` should be forwarded upstream. With no
@@ -430,10 +542,7 @@ impl EgressPolicy {
     pub fn hostname_allowed(&self, hostname: &str) -> bool {
         match &self.inner {
             None => true,
-            Some(list) => match &list.allowed_hosts {
-                None => true,
-                Some(hosts) => dns::hostname_allowed(hostname, hosts),
-            },
+            Some(list) => list.rules().hostname_allowed(hostname),
         }
     }
 
@@ -455,14 +564,14 @@ impl EgressPolicy {
                 return self
                     .inner
                     .as_ref()
-                    .is_some_and(|list| list.cidrs.iter().any(|cidr| cidr.contains(ip)));
+                    .is_some_and(|list| list.rules().cidrs.iter().any(|cidr| cidr.contains(ip)));
             }
             return false;
         }
         match &self.inner {
             None => true,
             Some(list) => {
-                if list.cidrs.iter().any(|cidr| cidr.contains(ip)) {
+                if list.rules().cidrs.iter().any(|cidr| cidr.contains(ip)) {
                     return true;
                 }
                 list.learned
@@ -470,7 +579,7 @@ impl EgressPolicy {
                     .map(|learned| {
                         learned
                             .get(&ip)
-                            .is_some_and(|expires_at| *expires_at > Instant::now())
+                            .is_some_and(|entry| entry.expires_at > Instant::now())
                     })
                     .unwrap_or(false)
             }
@@ -491,6 +600,23 @@ impl EgressPolicy {
     /// IPs. TTLs are clamped to [60s, 3600s]; expired entries are pruned. No-op
     /// when unrestricted.
     pub fn learn_ip_records(&self, records: &[(IpAddr, u32)]) {
+        self.learn(None, records);
+    }
+
+    /// Learn the A/AAAA records of an allowed DNS `answer`, remembering the
+    /// name asked so revoking that name later revokes these IPs too. An answer
+    /// for a name revoked while the query was in flight is not learned.
+    pub fn learn_dns_answer(&self, answer: &[u8]) {
+        let name = dns::question_name(answer).and_then(|n| dns::normalize_hostname(&n));
+        if let (Some(list), Some(name)) = (&self.inner, name.as_deref()) {
+            if !list.rules().hostname_allowed(name) {
+                return;
+            }
+        }
+        self.learn(name, &dns::answer_ip_records(answer));
+    }
+
+    fn learn(&self, name: Option<String>, records: &[(IpAddr, u32)]) {
         let Some(list) = &self.inner else {
             return;
         };
@@ -498,14 +624,18 @@ impl EgressPolicy {
             return;
         };
         let now = Instant::now();
-        learned.retain(|_, expires_at| *expires_at > now);
+        learned.retain(|_, entry| entry.expires_at > now);
         for (ip, ttl) in records {
             let ttl = u64::from(*ttl).clamp(MIN_LEARNED_TTL, MAX_LEARNED_TTL);
             let expires_at = now + Duration::from_secs(ttl);
-            learned
-                .entry(*ip)
-                .and_modify(|existing| *existing = (*existing).max(expires_at))
-                .or_insert(expires_at);
+            let entry = learned.entry(*ip).or_insert(Learned {
+                expires_at,
+                name: name.clone(),
+            });
+            if expires_at >= entry.expires_at {
+                entry.expires_at = expires_at;
+                entry.name = name.clone();
+            }
         }
     }
 }
@@ -513,6 +643,74 @@ impl EgressPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_allow_list_grants_and_revokes_for_every_clone() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        let gateway_copy = policy.clone();
+        assert!(!gateway_copy.hostname_allowed("pypi.org"));
+
+        policy
+            .replace_allow_list(&render_live_policy(
+                &[],
+                &["api.github.com".into(), "pypi.org".into()],
+            ))
+            .unwrap();
+        assert!(gateway_copy.hostname_allowed("pypi.org"));
+        assert!(gateway_copy.hostname_allowed("api.github.com"));
+
+        policy
+            .replace_allow_list(&render_live_policy(
+                &["8.8.8.0/24".into()],
+                &["pypi.org".into()],
+            ))
+            .unwrap();
+        assert!(!gateway_copy.hostname_allowed("api.github.com"));
+        assert!(gateway_copy.allows_v4(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn an_empty_allow_list_admits_nothing_and_never_lifts_the_policy() {
+        let policy = EgressPolicy::new(Some(&["8.8.8.0/24".into()]), None);
+        policy.replace_allow_list("# nothing allowed\n").unwrap();
+        assert!(policy.is_restricted());
+        assert!(!policy.allows_v4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!policy.hostname_allowed("example.com"));
+    }
+
+    #[test]
+    fn a_bad_allow_list_is_refused_and_the_current_one_kept() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        assert!(policy.replace_allow_list("allow everything\n").is_err());
+        assert!(policy.replace_allow_list("cidr not-a-cidr\n").is_err());
+        assert!(policy.hostname_allowed("api.github.com"));
+        assert!(!policy.hostname_allowed("pypi.org"));
+    }
+
+    #[test]
+    fn revoking_a_host_revokes_the_addresses_learned_for_it() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into(), "pypi.org".into()]));
+        let github = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6));
+        let pypi = IpAddr::V4(Ipv4Addr::new(151, 101, 0, 223));
+        policy.learn(Some("api.github.com".into()), &[(github, 300)]);
+        policy.learn(Some("pypi.org".into()), &[(pypi, 300)]);
+        assert!(policy.allows(github));
+
+        policy
+            .replace_allow_list(&render_live_policy(&[], &["pypi.org".into()]))
+            .unwrap();
+        assert!(!policy.allows(github));
+        assert!(policy.allows(pypi));
+    }
+
+    #[test]
+    fn an_unrestricted_policy_has_no_allow_list_to_replace() {
+        let open = EgressPolicy::unrestricted();
+        assert!(open
+            .replace_allow_list(&render_live_policy(&[], &["pypi.org".into()]))
+            .is_err());
+        assert!(!open.is_restricted());
+    }
 
     #[test]
     fn floor_override_parsing() {

@@ -526,6 +526,7 @@ pub fn launch_agent_vm_dynamic(
                     dir.join(smolvm_network::watchlist::EGRESS_WATCHLIST_FILE),
                     dir.join(smolvm_network::EGRESS_SIGNALS_LOG),
                 );
+                crate::network::launch::serve_egress_control(&egress, dir, network_plan.outbound);
             }
 
             // The host/guest ends of the virtio-net channel are an AF_UNIX

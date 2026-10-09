@@ -458,6 +458,47 @@ pub fn egress_denials_log_file(name: &str) -> PathBuf {
     vm_data_dir(name).join(smolvm_network::EGRESS_DENIALS_LOG)
 }
 
+/// Replace a running machine's allow list with `record`'s, through the egress
+/// control socket its network runtime serves. Returns once the runtime has the
+/// new list in force.
+pub fn apply_live_egress_policy(name: &str, record: &crate::config::VmRecord) -> Result<()> {
+    use std::io::{Read, Write};
+    let fail = |reason: String| {
+        Error::config(
+            "egress policy",
+            format!("could not change machine '{name}''s allow list while it runs: {reason}"),
+        )
+    };
+    let path = vm_data_dir(name).join(smolvm_network::EGRESS_SOCKET);
+    let mut stream =
+        crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2)).map_err(
+            |e| {
+                fail(format!(
+                    "{e}; a machine started before live changes were supported needs a restart"
+                ))
+            },
+        )?;
+    let rendered = smolvm_network::egress::render_live_policy(
+        record.allowed_cidrs.as_deref().unwrap_or(&[]),
+        record.dns_filter_hosts.as_deref().unwrap_or(&[]),
+    );
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .and_then(|()| stream.write_all(rendered.as_bytes()))
+        .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
+        .map_err(|e| fail(e.to_string()))?;
+    let mut reply = String::new();
+    stream
+        .read_to_string(&mut reply)
+        .map_err(|e| fail(e.to_string()))?;
+    match reply.trim() {
+        "ok" => Ok(()),
+        other => Err(fail(
+            other.strip_prefix("error: ").unwrap_or(other).to_string(),
+        )),
+    }
+}
+
 /// One egress denial observed by the VMM: the policy refused a guest's
 /// connect or sendto toward `dest`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

@@ -312,6 +312,13 @@ impl StreamInterception {
 /// socket by the launcher and read back by the host's `read_egress_denials`.
 pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
 
+/// Filename of the per-VM egress control socket, served by the network runtime
+/// of a machine started with an allow list. The host sends it a replacement
+/// allow list (see [`egress::render_live_policy`]) and reads back `ok` or
+/// `error: <reason>`. A guest cannot reach a host socket through a shared
+/// folder, so only the host can change a running machine's allow list.
+pub const EGRESS_SOCKET: &str = "egress.sock";
+
 /// Filename of the per-VM egress signal log: watchlist matches, recorded beside
 /// the denial log by the launcher and read back by the host's
 /// `read_egress_signals`. Created on the first match only.
