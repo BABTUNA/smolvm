@@ -545,7 +545,7 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file"],
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "deny_cidr", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -669,6 +669,10 @@ pub struct RunCmd {
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
     pub allow_cidr: Vec<String>,
+
+    /// Deny egress to a CIDR range, checked before anything is allowed (can be used multiple times, implies --net)
+    #[arg(long = "deny-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
+    pub deny_cidr: Vec<String>,
 
     /// Allow egress to specific hostname, resolved at VM start (can be used multiple times, implies --net)
     #[arg(long = "allow-host", value_name = "HOSTNAME", help_heading = "Network")]
@@ -1462,6 +1466,7 @@ impl RunCmd {
         params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
         // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
         params.dns_options = self.dns_option.clone();
+        params.prepend_deny_cidrs(&self.deny_cidr);
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
@@ -1570,6 +1575,7 @@ impl RunCmd {
                         allowed_cidrs: params.allowed_cidrs.clone(),
                         dns_filter_hosts: params.dns_filter_hosts.clone(),
                         block_private: params.block_private.clone(),
+                        egress_rules: params.egress_rules.clone(),
                     }),
                     secret_refs: params.secret_refs.clone(),
                 }
@@ -1730,6 +1736,7 @@ impl RunCmd {
                     allowed_cidrs: params.allowed_cidrs.clone(),
                     dns_filter_hosts: params.dns_filter_hosts.clone(),
                     block_private: params.block_private.clone(),
+                    egress_rules: params.egress_rules.clone(),
                 }),
                 secret_refs: params.secret_refs.clone(),
             }
@@ -1857,7 +1864,7 @@ impl RunCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
-            egress_rules: Vec::new(),
+            egress_rules: params.egress_rules.clone(),
             block_io: params.block_io,
             disk_durability: params.disk_durability,
             disks: params.disks.clone(),
@@ -4173,6 +4180,10 @@ pub struct CreateCmd {
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub allow_cidr: Vec<String>,
 
+    /// Deny egress to a CIDR range, checked before anything is allowed (can be used multiple times, implies --net)
+    #[arg(long = "deny-cidr", value_parser = parse_cidr, value_name = "CIDR")]
+    pub deny_cidr: Vec<String>,
+
     /// Allow egress to specific hostname, resolved at VM start (can be used multiple times, implies --net)
     #[arg(long = "allow-host", value_name = "HOSTNAME")]
     pub allow_host: Vec<String>,
@@ -4496,6 +4507,7 @@ impl CreateCmd {
         params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
         // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
         params.dns_options = self.dns_option.clone();
+        params.prepend_deny_cidrs(&self.deny_cidr);
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
@@ -4562,7 +4574,7 @@ impl CreateCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
-            egress_rules: Vec::new(),
+            egress_rules: params.egress_rules.clone(),
             block_io: params.block_io,
             disk_durability: params.disk_durability,
             disks: Vec::new(),
@@ -4953,6 +4965,10 @@ impl CreateCmd {
             disk_durability: self.disk_durability.unwrap_or_default(),
             allowed_cidrs,
             block_private: None,
+            // Captured rules first, as allowed_cidrs prefers the checkpoint's.
+            egress_rules: checkpoint_network
+                .map(|captured| captured.egress_rules.clone())
+                .unwrap_or_default(),
             restart_policy: checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.workload.as_ref())
@@ -5002,6 +5018,7 @@ impl CreateCmd {
                     .is_some_and(|checkpoint| checkpoint.packed_layers.is_some()))
             .then_some(canonical_path),
         };
+        params.prepend_deny_cidrs(&self.deny_cidr);
         merge_cli_credentials(&mut params, &self.credential)?;
 
         let resources = VmResources {
@@ -5027,7 +5044,7 @@ impl CreateCmd {
             disk_volumes: Vec::new(),
             block_private: params.block_private.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
-            egress_rules: Vec::new(),
+            egress_rules: params.egress_rules.clone(),
         };
         resources.validate()?;
         validate_requested_network_backend(
