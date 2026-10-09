@@ -608,6 +608,17 @@ pub struct EgressSignal {
 /// The most label and destination pairs reported per machine, latest first.
 const EGRESS_SIGNALS_REPORTED: usize = 50;
 
+/// Hex form of the host-minted identity of `name`'s current mediated launch,
+/// the same value mediated egress decisions carry as `machineId`, or `None`
+/// when the machine was not launched with mediated egress.
+pub fn read_mediation_machine_id(name: &str) -> Option<String> {
+    let bytes =
+        std::fs::read(vm_data_dir(name).join(crate::agent::launcher::MEDIATED_IDENTITY_FILE))
+            .ok()?;
+    let id: [u8; 16] = bytes.try_into().ok()?;
+    Some(id.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// Summarize the watchlist matches recorded for `name`, latest first, or `None`
 /// when there are none (no watchlist, or nothing matched). Only the log's
 /// recent tail is read, bounding the work per machine-info call.
@@ -2348,20 +2359,59 @@ impl AgentManager {
                 features.credentials.is_some(),
                 features.pod_netns.is_some(),
             )?;
-            if features.snapshot_dir.is_some() || features.forkable {
-                return Err(Error::config(
-                    "egress interceptor",
-                    "external interception does not support checkpoint or branch launches",
-                ));
-            }
         }
         if let Some(name) = self.name() {
             let db = crate::db::SmolvmDb::open()?;
+            if let Some(record) = db.get_vm(name)? {
+                if record.mediated_egress_required {
+                    // A persisted mediated boundary cannot be downgraded by
+                    // a restart path that only supplies the broker binding.
+                    features.mediated_egress = true;
+                }
+                if features.mediated_egress && features.external_interceptor.is_none() {
+                    return Err(Error::config(
+                        "mediated egress",
+                        "this machine requires an external interceptor on every start",
+                    ));
+                }
+                if features.mediated_egress && !record.mediated_egress_required {
+                    db.update_vm(name, |record| {
+                        record.mediated_egress_required = true;
+                        record.external_interceptor_required = true;
+                    })?;
+                }
+                if features.mediated_egress {
+                    if let Some(parent) = record.golden.as_deref() {
+                        let path = vm_data_dir(parent)
+                            .join(crate::agent::launcher::MEDIATED_IDENTITY_FILE);
+                        let bytes = std::fs::read(&path).map_err(|error| {
+                            Error::config(
+                                "mediated egress",
+                                format!("branch source identity unavailable: {error}"),
+                            )
+                        })?;
+                        features.mediated_parent_id = bytes.try_into().map_err(|_| {
+                            Error::config("mediated egress", "branch source identity is invalid")
+                        })?;
+                    }
+                }
+            }
             enforce_external_interceptor_requirement(
                 &db,
                 name,
                 features.external_interceptor.as_ref(),
             )?;
+        }
+        if resources
+            .egress_rules
+            .iter()
+            .any(|rule| rule.action == smolvm_protocol::RuleAction::Redirect)
+            && !features.mediated_egress
+        {
+            return Err(Error::config(
+                "egress rules",
+                "redirect rules require a mediated egress interceptor on every start",
+            ));
         }
         if let Some(snapshot) = features.snapshot_dir.as_deref() {
             crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
@@ -2726,6 +2776,8 @@ impl AgentManager {
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
             external_interceptor: features.external_interceptor,
+            mediated_egress: features.mediated_egress,
+            mediated_parent_id: features.mediated_parent_id,
             packed_layers_dir: features.packed_layers_dir,
             packed_layers_dax_window,
             pack_idmap_source,
