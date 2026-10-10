@@ -1822,12 +1822,41 @@ impl RunCmd {
             params.port.len(),
         )?;
 
-        // A fresh registry-image run starts on a shared seed of its image, so
-        // the guest finds the image already pulled, exactly as `machine start`
-        // does. Best-effort: without a seed the guest pulls as before.
+        // Resolve the image source on the host before launch: registry refs
+        // pass through to the guest pull; a local `docker save` archive or an
+        // unpacked rootfs directory is staged/validated and mounted via
+        // virtiofs (the `.smolmachine` packed-layers path), so no pull happens.
+        let raw_image = self.image.clone().or(params.image.clone());
+        let mut packed_layers_dir = None;
+        let image = match raw_image.as_deref() {
+            Some(img) => {
+                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+                match resolve(classify(img))? {
+                    ResolvedImage::Registry(reference) => Some(reference),
+                    ResolvedImage::Local {
+                        reference,
+                        packed_layers_dir: dir,
+                    } => {
+                        packed_layers_dir = Some(dir);
+                        Some(reference)
+                    }
+                }
+            }
+            None => None,
+        };
+        // A fresh run starts on a shared seed of its image, so the guest finds
+        // the image already in place, exactly as `machine start` does. A local
+        // archive seeds under its resolved `local:<hash>` reference, which is
+        // what the seed cache keys on. Best-effort: without a seed the guest
+        // pulls or flattens as before.
+        let seed_image = if packed_layers_dir.is_some() {
+            image.clone()
+        } else {
+            params.image.clone()
+        };
         smolvm::image_seed::seed_ephemeral_run_with_trust(
             &vm_name,
-            params.image.as_deref(),
+            seed_image.as_deref(),
             params.storage_gb,
             self.seed_digest_ttl,
             self.proxy_opts.resolved_proxy()?.as_deref(),
@@ -1859,28 +1888,6 @@ impl RunCmd {
             None
         };
 
-        // Resolve the image source on the host before launch: registry refs
-        // pass through to the guest pull; a local `docker save` archive or an
-        // unpacked rootfs directory is staged/validated and mounted via
-        // virtiofs (the `.smolmachine` packed-layers path), so no pull happens.
-        let raw_image = self.image.clone().or(params.image.clone());
-        let mut packed_layers_dir = None;
-        let image = match raw_image.as_deref() {
-            Some(img) => {
-                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
-                match resolve(classify(img))? {
-                    ResolvedImage::Registry(reference) => Some(reference),
-                    ResolvedImage::Local {
-                        reference,
-                        packed_layers_dir: dir,
-                    } => {
-                        packed_layers_dir = Some(dir);
-                        Some(reference)
-                    }
-                }
-            }
-            None => None,
-        };
         let uses_packed_layers = packed_layers_dir.is_some();
 
         let mut features = smolvm::agent::LaunchFeatures {
