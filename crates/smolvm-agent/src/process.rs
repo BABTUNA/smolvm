@@ -290,6 +290,20 @@ impl ExitSignal {
         Self()
     }
 
+    /// The pidfd, for callers that wait on it alongside other fds. It
+    /// becomes readable when the child exits. `None` without pidfd support.
+    pub(crate) fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            self.0.as_ref().map(|fd| fd.as_raw_fd())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// Return after `timeout`, or sooner if the child exits.
     pub(crate) fn wait(&self, timeout: Duration) {
         #[cfg(target_os = "linux")]

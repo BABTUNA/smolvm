@@ -5462,6 +5462,9 @@ fn run_interactive_loop(
 
     let mut stdout_buf = [0u8; IO_BUFFER_SIZE];
     let mut stderr_buf = [0u8; IO_BUFFER_SIZE];
+    // Wakes the poll below the moment the child exits, instead of on the
+    // next timeout tick.
+    let exit_signal = process::ExitSignal::open(child);
 
     loop {
         // Check if child has exited
@@ -5521,10 +5524,15 @@ fn run_interactive_loop(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: exit_signal.raw_fd().unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
 
         // Wait for I/O or timeout using poll()
-        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 3, poll_timeout_ms) };
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 4, poll_timeout_ms) };
 
         if poll_result < 0 {
             let err = std::io::Error::last_os_error();
@@ -5536,11 +5544,19 @@ fn run_interactive_loop(
 
         // Read available stdout. If send_response fails (host disconnected),
         // kill the child and return gracefully.
-        if poll_fds[0].revents & libc::POLLIN != 0 {
+        // A pipe whose writer closed reports POLLHUP, often without POLLIN,
+        // and stays ready forever. Read it to EOF and stop polling it, or
+        // poll returns at once on every pass and spins a CPU until the child
+        // exits.
+        let mut stdout_closed = false;
+        if poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             if let Some(ref mut stdout) = child_stdout {
                 loop {
                     match stdout.read(&mut stdout_buf) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            stdout_closed = true;
+                            break;
+                        }
                         Ok(n) => {
                             if send_response(
                                 stream,
@@ -5557,19 +5573,31 @@ fn run_interactive_loop(
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(e) => {
                             debug!(error = %e, "stdout read error");
+                            stdout_closed = true;
                             break;
                         }
                     }
                 }
             }
         }
+        if stdout_closed {
+            child_stdout = None;
+        }
 
         // Read available stderr. Same disconnection handling as stdout.
-        if poll_fds[1].revents & libc::POLLIN != 0 {
+        // A pipe whose writer closed reports POLLHUP, often without POLLIN,
+        // and stays ready forever. Read it to EOF and stop polling it, or
+        // poll returns at once on every pass and spins a CPU until the child
+        // exits.
+        let mut stderr_closed = false;
+        if poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             if let Some(ref mut stderr) = child_stderr {
                 loop {
                     match stderr.read(&mut stderr_buf) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            stderr_closed = true;
+                            break;
+                        }
                         Ok(n) => {
                             if send_response(
                                 stream,
@@ -5586,11 +5614,15 @@ fn run_interactive_loop(
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(e) => {
                             debug!(error = %e, "stderr read error");
+                            stderr_closed = true;
                             break;
                         }
                     }
                 }
             }
+        }
+        if stderr_closed {
+            child_stderr = None;
         }
 
         // Read incoming request from host (stdin data, resize) — only when
@@ -7666,6 +7698,41 @@ mod work_slot_tests {
             progress: false
         }));
         assert!(needs_work_slot(&AgentRequest::ListImages));
+    }
+
+    #[test]
+    fn interactive_loop_idles_while_the_child_keeps_running_with_stdout_closed() {
+        use std::process::{Command, Stdio};
+        fn thread_cpu() -> std::time::Duration {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: clock_gettime writes one timespec owned by this frame.
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+            std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+        }
+        // The host end stays open for the whole run, as a connected CLI would.
+        let (_host, mut guest) = UnixStream::pair().unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", "exec 1>&-; sleep 1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let before = thread_cpu();
+        let code = run_interactive_loop(&mut guest, &mut child, None).unwrap();
+        let spent = thread_cpu() - before;
+
+        assert_eq!(code, 0);
+        // A closed stdout used to leave poll returning at once on every pass,
+        // a whole CPU for the second the child keeps running.
+        assert!(
+            spent < std::time::Duration::from_millis(250),
+            "spent {spent:?} of CPU waiting on a child with stdout closed"
+        );
     }
 
     #[test]
