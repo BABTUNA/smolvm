@@ -3151,50 +3151,92 @@ impl AgentClient {
     ) -> Result<u64> {
         use std::io::Write;
 
-        let mut file = std::fs::File::create(local_path).map_err(|e| {
+        // An existing destination (including a symlink) must keep its previous
+        // contents if the guest fails mid-stream. Stage those downloads until
+        // the complete stream arrives; new paths still stream straight to disk.
+        let destination_existed = std::fs::symlink_metadata(local_path).is_ok();
+        let mut file = if destination_existed {
+            // Keep large downloads on the destination filesystem when possible;
+            // a writable file in a read-only directory still works via /tmp.
+            let parent = local_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
+            tempfile::tempfile_in(parent).or_else(|_| tempfile::tempfile())
+        } else {
+            std::fs::File::create(local_path)
+        }
+        .map_err(|e| {
             Error::agent(
                 "write local file",
                 format!("{}: {}", local_path.display(), e),
             )
         })?;
 
-        let mut total = 0u64;
-        loop {
-            match self.recv_raw()? {
-                AgentResponse::DataChunk { data, done } => {
-                    let next_total = total.saturating_add(data.len() as u64);
-                    if next_total > cap {
-                        let _ = std::fs::remove_file(local_path);
-                        return Err(Error::agent(
-                            operation,
-                            format!(
-                                "guest streamed {} bytes, exceeding the {} byte cap",
-                                next_total, cap
-                            ),
-                        ));
+        // A failed read or write may leave a partial new file behind. Close
+        // the handle before trying to remove it (required on Windows).
+        let result = (|| {
+            let mut total = 0u64;
+            loop {
+                match self.recv_raw()? {
+                    AgentResponse::DataChunk { data, done } => {
+                        let next_total = total.saturating_add(data.len() as u64);
+                        if next_total > cap {
+                            return Err(Error::agent(
+                                operation,
+                                format!(
+                                    "guest streamed {} bytes, exceeding the {} byte cap",
+                                    next_total, cap
+                                ),
+                            ));
+                        }
+                        if !data.is_empty() {
+                            file.write_all(&data)
+                                .map_err(|e| Error::agent("write local file", e.to_string()))?;
+                            total = next_total;
+                            on_progress(total);
+                        }
+                        if done {
+                            file.flush()
+                                .map_err(|e| Error::agent("flush local file", e.to_string()))?;
+                            return Ok(total);
+                        }
                     }
-                    if !data.is_empty() {
-                        file.write_all(&data)
-                            .map_err(|e| Error::agent("write local file", e.to_string()))?;
-                        total = next_total;
-                        on_progress(total);
+                    AgentResponse::Error { message, .. } => {
+                        return Err(Error::agent(operation, message));
                     }
-                    if done {
-                        file.flush()
-                            .map_err(|e| Error::agent("flush local file", e.to_string()))?;
-                        return Ok(total);
+                    _ => {
+                        return Err(Error::agent(operation, "unexpected response"));
                     }
-                }
-                AgentResponse::Error { message, .. } => {
-                    let _ = std::fs::remove_file(local_path);
-                    return Err(Error::agent(operation, message));
-                }
-                _ => {
-                    let _ = std::fs::remove_file(local_path);
-                    return Err(Error::agent(operation, "unexpected response"));
                 }
             }
+        })();
+        let result = result.and_then(|total| {
+            if destination_existed {
+                use std::io::Seek;
+                file.rewind()
+                    .map_err(|e| Error::agent("read staged file", e.to_string()))?;
+                // Write through existing symlinks and hard links as File::create
+                // did before; only the guest's incomplete stream is staged.
+                let mut destination = std::fs::File::create(local_path).map_err(|e| {
+                    Error::agent(
+                        "write local file",
+                        format!("{}: {}", local_path.display(), e),
+                    )
+                })?;
+                std::io::copy(&mut file, &mut destination)
+                    .map_err(|e| Error::agent("write local file", e.to_string()))?;
+                destination
+                    .flush()
+                    .map_err(|e| Error::agent("flush local file", e.to_string()))?;
+            }
+            Ok(total)
+        });
+        drop(file);
+        if result.is_err() && !destination_existed {
+            let _ = std::fs::remove_file(local_path);
         }
+        result
     }
 
     // ========================================================================
@@ -5083,5 +5125,136 @@ mod interactive_input_tests {
                 .all(|(i, byte)| *byte == (i % 251) as u8),
             "bytes arrived out of order or changed"
         );
+    }
+}
+
+#[cfg(test)]
+mod streamed_path_cleanup_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn send_response(peer: &mut UdsStream, response: AgentResponse) {
+        let data = serde_json::to_vec(&response).unwrap();
+        peer.write_all(&(data.len() as u32).to_be_bytes()).unwrap();
+        peer.write_all(&data).unwrap();
+    }
+
+    #[test]
+    fn disconnect_mid_transfer_removes_the_partial_file() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        send_response(
+            &mut peer,
+            AgentResponse::DataChunk {
+                data: b"partial archive".to_vec(),
+                done: false,
+            },
+        );
+        drop(peer);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("flat-export.tmp");
+        let mut client = AgentClient::from_stream(client_stream);
+        assert!(client
+            .receive_stream_to_path(&output, 1024, |_| {}, "flatten layers")
+            .is_err());
+        assert!(!output.exists(), "failed transfer left a partial archive");
+    }
+
+    #[test]
+    fn disconnect_does_not_unlink_an_existing_destination() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        send_response(
+            &mut peer,
+            AgentResponse::DataChunk {
+                data: b"partial archive".to_vec(),
+                done: false,
+            },
+        );
+        drop(peer);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("existing.txt");
+        std::fs::write(&output, b"original").unwrap();
+        let mut client = AgentClient::from_stream(client_stream);
+        assert!(client
+            .receive_stream_to_path(&output, 1024, |_| {}, "read file")
+            .is_err());
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            b"original",
+            "failed download must not truncate an existing destination"
+        );
+    }
+
+    #[test]
+    fn guest_error_does_not_truncate_an_existing_destination() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        send_response(
+            &mut peer,
+            AgentResponse::Error {
+                message: "missing guest file".into(),
+                code: None,
+            },
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("existing.txt");
+        std::fs::write(&output, b"original").unwrap();
+        let mut client = AgentClient::from_stream(client_stream);
+        assert!(client
+            .receive_stream_to_path(&output, 1024, |_| {}, "read file")
+            .is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+    }
+
+    #[test]
+    fn successful_transfer_overwrites_existing_destination() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        send_response(
+            &mut peer,
+            AgentResponse::DataChunk {
+                data: b"new content".to_vec(),
+                done: true,
+            },
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("existing.txt");
+        std::fs::write(&output, b"original").unwrap();
+        let alias = dir.path().join("alias.txt");
+        std::fs::hard_link(&output, &alias).unwrap();
+        let mut client = AgentClient::from_stream(client_stream);
+        assert_eq!(
+            client
+                .receive_stream_to_path(&output, 1024, |_| {}, "read file")
+                .unwrap(),
+            b"new content".len() as u64
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"new content");
+        assert_eq!(std::fs::read(&alias).unwrap(), b"new content");
+    }
+
+    #[test]
+    fn successful_transfer_keeps_the_file() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        send_response(
+            &mut peer,
+            AgentResponse::DataChunk {
+                data: b"complete archive".to_vec(),
+                done: true,
+            },
+        );
+        drop(peer);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("flat-export.tmp");
+        let mut client = AgentClient::from_stream(client_stream);
+        assert_eq!(
+            client
+                .receive_stream_to_path(&output, 1024, |_| {}, "flatten layers")
+                .unwrap(),
+            b"complete archive".len() as u64
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"complete archive");
     }
 }
