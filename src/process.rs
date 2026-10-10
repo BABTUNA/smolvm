@@ -3217,29 +3217,8 @@ pub fn stop_process_fast(pid: Pid, timeout: Duration, force: bool) -> Result<i32
         return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
     }
 
-    // Two-phase polling: aggressive first, then back off
-    let start = Instant::now();
-    let mut poll_count: u32 = 0;
-
-    while start.elapsed() < timeout {
-        // Check immediately, then poll
-        if let Some(code) = try_wait(pid) {
-            return Ok(code);
-        }
-
-        if !is_alive(pid) {
-            return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
-        }
-
-        // Aggressive polling for first ~100ms, then back off
-        let poll_interval = if poll_count < FAST_POLL_COUNT {
-            FAST_POLL_INTERVAL // 10ms
-        } else {
-            Duration::from_millis(100)
-        };
-        poll_count += 1;
-
-        std::thread::sleep(poll_interval);
+    if let Some(code) = poll_for_exit(pid, timeout) {
+        return Ok(code);
     }
 
     // Timeout reached
@@ -3311,10 +3290,135 @@ pub fn stop_vm_process(
     ))
 }
 
-/// Poll for process exit with aggressive-then-backoff strategy.
-///
-/// Returns `Some(exit_code)` if the process exits within the timeout.
+/// How waiting on a process's exit event ended.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+enum ExitEvent {
+    Exited,
+    TimedOut,
+    /// No exit event for this process here: fall back to polling.
+    Unavailable,
+}
+
+/// Block until `pid` exits or `timeout` passes, woken by the kernel at the
+/// moment of exit rather than by a polling tick. Works for processes that are
+/// not our children, which a VM started by an earlier CLI invocation is not.
+#[cfg(target_os = "linux")]
+fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
+    // SAFETY: pidfd_open takes a pid and a flags word and returns a new fd.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    if fd < 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => ExitEvent::Exited,
+            _ => ExitEvent::Unavailable,
+        };
+    }
+    // SAFETY: a non-negative return is a fresh fd this function owns.
+    let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd as i32) };
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let mut pollfd = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&fd),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Round up: poll counts whole milliseconds, and truncating would
+        // return before the deadline.
+        let ms = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32;
+        // SAFETY: one valid pollfd for the pidfd owned above.
+        let rc = unsafe { libc::poll(&mut pollfd, 1, ms) };
+        if rc > 0 {
+            return ExitEvent::Exited;
+        }
+        if rc == 0 {
+            if Instant::now() < deadline {
+                continue;
+            }
+            return ExitEvent::TimedOut;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return ExitEvent::Unavailable;
+        }
+    }
+}
+
+/// [`wait_for_exit_event`] through kqueue's `NOTE_EXIT`.
+#[cfg(target_os = "macos")]
+fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
+    // SAFETY: kqueue takes no arguments and returns a new fd or -1.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return ExitEvent::Unavailable;
+    }
+    // SAFETY: a non-negative return is a fresh fd this function owns.
+    let kq = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(kq) };
+    let kq_fd = std::os::fd::AsRawFd::as_raw_fd(&kq);
+    let change = libc::kevent {
+        ident: pid as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: registers one kevent from a valid struct; no events are read.
+    if unsafe { libc::kevent(kq_fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => ExitEvent::Exited,
+            _ => ExitEvent::Unavailable,
+        };
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = libc::timespec {
+            tv_sec: remaining.as_secs() as libc::time_t,
+            tv_nsec: remaining.subsec_nanos() as libc::c_long,
+        };
+        // SAFETY: an all-zero kevent is a valid output buffer for one event.
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        // SAFETY: waits for at most one event into `event`, with a valid timeout.
+        let rc = unsafe { libc::kevent(kq_fd, std::ptr::null(), 0, &mut event, 1, &wait) };
+        if rc > 0 {
+            return ExitEvent::Exited;
+        }
+        if rc == 0 {
+            if Instant::now() < deadline {
+                continue;
+            }
+            return ExitEvent::TimedOut;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return ExitEvent::Unavailable;
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn wait_for_exit_event(_pid: Pid, _timeout: Duration) -> ExitEvent {
+    ExitEvent::Unavailable
+}
+
+/// Wait for process exit, returning `Some(exit_code)` if it exits within the
+/// timeout. Uses the kernel's exit event where there is one, so the exit is
+/// seen when it happens. Elsewhere it polls, aggressively at first and then
+/// backing off.
 pub(crate) fn poll_for_exit(pid: Pid, timeout: Duration) -> Option<i32> {
+    if let Some(code) = try_wait(pid) {
+        return Some(code);
+    }
+    match wait_for_exit_event(pid, timeout) {
+        // Reaps our own child and reads its code. Anyone else's exit code is
+        // not ours to read.
+        ExitEvent::Exited => return Some(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE)),
+        ExitEvent::TimedOut => {
+            return try_wait(pid).or_else(|| (!is_alive(pid)).then_some(UNKNOWN_EXIT_CODE));
+        }
+        ExitEvent::Unavailable => {}
+    }
     let start = Instant::now();
     let mut poll_count: u32 = 0;
 
@@ -3755,6 +3859,41 @@ extern "C" fn sigint_kill_handler(_sig: libc::c_int) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn poll_for_exit_reads_a_child_exit_code() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 0.2; exit 3"])
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            poll_for_exit(child.id() as Pid, Duration::from_secs(5)),
+            Some(3)
+        );
+        // poll_for_exit already reaped it, so this only errs; it is here
+        // because the zombie lint cannot see that.
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_for_exit_gives_up_at_the_timeout() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            poll_for_exit(child.id() as Pid, Duration::from_millis(150)),
+            None
+        );
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(150), "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     /// Inside a smol machine the home is overlayfs and `/workspace` is ext4, so
     /// state moves; anywhere the home can back idmapped mounts it stays put.
     #[cfg(target_os = "linux")]
