@@ -266,17 +266,7 @@ fn raw_data_ranges(path: &Path, size: u64, into: &mut Vec<(u64, u64)>) -> Result
 /// layer of the chain holds are copied, and all-zero chunks are left
 /// unallocated, so the result is no larger than the data it carries.
 pub(crate) fn flatten_standalone(top: &Path, out: &Path) -> Result<()> {
-    let layers = chain(top)?;
-    let view = open_readonly(top, true)?;
-    let size = view.size();
-    let mut ranges = Vec::new();
-    for layer in &layers {
-        if is_qcow2(layer)? {
-            defined_ranges(layer, size, &mut ranges)?;
-        } else {
-            raw_data_ranges(layer, size, &mut ranges)?;
-        }
-    }
+    let ChainData { view, size, ranges } = chain_data(top)?;
     runtime()?
         .block_on(async {
             let storage =
@@ -315,6 +305,68 @@ pub(crate) fn flatten_standalone(top: &Path, out: &Path) -> Result<()> {
             .flush()
             .map_err(|e| compact_err("flush flattened", e))?;
         writer.sync().map_err(|e| compact_err("sync flattened", e))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(out);
+    }
+    result
+}
+
+/// A read view of a whole chain, its size, and the ranges some layer of the
+/// chain holds. Everything outside those ranges reads as zeros.
+struct ChainData {
+    view: SyncFormatAccess<ImagoFile>,
+    size: u64,
+    ranges: Vec<(u64, u64)>,
+}
+
+fn chain_data(top: &Path) -> Result<ChainData> {
+    let layers = chain(top)?;
+    let view = open_readonly(top, true)?;
+    let size = view.size();
+    let mut ranges = Vec::new();
+    for layer in &layers {
+        if is_qcow2(layer)? {
+            defined_ranges(layer, size, &mut ranges)?;
+        } else {
+            raw_data_ranges(layer, size, &mut ranges)?;
+        }
+    }
+    Ok(ChainData { view, size, ranges })
+}
+
+/// Write `out` as a sparse raw image that reads exactly as `top` does. Only
+/// ranges some layer of the chain holds are read, and all-zero chunks stay
+/// holes, so a mostly empty 20 GiB disk costs its data, not its size.
+pub(crate) fn flatten_to_raw(top: &Path, out: &Path) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let ChainData { view, size, ranges } = chain_data(top)?;
+    let result = (|| {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(out)
+            .map_err(|e| compact_err(&format!("create {}", out.display()), e))?;
+        file.set_len(size)
+            .map_err(|e| compact_err("size raw image", e))?;
+        let mut buffer = vec![0_u8; COPY_CHUNK as usize];
+        for (start, end) in coalesce(ranges) {
+            let mut offset = start;
+            while offset < end {
+                let length = (end - offset).min(COPY_CHUNK);
+                let chunk = &mut buffer[..length as usize];
+                view.read(&mut *chunk, offset)
+                    .map_err(|e| compact_err("read chain", e))?;
+                if chunk.iter().any(|byte| *byte != 0) {
+                    file.write_all_at(chunk, offset)
+                        .map_err(|e| compact_err("write data", e))?;
+                }
+                offset += length;
+            }
+        }
+        file.sync_all()
+            .map_err(|e| compact_err("sync raw image", e))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(out);
@@ -803,6 +855,46 @@ mod tests {
 
     /// The layer flattened is the one right beneath the writable top, onto the
     /// first layer that is not a generation; a shallow chain is left alone.
+    #[test]
+    fn flatten_to_raw_reads_exactly_as_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, layers) = layered(dir.path(), 4);
+        let top = layers.last().unwrap();
+        let out = dir.path().join("flat.raw");
+
+        flatten_to_raw(top, &out).unwrap();
+
+        assert_eq!(std::fs::read(&out).unwrap(), read_all(top));
+    }
+
+    #[test]
+    fn flatten_to_raw_keeps_unwritten_space_as_holes() {
+        use std::os::unix::fs::MetadataExt;
+        const BIG: u64 = 256 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.raw");
+        std::fs::File::create(&root).unwrap().set_len(BIG).unwrap();
+        let top = dir.path().join("top.qcow2");
+        create_overlay(&top, BIG, &root.canonicalize().unwrap()).unwrap();
+        let access = writable(&top);
+        access.write(&[0xAB; 4096][..], 1 << 20).unwrap();
+        access.write(&[0xCD; 4096][..], 200 << 20).unwrap();
+        access.flush().unwrap();
+        drop(access);
+        let out = dir.path().join("flat.raw");
+
+        flatten_to_raw(&top, &out).unwrap();
+
+        let meta = std::fs::metadata(&out).unwrap();
+        assert_eq!(meta.len(), BIG);
+        assert!(
+            meta.blocks() * 512 < 4 << 20,
+            "8 KiB of data took {} bytes on disk",
+            meta.blocks() * 512
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), read_all(&top));
+    }
+
     #[test]
     fn the_newest_immutable_generation_is_the_flatten_target() {
         let dir = tempfile::tempdir().unwrap();

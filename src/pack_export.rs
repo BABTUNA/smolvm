@@ -1447,13 +1447,24 @@ fn export_workspace_seed(
     Ok(())
 }
 
+/// Flatten a qcow2 disk (and its backing chain) into a sparse raw image on
+/// the host. Only the ranges the chain holds are read and only non-zero data
+/// is written, so a mostly empty 20 GiB disk costs its data, not its size.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()> {
+    println!("Flattening qcow2 overlay to raw...");
+    crate::agent::fork::flatten_to_raw(qcow2_path, dest_raw)
+}
+
 /// Flatten a qcow2 CoW overlay into a standalone raw disk image (bare VMs).
 ///
-/// There is no host-side qcow2 reader (smolvm deliberately takes no qemu-img
-/// dependency), so the conversion runs inside a throwaway agent VM: the source
+/// Elsewhere than Linux and macOS there is no host-side flatten (smolvm
+/// deliberately takes no qemu-img dependency), so the conversion runs inside
+/// a throwaway agent VM: the source
 /// qcow2 is attached read-only (libkrun resolves its backing chain) as
 /// `/dev/vdc` alongside a fresh raw output as `/dev/vdd`, and the guest `dd`s
 /// one into the other.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()> {
     let virtual_size = read_qcow2_virtual_size(qcow2_path)?;
     let dest = std::fs::OpenOptions::new()

@@ -25,7 +25,7 @@ use std::time::Duration;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod compact;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use compact::flatten_standalone;
+pub(crate) use compact::{flatten_standalone, flatten_to_raw};
 
 /// Bound qcow2 ancestry and recursive lifecycle work. Longer chains should be
 /// compacted into a new root rather than accumulating unbounded lookup cost.
