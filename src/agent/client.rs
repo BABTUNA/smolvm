@@ -19,21 +19,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Old agent rootfs builds reject this request before sending any layer bytes.
-/// Explain the version skew while leaving all other export failures intact.
-fn explain_unsupported_flatten(error: Error) -> Error {
-    if let Error::Agent { reason, .. } = &error {
-        if reason.contains("unknown variant") && reason.contains("flatten_layers") {
-            return Error::agent(
-                "flatten layers",
-                "the guest agent does not support pack export; install an agent-rootfs from the \
-                 same smolvm release (reinstall smolvm or set SMOLVM_AGENT_ROOTFS to a matching rootfs)",
-            );
-        }
-    }
-    error
-}
-
 /// Metadata applied to an uploaded file after it lands: permissions and
 /// ownership. Ownership matters for non-root workload images — a root-owned
 /// upload is unreadable/unwritable to the user the container actually runs as.
@@ -1129,8 +1114,8 @@ fn describe_agent_error(message: String) -> String {
     };
     format!(
         "the machine's guest agent is older than this CLI and does not support the \
-         '{variant}' request. Update the agent rootfs to this release's (reinstall \
-         smolvm, or point SMOLVM_AGENT_ROOTFS at the new one), then restart the machine"
+         '{variant}' request. Install the agent rootfs from this smolvm release (reinstall \
+         smolvm, or set SMOLVM_AGENT_ROOTFS to a matching rootfs), then restart the machine"
     )
 }
 
@@ -1832,13 +1817,11 @@ impl AgentClient {
         // window for the whole flatten, as the file-read paths do for large
         // transfers. Configurable because pack size is unbounded.
         let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
-        let resp = self
-            .request(&AgentRequest::FlattenLayers {
-                lowerdirs: lowerdirs.to_vec(),
-                output: Some(output.to_string()),
-            })
-            .map_err(explain_unsupported_flatten)?;
-        expect_ok(resp, "flatten layers").map_err(explain_unsupported_flatten)
+        let resp = self.request(&AgentRequest::FlattenLayers {
+            lowerdirs: lowerdirs.to_vec(),
+            output: Some(output.to_string()),
+        })?;
+        expect_ok(resp, "flatten layers")
     }
 
     /// Merge `lowerdirs` (topmost first — the order the agent stacks them in)
@@ -1863,7 +1846,6 @@ impl AgentClient {
             output: None,
         })?;
         self.receive_stream_to_path(local_path, cap, on_progress, "flatten layers")
-            .map_err(explain_unsupported_flatten)
     }
 
     /// Get storage status.
