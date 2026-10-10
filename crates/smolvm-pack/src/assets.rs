@@ -1638,14 +1638,11 @@ fn append_checkpoint_tree<W: Write>(
 
 /// Copy a sparse overlay disk to `dst`, stripping trailing zeros.
 ///
-/// Scans backwards from the end of the source to find the last non-zero byte,
-/// then copies only bytes `[0, last_nonzero+1]` to `dst`, skipping zero
-/// chunks in the forward pass.
-///
-/// `SEEK_DATA`/`SEEK_HOLE` is avoided because APFS reports zero-fill extents
-/// (efficiently stored but containing zeros) as "data", making lseek-based
-/// hole detection return the full file size even when 90%+ is zeros.
-/// Content scanning works correctly on both APFS and Linux ext4/xfs.
+/// Only the source's data ranges are read. Holes read as zeros, and a VM disk
+/// is almost all hole, so a 20 GiB disk with a few MiB written reads a few MiB
+/// instead of 20 GiB. A data range can still hold zeros (APFS reports written
+/// zeros as data), so each range is scanned and its zero chunks stay holes in
+/// `dst`. Trailing zeros are stripped from the end.
 ///
 /// Returns the original full (logical) size so the caller can record it for
 /// the extraction side to restore the sparse skeleton via `ftruncate`.
@@ -1653,11 +1650,10 @@ fn append_checkpoint_tree<W: Write>(
 fn sparse_copy_overlay(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
     let mut src_file = File::open(src)?;
     let logical_size = src_file.metadata()?.len();
+    let ranges = data_ranges(&src_file, logical_size)?;
 
     // Scan backwards to find the last non-zero byte (= safe truncation point).
-    // On APFS, zero-fill regions are served from page cache without disk I/O,
-    // so even scanning 8+ GiB of trailing zeros takes only ~100–200 ms.
-    let truncated_size = find_last_data_byte(&mut src_file, logical_size)?;
+    let truncated_size = find_last_data_byte(&mut src_file, &ranges)?;
 
     // Create destination as a sparse skeleton; keep the handle for writing.
     let mut dst_file = File::create(dst)?;
@@ -1670,28 +1666,26 @@ fn sparse_copy_overlay(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
     crate::extract::mark_file_sparse(&dst_file)?;
     dst_file.set_len(truncated_size)?;
 
-    if truncated_size == 0 {
-        return Ok((logical_size, 0));
-    }
-
-    // Forward copy: read [0, truncated_size) in 512 KiB chunks,
-    // writing only non-zero chunks (zero chunks remain as holes).
-    src_file.seek(SeekFrom::Start(0))?;
+    // Forward copy of each data range below the truncation point, in 512 KiB
+    // chunks, writing only non-zero chunks (zero chunks remain as holes).
     let mut buf = vec![0u8; 512 * 1024];
-    let mut offset: u64 = 0;
-
-    while offset < truncated_size {
-        let to_read = (truncated_size - offset).min(buf.len() as u64) as usize;
-        let n = src_file.read(&mut buf[..to_read])?;
-        if n == 0 {
-            break;
+    for &(start, len) in &ranges {
+        let end = (start + len).min(truncated_size);
+        let mut offset = start;
+        src_file.seek(SeekFrom::Start(offset))?;
+        while offset < end {
+            let to_read = (end - offset).min(buf.len() as u64) as usize;
+            let n = src_file.read(&mut buf[..to_read])?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            if chunk.iter().any(|&b| b != 0) {
+                dst_file.seek(SeekFrom::Start(offset))?;
+                dst_file.write_all(chunk)?;
+            }
+            offset += n as u64;
         }
-        let chunk = &buf[..n];
-        if chunk.iter().any(|&b| b != 0) {
-            dst_file.seek(SeekFrom::Start(offset))?;
-            dst_file.write_all(chunk)?;
-        }
-        offset += n as u64;
     }
 
     Ok((logical_size, truncated_size))
@@ -1699,35 +1693,33 @@ fn sparse_copy_overlay(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
 
 /// Find the truncation point: offset of the last non-zero byte + 1.
 ///
-/// Reads the file backwards in 1 MiB chunks until a non-zero byte is found.
-/// Returns 0 if the entire file is zeros.
-fn find_last_data_byte(file: &mut File, logical_size: u64) -> std::io::Result<u64> {
-    if logical_size == 0 {
-        return Ok(0);
-    }
-
+/// Reads `ranges` (sorted `(offset, length)` data ranges) backwards in 1 MiB
+/// chunks until a non-zero byte is found. Returns 0 if every range is zeros.
+fn find_last_data_byte(file: &mut File, ranges: &[(u64, u64)]) -> std::io::Result<u64> {
     const CHUNK: u64 = 1024 * 1024; // 1 MiB scan chunk
     let mut buf = vec![0u8; CHUNK as usize];
-    let mut pos = logical_size;
 
-    while pos > 0 {
-        let chunk_start = pos.saturating_sub(CHUNK);
-        let chunk_size = (pos - chunk_start) as usize;
+    for &(start, len) in ranges.iter().rev() {
+        let mut pos = start + len;
+        while pos > start {
+            let chunk_start = pos.saturating_sub(CHUNK).max(start);
+            let chunk_size = (pos - chunk_start) as usize;
 
-        file.seek(SeekFrom::Start(chunk_start))?;
-        let n = file.read(&mut buf[..chunk_size])?;
-        if n == 0 {
-            break;
-        }
-
-        // Scan backwards for the last non-zero byte in this chunk.
-        for i in (0..n).rev() {
-            if buf[i] != 0 {
-                return Ok(chunk_start + i as u64 + 1);
+            file.seek(SeekFrom::Start(chunk_start))?;
+            let n = file.read(&mut buf[..chunk_size])?;
+            if n == 0 {
+                break;
             }
-        }
 
-        pos = chunk_start;
+            // Scan backwards for the last non-zero byte in this chunk.
+            for i in (0..n).rev() {
+                if buf[i] != 0 {
+                    return Ok(chunk_start + i as u64 + 1);
+                }
+            }
+
+            pos = chunk_start;
+        }
     }
 
     Ok(0) // Entire file is zeros
@@ -1851,7 +1843,7 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().unwrap();
         fs::write(temp.path(), vec![0u8; 4096]).unwrap();
         let mut file = File::open(temp.path()).unwrap();
-        assert_eq!(find_last_data_byte(&mut file, 4096).unwrap(), 0);
+        assert_eq!(find_last_data_byte(&mut file, &[(0, 4096)]).unwrap(), 0);
     }
 
     #[test]
@@ -1861,7 +1853,7 @@ mod tests {
         data[99] = 0xAB; // non-zero at 99, then 4000 trailing zeros
         fs::write(temp.path(), &data).unwrap();
         let mut file = File::open(temp.path()).unwrap();
-        assert_eq!(find_last_data_byte(&mut file, 4100).unwrap(), 100);
+        assert_eq!(find_last_data_byte(&mut file, &[(0, 4100)]).unwrap(), 100);
     }
 
     #[test]
@@ -1872,7 +1864,7 @@ mod tests {
         data[1023] = 1;
         fs::write(temp.path(), &data).unwrap();
         let mut file = File::open(temp.path()).unwrap();
-        assert_eq!(find_last_data_byte(&mut file, 1024).unwrap(), 1024);
+        assert_eq!(find_last_data_byte(&mut file, &[(0, 1024)]).unwrap(), 1024);
     }
 
     #[test]
@@ -1910,6 +1902,28 @@ mod tests {
         assert_eq!(dst_data[0], 0x01);
         assert_eq!(dst_data[511], 0xFF);
         assert_eq!(dst_data[256], 0x00); // interior zero is preserved
+    }
+
+    #[test]
+    fn test_sparse_copy_overlay_keeps_data_between_holes() {
+        // Data separated by large holes, the shape of a VM disk: only the data
+        // ranges are read, and every written byte must still reach the copy.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src = temp_dir.path().join("src.raw");
+        let dst = temp_dir.path().join("dst.raw");
+        let mut file = File::create(&src).unwrap();
+        file.set_len(64 << 20).unwrap();
+        for (offset, byte) in [(4096, 0x11), (24 << 20, 0x22), ((40 << 20) + 7, 0x33)] {
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&[byte; 1000]).unwrap();
+        }
+        drop(file);
+
+        let (logical, truncated) = sparse_copy_overlay(&src, &dst).unwrap();
+        assert_eq!(logical, 64 << 20);
+        assert_eq!(truncated, (40 << 20) + 7 + 1000);
+        let source = fs::read(&src).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), source[..truncated as usize]);
     }
 
     #[test]
