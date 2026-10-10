@@ -2807,14 +2807,74 @@ async fn create_machine_inner(
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
 
+    let resources = ResourceSpec {
+        cpus: Some(cpus),
+        memory_mb: Some(mem),
+        network: Some(network),
+        gpu: Some(req.gpu),
+        cuda: Some(req.cuda || req.auto_graph),
+        nested_virt: req.nested_virt.then_some(true),
+        storage_gb: restored_storage_gb,
+        overlay_gb: restored_overlay_gb,
+        block_io: req.block_io,
+        disk_durability: req.disk_durability,
+        cache_disk: req.cache_disk.clone(),
+        allowed_cidrs: normalized_cidrs,
+        egress_rules: checkpoint_network.map_or_else(
+            || req.egress_rules.clone(),
+            |network| network.egress_rules.clone(),
+        ),
+        allowed_hosts: restored_allowed_hosts,
+        // A restored checkpoint keeps the bindings its workload was captured
+        // with unless the request names its own.
+        credentials: req
+            .credentials
+            .clone()
+            .or_else(|| checkpoint_network.and_then(|network| network.credential_policy.clone())),
+        network_backend: restored_network_backend,
+        // A restored guest already has its captured address in memory, so the
+        // checkpoint's subnet wins over anything requested.
+        guest_subnet: match manifest_checkpoint.as_ref() {
+            Some(checkpoint) => crate::portable_checkpoint::restored_guest_subnet(checkpoint)
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+            None => guest_subnet,
+        },
+    };
+    smolvm_network::EgressPolicy::unrestricted()
+        .with_rules(&resources.egress_rules)
+        .map_err(ApiError::BadRequest)?;
+    crate::network::validate_requested_network_backend(
+        &crate::api::state::resource_spec_to_vm_resources(&resources, network),
+        resources.allowed_hosts.as_deref(),
+        restored_ports.len(),
+    )
+    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+
+    // A machine without networking has its registry image fetched on the host
+    // at start, which repoints it at the fetched archive and seeds from that.
+    // A seed of the registry image made here would only be discarded then.
+    let start_fetches_on_host = image.as_deref().is_some_and(|image| {
+        matches!(
+            crate::data::image_source::classify(image),
+            crate::data::image_source::ImageSource::Registry(_)
+        )
+    }) && !crate::network::plan_launch_network_with(
+        &crate::api::state::resource_spec_to_vm_resources(&resources, network),
+        resources.allowed_hosts.as_deref(),
+        restored_ports.len(),
+        resources.credentials.is_some(),
+    )
+    .has_network();
+
     // A registry-image machine gets its storage disk on a shared seed of its
     // image (see `image_seed`), so its first start skips the pull. The manager
     // below then opens that disk instead of creating a blank one.
     let seed_image = (source_smolmachine.is_none()
         && manifest_checkpoint.is_none()
-        && vm_seed.is_none())
-    .then(|| crate::image_seed::seedable_image(&name, image.as_deref(), restored_storage_gb))
-    .flatten();
+        && vm_seed.is_none()
+        && !start_fetches_on_host)
+        .then(|| crate::image_seed::seedable_image(&name, image.as_deref(), restored_storage_gb))
+        .flatten();
 
     // Create manager (does not boot the VM)
     let mut manager = tokio::task::spawn_blocking({
@@ -3078,48 +3138,6 @@ async fn create_machine_inner(
         .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
         crate::portable_checkpoint::log_phase(&name, "api_restore_install", &mut checkpoint_phase);
     }
-    let resources = ResourceSpec {
-        cpus: Some(cpus),
-        memory_mb: Some(mem),
-        network: Some(network),
-        gpu: Some(req.gpu),
-        cuda: Some(req.cuda || req.auto_graph),
-        nested_virt: req.nested_virt.then_some(true),
-        storage_gb: restored_storage_gb,
-        overlay_gb: restored_overlay_gb,
-        block_io: req.block_io,
-        disk_durability: req.disk_durability,
-        cache_disk: req.cache_disk.clone(),
-        allowed_cidrs: normalized_cidrs,
-        egress_rules: checkpoint_network.map_or_else(
-            || req.egress_rules.clone(),
-            |network| network.egress_rules.clone(),
-        ),
-        allowed_hosts: restored_allowed_hosts,
-        // A restored checkpoint keeps the bindings its workload was captured
-        // with unless the request names its own.
-        credentials: req
-            .credentials
-            .clone()
-            .or_else(|| checkpoint_network.and_then(|network| network.credential_policy.clone())),
-        network_backend: restored_network_backend,
-        // A restored guest already has its captured address in memory, so the
-        // checkpoint's subnet wins over anything requested.
-        guest_subnet: match manifest_checkpoint.as_ref() {
-            Some(checkpoint) => crate::portable_checkpoint::restored_guest_subnet(checkpoint)
-                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
-            None => guest_subnet,
-        },
-    };
-    smolvm_network::EgressPolicy::unrestricted()
-        .with_rules(&resources.egress_rules)
-        .map_err(ApiError::BadRequest)?;
-    crate::network::validate_requested_network_backend(
-        &crate::api::state::resource_spec_to_vm_resources(&resources, network),
-        resources.allowed_hosts.as_deref(),
-        restored_ports.len(),
-    )
-    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
 
     // Validate request-body secret refs before persisting. Untrusted
     // scope rejects every source kind, so any non-empty `secrets` map on
