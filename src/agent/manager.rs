@@ -829,7 +829,7 @@ fn ready_marker_unwritable(_marker: &Path) -> bool {
 /// signal. socket2's `Domain::UNIX` works on unix AND Windows (Win10+), unlike
 /// std's unix-only `UnixListener`, so this builds on every host. Returns None on
 /// any error — readiness then falls back to the marker/ping.
-fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
+pub fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
     let _ = std::fs::remove_file(path);
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).ok()?;
     sock.bind(&socket2::SockAddr::unix(path).ok()?).ok()?;

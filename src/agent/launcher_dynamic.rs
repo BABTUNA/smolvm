@@ -685,6 +685,17 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_add_vsock_port2 failed");
     }
 
+    // Readiness doorbell, as in `launcher.rs`: the guest dials it at the end of
+    // init and the host accepts. Best-effort, but without it the guest's dial
+    // goes unanswered until the vsock connect timeout, two seconds, before it
+    // falls back to the marker.
+    if let Ok(ready) = path_to_cstring(&config.vsock_socket.with_extension("ready")) {
+        // SAFETY: ctx is valid, ready is a valid C string
+        if unsafe { (krun.add_vsock_port2)(ctx, ports::AGENT_READY, ready.as_ptr(), false) } < 0 {
+            tracing::warn!("readiness-doorbell vsock port failed to add; using ping");
+        }
+    }
+
     // Guest↔host vsock services. The registry owns both sides of each bridge:
     // the host port registration below and the guest activation env injected
     // while building the init environment.

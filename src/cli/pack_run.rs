@@ -624,6 +624,7 @@ impl PackRunCmd {
         // executable as `current_exe _boot-vm <config.json>`, which loads libkrun
         // from `SMOLVM_LIB_DIR` and boots the VM. See `src/agent/manager.rs`.
         smolvm::process::install_sigchld_handler();
+        let ready_doorbell = bind_ready_doorbell(&vsock_path);
 
         let console_log_path = runtime_dir.path().join("console.log");
 
@@ -859,7 +860,7 @@ impl PackRunCmd {
         };
 
         // 10. Parent: wait for agent, connect, execute command
-        let mut client = wait_for_agent(&vsock_path, self.debug)?;
+        let mut client = wait_for_agent(&vsock_path, self.debug, ready_doorbell.as_ref())?;
 
         let exit_code = execute_command(&mut client, &manifest, &self, &mounts)?;
 
@@ -1011,14 +1012,32 @@ fn setup_vm_overlay(
     Ok(Some(dest.to_path_buf()))
 }
 
+/// Listen for the guest's readiness doorbell, which the launcher registers
+/// beside the control socket. Bound before the VM is forked so the guest's
+/// dial at the end of init is always answered.
+fn bind_ready_doorbell(vsock_path: &Path) -> Option<socket2::Socket> {
+    smolvm::agent::bind_ready_listener(&vsock_path.with_extension("ready"))
+}
+
 /// Wait for the agent to become ready on the vsock socket.
-fn wait_for_agent(vsock_path: &Path, debug: bool) -> smolvm::Result<AgentClient> {
+///
+/// The doorbell rings when the guest finishes init, so the agent is pinged
+/// right away instead of on the next poll. Without a doorbell the socket is
+/// pinged every 100 ms as before.
+fn wait_for_agent(
+    vsock_path: &Path,
+    debug: bool,
+    ready_doorbell: Option<&socket2::Socket>,
+) -> smolvm::Result<AgentClient> {
     use std::thread;
     use std::time::Instant;
 
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
+    let doorbell_interval = Duration::from_millis(5);
     let timeout = agent_ready_timeout();
+    let mut rung = false;
+    let mut next_probe = start;
 
     loop {
         if start.elapsed() > timeout {
@@ -1031,7 +1050,11 @@ fn wait_for_agent(vsock_path: &Path, debug: bool) -> smolvm::Result<AgentClient>
             ));
         }
 
-        if vsock_path.exists() {
+        if !rung {
+            rung = ready_doorbell.is_some_and(|listener| listener.accept().is_ok());
+        }
+        if (rung || Instant::now() >= next_probe) && vsock_path.exists() {
+            next_probe = Instant::now() + poll_interval;
             // Connect opens the Unix socket to the muxer, but the guest agent
             // may not be listening on vsock port 6000 yet. We must ping to
             // verify end-to-end connectivity before declaring the agent ready.
@@ -1056,7 +1079,11 @@ fn wait_for_agent(vsock_path: &Path, debug: bool) -> smolvm::Result<AgentClient>
             }
         }
 
-        thread::sleep(poll_interval);
+        thread::sleep(if ready_doorbell.is_some() {
+            doorbell_interval
+        } else {
+            poll_interval
+        });
     }
 }
 
@@ -1826,6 +1853,7 @@ fn run_from_cache(
     let packed_mounts = mounts_to_packed(&mounts);
 
     smolvm::process::install_sigchld_handler();
+    let ready_doorbell = bind_ready_doorbell(&vsock_path);
 
     let console_log_path = runtime_dir.path().join("console.log");
     let vsock_path_clone = vsock_path.clone();
@@ -1987,7 +2015,7 @@ fn run_from_cache(
         runtime_dir,
     };
 
-    let mut client = wait_for_agent(&vsock_path, debug)?;
+    let mut client = wait_for_agent(&vsock_path, debug, ready_doorbell.as_ref())?;
 
     let params = ExecParams {
         launch: resolve_packed_launch(
@@ -2295,6 +2323,7 @@ fn daemon_start(
 
     // Fork child → launch VM
     smolvm::process::install_sigchld_handler();
+    let ready_doorbell = bind_ready_doorbell(&vsock_path);
 
     let console_log_path = daemon.join("console.log");
     let vsock_path_clone = vsock_path.clone();
@@ -2389,7 +2418,7 @@ fn daemon_start(
 
     // Wait for agent to become ready
     println!("Starting daemon...");
-    let _client = wait_for_agent(&vsock_path, debug)?;
+    let _client = wait_for_agent(&vsock_path, debug, ready_doorbell.as_ref())?;
 
     println!("Daemon started (PID: {})", child_pid);
     Ok(())
